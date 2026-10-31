@@ -16,3 +16,5 @@ The first release as a repository of its own, for Eider 0.1. The code is eider-l
 - `VERSION`, `eider = "0.1"`, `scripts/build.sh` and `scripts/test.sh` against an eider-lang
   checkout (`EIDER_ROOT`), refusing a toolchain of another MAJOR.MINOR, with
   `EIDER_PKG_OVERRIDE` set for sibling checkouts (scripts/env.sh).
+- `scripts/version.sh` (`check`, `sync`): eider.toml agrees with VERSION; eider-lang's
+  `scripts/version.sh check-siblings` and `bump` drive it.
