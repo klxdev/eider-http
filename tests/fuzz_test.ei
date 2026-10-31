@@ -10,12 +10,12 @@
 //    exactly the declared length; one Host on HTTP/1.1; no control characters in values;
 //    token names; the body limit).
 
-import "core/sys"
-import "std/bytes"
-import "std/io"
-import "rng.ei" as fuzz
-import "../http.ei"
-import "../parse.ei"
+import core.sys
+import std.bytes
+import std.io
+import http.tests.rng as fuzz
+import http
+import http.parse
 
 fn pick_str(inout r: fuzz.Rng, xs: List[List[u8]]) -> List[u8] { fuzz.pick(inout r, xs) }
 

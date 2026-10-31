@@ -33,18 +33,18 @@
 //! None of this can contain a trap: a handler that panics or overflows still ends the
 //! process (docs/services.md N5). `errors` is the way not to need one.
 
-import "core/sys"
-import "std/bytes"
-import "std/atomic"
-import "std/encoding"
-import "std/random"
-import "std/stream"
-import "std/sync"
-import "std/task"
-import "std/time"
-import "json"
-import "http.ei"
-import "problem.ei"
+import core.sys
+import std.bytes
+import std.atomic
+import std.encoding
+import std.random
+import std.stream
+import std.sync
+import std.task
+import std.time
+import json
+import http
+import http.problem
 
 /// Applies `layers` to `h`, the first one outermost: `chain(h, [a, b])` is `a(b(h))`.
 pub fn chain(h: http.Handler, layers: List[http.Middleware]) -> http.Handler {

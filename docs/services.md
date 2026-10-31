@@ -11,11 +11,11 @@ P0.12 and the first milestone of P1.1); the decisions are C40 to C51 and C80 onw
 eider-lang's docs/decisions.md, which also records the move into this repository (U19).
 
 ```
-import "std/net"
-import "std/task"
-import "http"                 // Request, Response, headers, limits, writing messages
-import "http/server"
-import "http/router"
+import std.net
+import std.task
+import http                   // Request, Response, headers, limits, writing messages
+import http.server
+import http.router
 
 fn main() uses io, net, clock, threads {
     let mut r = router.new()

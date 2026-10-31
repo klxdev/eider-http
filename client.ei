@@ -9,14 +9,14 @@
 //! already closed fails with Err; send it again on a new Conn if it is idempotent), streaming
 //! bodies, and name resolution with deadlines (std/net.lookup blocks; pass an Addr).
 
-import "core/sys"
-import "std/bytes"
-import "std/fd"
-import "std/net"
-import "std/time"
-import "http.ei"
-import "parse.ei"
-import "sock.ei"
+import core.sys
+import std.bytes
+import std.fd
+import std.net
+import std.time
+import http
+import http.parse
+import http.sock
 
 /// A connection to `addr`. `host` is what goes in the Host header ("127.0.0.1:8080");
 /// `open` says whether a connection is up now.

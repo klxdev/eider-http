@@ -11,10 +11,10 @@
 //! rewrites the package's plain-text error responses (404, 405, 413, ...) the same way, so a
 //! service answers every error in one format.
 
-import "core/sys"
-import "std/bytes"
-import "json"
-import "http.ei"
+import core.sys
+import std.bytes
+import json
+import http
 
 /// The media type of a problem.
 pub const MEDIA: str = "application/problem+json"

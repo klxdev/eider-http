@@ -2,10 +2,10 @@
 //! before a deadline, and close gracefully. A socket here is non-blocking and written by one
 //! thread at a time.
 
-import "std/bytes"
-import "std/fd"
-import "std/net"
-import "std/time"
+import std.bytes
+import std.fd
+import std.net
+import std.time
 
 /// Sends all of `data` before `dl`: false if the deadline passed or the peer is gone.
 pub fn send_by(c: i32, data: List[u8], dl: time.Deadline) -> bool uses net, io, clock {

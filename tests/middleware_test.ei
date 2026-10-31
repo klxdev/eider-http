@@ -4,20 +4,20 @@
 // sleeps), CORS preflights and responses, bearer and basic authentication, and the
 // Prometheus exposition text.
 
-import "core/sys"
-import "std/bytes"
-import "std/encoding"
-import "std/io"
-import "std/stream"
-import "std/sync"
-import "std/task"
-import "std/time"
-import "json"
-import "../http.ei"
-import "../router.ei"
-import "../problem.ei"
-import "../middleware.ei"
-import "../metrics.ei"
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import std.stream
+import std.sync
+import std.task
+import std.time
+import json
+import http
+import http.router
+import http.problem
+import http.middleware
+import http.metrics
 
 fn lit(s: str) -> List[u8] { sys.lit(s) }
 

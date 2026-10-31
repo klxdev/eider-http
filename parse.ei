@@ -26,10 +26,10 @@
 //!   request line are skipped (RFC 9112 2.2).
 //! After `Bad`, the parser stays failed: the connection must be closed (its framing is lost).
 
-import "core/sys"
-import "std/bytes"
-import "std/time"
-import "http.ei"
+import core.sys
+import std.bytes
+import std.time
+import http
 
 const HEAD: i32 = 0
 const LENGTH: i32 = 1

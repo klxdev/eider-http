@@ -11,9 +11,9 @@
 //! Connection) belong to this package: whatever a program puts there is replaced when the
 //! message is written, so a handler can't desynchronise the framing of a connection.
 
-import "core/sys"
-import "std/bytes"
-import "std/time"
+import core.sys
+import std.bytes
+import std.time
 
 pub type Header = { name: List[u8], value: List[u8] }
 

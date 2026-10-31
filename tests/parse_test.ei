@@ -3,11 +3,11 @@
 // at a time and in two pieces at every split point gives what the whole input gives), and a
 // corpus of malformed and smuggling inputs with the status each is refused with.
 
-import "core/sys"
-import "std/bytes"
-import "std/io"
-import "../http.ei"
-import "../parse.ei"
+import core.sys
+import std.bytes
+import std.io
+import http
+import http.parse
 
 /// Test text: `\n` is CRLF, `~` a bare LF, `^` a bare CR.
 fn wire(s: str) -> List[u8] {

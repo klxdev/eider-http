@@ -13,9 +13,9 @@
 //! the router's not-found handler (404 by default). A HEAD request uses the GET route when
 //! there is no HEAD route (the server leaves out the body).
 
-import "core/sys"
-import "std/bytes"
-import "http.ei"
+import core.sys
+import std.bytes
+import http
 
 const LIT: i32 = 0
 const PARAM: i32 = 1

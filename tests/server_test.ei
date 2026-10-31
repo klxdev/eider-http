@@ -6,18 +6,18 @@
 // idle deadlines, max requests per connection, back-pressure (503 when the queue is full,
 // and keep-alive given up while others wait), and graceful shutdown with a request in flight.
 
-import "core/sys"
-import "std/bytes"
-import "std/fd"
-import "std/io"
-import "std/net"
-import "std/time"
-import "std/task"
-import "../http.ei"
-import "../parse.ei"
-import "../server.ei"
-import "../client.ei"
-import "../router.ei"
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.net
+import std.time
+import std.task
+import http
+import http.parse
+import http.server
+import http.client
+import http.router
 
 fn lit(s: str) -> List[u8] { sys.lit(s) }
 

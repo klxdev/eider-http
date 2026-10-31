@@ -7,11 +7,11 @@ route, CORS, bearer and Basic authentication), Prometheus metrics, and the profi
 labels and debugging endpoints.
 
 ```eider,ignore
-import "std/net"
-import "std/task"
-import "http"
-import "http/server"
-import "http/router"
+import std.net
+import std.task
+import http
+import http.server
+import http.router
 
 fn main() uses io, net, clock, threads {
     let mut r = router.new()
@@ -54,8 +54,8 @@ version = "0.1.0"
 uses = ["net", "io", "clock", "threads"]   # add "fs" for http/profiling's endpoints
 ```
 
-then `eider-pkg fetch` (eider-lang's `scripts/eider-pkg`) and `import "http"`,
-`import "http/server"`, ... A program grants http what the modules it loads use (the
+then `eider-pkg fetch` (eider-lang's `scripts/eider-pkg`) and `import http`,
+`import http.server`, ... A program grants http what the modules it loads use (the
 compiler checks it: E0204).
 
 ## Developing

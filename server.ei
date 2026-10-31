@@ -34,17 +34,17 @@
 //! A handler runs on a worker thread and must not block forever (nothing can interrupt it).
 //! A trap (panic, overflow) in a handler ends the whole process, as any trap does today.
 
-import "core/sys"
-import "std/bytes"
-import "std/fd"
-import "std/net"
-import "std/poll"
-import "std/time"
-import "std/task"
-import "std/sync"
-import "http.ei"
-import "parse.ei"
-import "sock.ei"
+import core.sys
+import std.bytes
+import std.fd
+import std.net
+import std.poll
+import std.time
+import std.task
+import std.sync
+import http
+import http.parse
+import http.sock
 
 pub type Config = {
     workers: usize,

@@ -15,12 +15,12 @@
 //! copies (one Lock), so the handler that serves it and the wrapper that counts see the same
 //! numbers from every worker thread.
 
-import "core/sys"
-import "std/bytes"
-import "std/sort"
-import "std/sync"
-import "std/time"
-import "http.ei"
+import core.sys
+import std.bytes
+import std.sort
+import std.sync
+import std.time
+import http
 
 type Key = { method: List[u8], code: i32 }
 

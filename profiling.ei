@@ -25,13 +25,13 @@
 // the program, so it is not for the public internet: keep `remote` false or put the
 // endpoints behind authentication (middleware.bearer).
 
-import "core/sys"
-import "std/bytes"
-import "std/atomic"
-import "std/profile"
-import "std/time"
-import "http.ei"
-import "router.ei"
+import core.sys
+import std.bytes
+import std.atomic
+import std.profile
+import std.time
+import http
+import http.router
 
 /// What `mount` adds. `enabled`: false adds nothing. `remote`: whether peers other than the
 /// local host (127.0.0.1, ::1, or a request that didn't come from a socket) may use them.
