@@ -1,12 +1,14 @@
-# Services (layer/services)
+# Services on eider-http
 
-What a networked Eider service is built from today: HTTP/1.1 and JSON-RPC 2.0 in
-`packages/http`, on std's sockets, deadlines, tokens and thread pool (docs/runtime.md), and
-`packages/json`, with middleware (request ids, access logs, metrics, CORS, authentication,
-limits and timeouts per route) in `packages/http` and OpenAPI 3.1 services in
-`packages/openapi` (docs/openapi.md). This is the first piece of the services layer
-(roadmap.md, P0.12 and the first milestone of P1.1); decisions are C40 to C51 and C80
-onwards in docs/decisions.md.
+What a networked Eider service is built from: HTTP/1.1 in this package (eider-http), on std's
+sockets, deadlines, tokens and thread pool (eider-lang's docs/runtime.md), and eider-json,
+with middleware (request ids, access logs, metrics, CORS, authentication, limits and
+timeouts per route) here too. JSON-RPC 2.0 on top of it is
+[eider-rpc](https://github.com/klxdev/eider-rpc) (its docs/jsonrpc.md), OpenAPI 3.1
+services [eider-openapi](https://github.com/klxdev/eider-openapi) (its docs/openapi.md).
+This was the first piece of Eider's services layer (eider-lang's docs/design/roadmap.md,
+P0.12 and the first milestone of P1.1); the decisions are C40 to C51 and C80 onwards in
+eider-lang's docs/decisions.md, which also records the move into this repository (U19).
 
 ```
 import "std/net"
@@ -14,15 +16,9 @@ import "std/task"
 import "http"                 // Request, Response, headers, limits, writing messages
 import "http/server"
 import "http/router"
-import "http/jsonrpc"
 
 fn main() uses io, net, clock, threads {
-    let mut rpc = jsonrpc.table()
-    rpc.add("math.add", |p: jsonrpc.Params| -> Result[List[u8], jsonrpc.Error] {
-        Ok(jsonrpc.int(p.int(0, "a")? + p.int(1, "b")?))
-    })
     let mut r = router.new()
-    r.post("/rpc", jsonrpc.handler(rpc))
     r.get("/users/:id", |q: http.Request| -> http.Response {
         http.respond(200, "text/plain", q.param("id").unwrap())
     })
@@ -32,11 +28,12 @@ fn main() uses io, net, clock, threads {
 }
 ```
 
-`examples/kvstore` is a complete service (a key-value store and a calculator over JSON-RPC,
-a REST route, graceful shutdown on SIGTERM), with an end-to-end test. `examples/todo` is a
-REST service described by OpenAPI (CRUD, validation, bearer tokens, `/openapi.json`,
-`/metrics`, the middleware below), with an end-to-end test that also checks the served
-description against a recorded golden.
+eider-rpc's `examples/kvstore` is a complete service (a key-value store and a calculator
+over JSON-RPC, a REST route, graceful shutdown on SIGTERM), with an end-to-end test.
+eider-openapi's `examples/todo` is a REST service described by OpenAPI (CRUD, validation,
+bearer tokens, `/openapi.json`, `/metrics`, the middleware below), with an end-to-end test
+that also checks the served description against a recorded golden. eider-lang's site has
+the step-by-step guide to both ("Building services").
 
 ## Modules
 
@@ -47,11 +44,11 @@ description against a recorded golden.
 | `http/server` | `listen`, `Server.serve(handler, token)`, `Config`, `Stats` | `net, io, clock, threads` |
 | `http/client` | `connect`, `Conn.request`, `fetch`, `get`, `post` | `net, io, clock` |
 | `http/router` | method + path patterns with parameters, 404/405 | none |
-| `http/jsonrpc` | JSON-RPC 2.0: a dispatch table, typed methods, the HTTP handler, a client call | none (`net, io, clock` for the client calls) |
 | `http/problem` | `ApiError`: errors as values, written as RFC 9457 problem+json | none |
 | `http/middleware` | `request_id`, `access_log`, `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` | none; `io, clock` for `access_log` and `timeout`, `io` for `random_ids` |
 | `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format | `clock` for `wrap` |
 | `http/sock` | sending before a deadline, lingering close | `net, io, clock` |
+| `http/profiling` | profiler labels per route, `/debug/profile` and `/debug/heap` (eider-lang's docs/site/tooling/profiler.md) | `fs, clock` for the endpoints |
 
 A handler is a value of type `http.Handler`, `fn(http.Request) -> http.Response`, and a
 middleware an `http.Middleware`, `fn(Handler) -> Handler` (a closure takes the
@@ -60,8 +57,9 @@ the message, a Request carries `peer` (the client's address, from the server), `
 the answer is due, set by `middleware.timeout`) and `ctx` (named values middleware hands
 inward: `request_id`, `principal`); a Response's `ctx` (never sent) carries values back out
 to the layers around the handler. The
-package's eider.toml grants its dependencies nothing (json and fuzz are pure); a program
-that uses it grants it `net, io, clock, threads` (examples/kvstore/eider.toml).
+package's eider.toml grants its dependency nothing (json is pure); a program that uses it
+grants it `net, io, clock, threads` (and `fs` with `http/profiling`'s endpoints; eider-rpc's
+examples/kvstore/eider.toml).
 
 ## Architecture
 
@@ -118,20 +116,6 @@ is split at `/` before each segment is percent-decoded, so `%2F` stays in its se
 most specific route wins (literal over parameter over rest, segment by segment); routes
 that match the path but not the method give `405` with `Allow`; HEAD falls back to GET.
 Trailing slashes are significant.
-
-**JSON-RPC 2.0** (`jsonrpc.ei`, C7, C47). A `Table` from method names to
-`fn(Params) -> Result[List[u8], Error]` (the result as JSON text). `Params` reads positional
-or named parameters with typed accessors (`int`, `str`, `bool`, `raw`, `none`, `at_most`);
-a wrong or missing one is `-32602` with the reason in `data`. `add_typed(name, decode,
-encode, f)` composes a decoder, a typed function and an encoder, which is how a typed
-dispatch table is written until JSON derive (P0.10) can generate the decoders. Everything the
-specification requires is covered by the spec's own examples in the tests: parse errors,
-invalid requests (with or without a readable id), unknown methods, notifications (never
-answered), batches (an empty one, all-notification ones, invalid members). Over HTTP:
-`POST` with `Content-Type: application/json` (else 405 / 415), `200` with the response, or
-`204` when there is nothing to send back. The client side has `call` and `notify` on a
-`client.Conn`, and `parse_reply`, which checks the version, the id and that there is exactly
-one of `result` and `error`.
 
 ## Middleware (`http/middleware`, `http/metrics`, `http/problem`)
 
@@ -209,8 +193,6 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
 | Requests per connection | 1000 | `Config.max_requests` | `Connection: close` |
 | Connections served at once | 16 | `Config.workers` | queued |
 | Connections queued | 64 | `Config.queue` | 503 |
-| JSON-RPC batch | 100 calls | `Table.max_batch` | one -32600 |
-| JSON nesting | 512 | packages/json | -32700 |
 
 ## Security posture
 
@@ -240,54 +222,41 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   a request-target are refused.
 - **Authentication and CORS** are middleware (above): bearer tokens or Basic credentials
   checked by a function the service gives, secrets compared in constant time, CORS refused
-  unless configured. packages/openapi applies the bearer check to the operations marked
+  unless configured. eider-openapi applies the bearer check to the operations marked
   `secured`.
 - **What can still go wrong.** A handler that blocks forever holds a worker forever
   (`middleware.timeout` bounds the answer, not the thread). A trap in a handler (panic,
-  overflow, out-of-bounds) ends the process, as any trap does today (needs N5). The kvstore
+  overflow, out-of-bounds) ends the process, as any trap does today (needs N5). eider-rpc's kvstore
   example checks arithmetic before doing it so a caller can't crash it. There is no rate
   limiting yet.
 
 ## Testing
 
-`packages/http/tests` (run by `tests/packages.sh`, verify.sh's packages leg):
+`tests/` (run by `scripts/test.sh`; eider-lang's verify.sh runs it too, through its
+`scripts/check-tools.sh`, when this repository is next to its checkout):
 
 - `parse_test`: valid messages, framing, pipelining, keep-alive, incremental input (each
   case is also fed byte by byte and in pieces of 2 to 7 bytes and must give the same), a
   corpus of 56 malformed and smuggling requests, every limit.
-- `fuzz_test`: with packages/fuzz's PRNG (a fixed seed, so the output is fixed): 300 random
-  valid requests and responses round-trip through the writer and parser, alone and pipelined
-  three at a time, fed whole, byte by byte and in random pieces; 1500 mutants (bytes flipped,
-  inserted or deleted, framing headers added, CRLF turned into bare LF or CR, cut short,
-  under default and tight limits) must parse identically however they are split, and every
-  message the parser accepts must satisfy the framing invariants.
-- `jsonrpc_test`: the specification's examples, typed methods, errors with data, the HTTP
-  handler's checks, the client's reply checks.
+- `fuzz_test`: with a deterministic PRNG (tests/rng.ei, a fixed seed, so the output is
+  fixed): 300 random valid requests and responses round-trip through the writer and parser,
+  alone and pipelined three at a time, fed whole, byte by byte and in random pieces; 1500
+  mutants (bytes flipped, inserted or deleted, framing headers added, CRLF turned into bare
+  LF or CR, cut short, under default and tight limits) must parse identically however they
+  are split, and every message the parser accepts must satisfy the framing invariants.
 - `server_test`: a server on 127.0.0.1 on an ephemeral port: routing, keep-alive,
   pipelining, chunked bodies, `Expect: 100-continue`, refused smuggling, the read and idle
   deadlines, `max_requests`, back-pressure (503 and keep-alive given up), graceful shutdown
   with a request in flight.
-
 - `middleware_test`: every middleware called directly. The timeout case uses a handler
   blocked on a channel that the test releases after the 503, so nothing sleeps. It also
   covers problem+json and the Prometheus text from fixed observations.
 
-`packages/openapi/tests/openapi_test` covers schema rendering and validation (every keyword,
-pointers, i64 bounds, nullable, refs), parameter text, a service's 400, 401, 413 and 415
-answers, typed handlers, and the whole document, pretty-printed.
-
-`examples/kvstore/tests/e2e_test` starts the example service on an ephemeral port, calls it
-with the client (JSON-RPC on one connection, a batch, the REST route, four concurrent clients
-from a task group) and shuts it down with its token. `examples/todo/tests/e2e_test` does the
-same for the OpenAPI service: CRUD, validation errors, 401, 413, 415, the router's 404 and
-405 as problem+json, CORS, request ids, four writers at once, `/metrics`, the served
-`/openapi.json` against `tests/openapi.golden.json` (`UPDATE_GOLDEN=1` rewrites it), and the
-access log (one line per request served, each with the peer). The threaded tests (http's
-server and middleware tests, both examples' end-to-end tests) are also run once under
-ThreadSanitizer by tests/packages.sh. They use only loopback, never a fixed port,
-and never sleep to synchronise: a server listens before its thread starts, each step waits
-(with a deadline) for the response it needs, and a timeout test waits for the server to act
-and then checks how long it took.
+The threaded tests (server and middleware) are also run once under ThreadSanitizer by
+scripts/test.sh. They use only loopback, never a fixed port, and never sleep to synchronise:
+a server listens before its thread starts, each step waits (with a deadline) for the
+response it needs, and a timeout test waits for the server to act and then checks how long
+it took. eider-rpc and eider-openapi have the end-to-end tests of their examples.
 
 ## Needs (gaps found while building this)
 
@@ -295,20 +264,20 @@ Recorded rather than worked around; none blocks the design.
 
 | # | Need | Where it showed | Today |
 |---|---|---|---|
-| ~~N1~~ | Type aliases (`type Handler = fn(Request) -> Response`) | every handler signature | done: `http.Handler`, `http.Middleware`, `jsonrpc.Method` (docs/compiler.md "C8.18"; C104) |
-| ~~N2~~ | `\r`, `\xNN` and `\u{...}` string escapes, and literal concatenation | CRLF in messages, test corpora | done: messages are written with `\r\n` literals (docs/compiler.md "C8.17"); the tests keep `wire()`, where `\n` is CRLF, by choice (C104) |
+| ~~N1~~ | Type aliases (`type Handler = fn(Request) -> Response`) | every handler signature | done: `http.Handler`, `http.Middleware`, `jsonrpc.Method` (eider-lang's docs/compiler.md "C8.18"; C104) |
+| ~~N2~~ | `\r`, `\xNN` and `\u{...}` string escapes, and literal concatenation | CRLF in messages, test corpora | done: messages are written with `\r\n` literals (eider-lang's docs/compiler.md "C8.17"); the tests keep `wire()`, where `\n` is CRLF, by choice (C104) |
 | N3 | `std/net`: a send that reports would-block (`try_send`, like `try_recv`) | sock.send_by | wait for writability before every send (correct: one writer per socket) |
 | N4 | Waiting on two descriptors with a deadline without a poller per connection (e.g. `fd.wait_any`, or one event.Loop per worker thread) | each connection waits on its socket and the stop signal | one epoll descriptor per connection (four system calls more per connection) |
 | N5 | Containing a trap: a handler's panic or overflow ends the process | server | documented; validate input before arithmetic |
 | N6 | Stackless tasks (C4) | thread per connection being served | a fixed pool; `serve` keeps its API when tasks arrive |
 | N7 | References (8.6): reading a List out of a record copies it | the request path copies heads and bodies a few times | fine at these sizes, measured nothing yet |
 | N8 | Comptime reflection and derive (P0.9, P0.10) | typed JSON-RPC parameters and results | decoder and encoder functions per type (`add_typed`) |
-| ~~N9~~ | Iterating a Map's keys | kvstore's `kv.keys` | done (docs/compiler.md "C8.20"): http/metrics and examples/todo iterate their Maps; kvstore keeps its key list, since `kv.keys` promises insertion order (C102) |
-| ~~N10~~ | Calling a function stored in a field (`(self.h)(x)`) | router | done: `self.h(x)`; a method of the same name wins (docs/compiler.md "C8.19") |
+| ~~N9~~ | Iterating a Map's keys | kvstore's `kv.keys` | done (eider-lang's docs/compiler.md "C8.20"): http/metrics and eider-openapi's examples/todo iterate their Maps; eider-rpc's kvstore keeps its key list, since `kv.keys` promises insertion order (C102) |
+| ~~N10~~ | Calling a function stored in a field (`(self.h)(x)`) | router | done: `self.h(x)`; a method of the same name wins (eider-lang's docs/compiler.md "C8.19") |
 | N11 | Name resolution with a deadline | the client takes an `net.Addr` | `net.lookup` blocks; resolve first |
 | N12 | Connection information in the handler (peer address, TLS later) | logging, rate limiting | done: `Request.peer` (TLS information later) |
-| N13 | A method chain continued on the next line (a line starting with `.field(...)`, or ending with `.`; the first is done: docs/compiler.md "C8.25", usable after the next seed) | schema and operation builders | reassignments: `s = s.field(...)` |
-| N14 | Grants checked per imported module, not against everything the program loads of a package | packages/openapi is pure but programs load http/server | openapi grants http `net, io, clock, threads` |
+| N13 | A method chain continued on the next line (a line starting with `.field(...)`, or ending with `.`; the first is done: eider-lang's docs/compiler.md "C8.25") | schema and operation builders | reassignments: `s = s.field(...)` |
+| N14 | Grants checked per imported module, not against everything the program loads of a package | eider-openapi is pure but programs load http/server | openapi grants http `net, io, clock, threads` |
 | N15 | Interrupting a handler (cancellation reaching blocked code; with N6) | `middleware.timeout` | 503 at the deadline; the handler finishes on its pool's worker, `req.deadline` for cooperation |
 | N16 | A per-route body limit before the body is read (the router consulted after the head) or streaming bodies | `middleware.body_limit` | checked after reading, up to the server's `max_body` |
 | N17 | A List literal (`["a", "b"]` is a fixed array) and `if` as a call argument (E0103) | builders, tests | `push` loops and `let`s |
@@ -321,10 +290,10 @@ Recorded rather than worked around; none blocks the design.
    tracing (W3C `traceparent`, carried like the request id).
 2. **Streaming:** request and response bodies as readers and writers (P0.4) instead of
    whole Lists, chunked responses, and `Content-Length` checked against a stream.
-3. **Typed services (P1.1):** with JSON derive (P0.10) and `dyn Trait` (P0.7), a service is a
+3. **Typed services (P1.1, eider-rpc):** with JSON derive (P0.10) and `dyn Trait` (P0.7), a service is a
    trait whose methods become `add_typed` entries and a client stub, generated from the
    types instead of written by hand; then Connect (HTTP + JSON) as the second wire format.
-4. **OpenAPI (P1.2):** done in a first form in packages/openapi (docs/openapi.md). One
+4. **OpenAPI (P1.2):** done in a first form in eider-openapi (its docs/openapi.md). One
    operation value drives the route, request validation and `/openapi.json`; typed handlers
    are decode / `fn(T) -> Result[U, ApiError]` / encode, with schemas written by hand. Next:
    derive the schemas, decoders and encoders from T and U (P0.9, P0.10), validate responses

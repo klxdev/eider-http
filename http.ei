@@ -3,8 +3,8 @@
 //! sides need (case-insensitive header names, percent-decoding, query strings, IMF-fixdate).
 //!
 //! Pure Eider, no capabilities (`sys.lit` turns literals into bytes). The incremental parser
-//! is `parse.ei`, the server `server.ei`, the client `client.ei`, routing `router.ei` and
-//! JSON-RPC 2.0 `jsonrpc.ei` (docs/services.md).
+//! is `parse.ei`, the server `server.ei`, the client `client.ei`, routing `router.ei`,
+//! middleware `middleware.ei` (docs/services.md; JSON-RPC 2.0 is eider-rpc).
 //!
 //! Header names in parsed messages are lowercased (field names are case-insensitive); names
 //! a program sets are written as given. Framing headers (Content-Length, Transfer-Encoding,
@@ -53,7 +53,7 @@ pub type Response = { status: i32, headers: List[Header], body: List[u8], versio
 /// writes it, so a handler can do what its author can.
 pub type Handler = fn(Request) -> Response
 
-/// A layer around a handler (packages/http/middleware.ei): `middleware.chain` applies a
+/// A layer around a handler (middleware.ei): `middleware.chain` applies a
 /// List of them.
 pub type Middleware = fn(Handler) -> Handler
 

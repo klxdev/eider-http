@@ -1,0 +1,26 @@
+// The fuzz test's deterministic PRNG: a 64-bit LCG (Knuth's MMIX constants), wrapping
+// arithmetic only. A copy of eider-lang's packages/fuzz PRNG (the compiler fuzzer's), so the
+// same seed gives the same run and tests/fuzz_test.out stays fixed.
+
+pub type Rng = { state: u64 }
+
+pub fn rng(seed: u64) -> Rng {
+    let mut r = Rng(seed *% 6364136223846793005 +% 1442695040888963407)
+    next(inout r)
+    r
+}
+
+/// The next 32 random bits (the high half of the state; the low bits of an LCG are weak).
+pub fn next(inout r: Rng) -> u64 {
+    r.state = r.state *% 6364136223846793005 +% 1442695040888963407
+    r.state / 4294967296
+}
+
+/// Uniform-ish in 0..n (n > 0; the modulo bias is negligible for the small n used here).
+pub fn below(inout r: Rng, n: usize) -> usize {
+    (next(inout r) % (n as u64)) as usize
+}
+
+pub fn pick(inout r: Rng, xs: List[List[u8]]) -> List[u8] {
+    xs[below(inout r, xs.len())]
+}

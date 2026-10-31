@@ -1,4 +1,4 @@
-// http/profiling: the profiler (std/profile, docs/runtime.md "Profiler") for HTTP services.
+// http/profiling: the profiler (std/profile, eider-lang's docs/runtime.md "Profiler") for HTTP services.
 //
 // - `label_routes(inout r)`: every route's handler runs under the labels `method` and
 //   `route` (the pattern, `/todos/:id`, never the path), so a profile can be split per

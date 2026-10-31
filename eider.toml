@@ -1,12 +1,11 @@
 [package]
 name = "http"
 version = "0.1.0"
-description = "HTTP/1.1: a strict incremental parser, a server with deadlines and graceful shutdown, a blocking client, a router, and JSON-RPC 2.0 over HTTP (docs/services.md)"
+eider = "0.1"
+description = "HTTP/1.1: a strict incremental parser, a server with deadlines and graceful shutdown, a blocking client, a router, middleware, metrics, problem+json and profiling endpoints (docs/services.md)"
 
-# JSON-RPC bodies (jsonrpc.ei); json is pure, so it is granted nothing
+# problem+json bodies and the middleware's JSON (problem.ei, middleware.ei); json is pure,
+# so it is granted nothing
 [deps.json]
-path = "../json"
-
-# the PRNG of the fuzz tests (tests/fuzz_test.ei); pure, granted nothing
-[deps.fuzz]
-path = "../fuzz"
+git = "https://github.com/klxdev/eider-json.git"
+version = "0.1.0"

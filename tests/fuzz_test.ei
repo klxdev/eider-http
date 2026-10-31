@@ -1,4 +1,4 @@
-// http/parse under random input, with packages/fuzz's deterministic PRNG (the same seed
+// http/parse under random input, with a deterministic PRNG (tests/rng.ei: the same seed
 // gives the same run, so the output is fixed):
 // 1. round trips: random valid requests and responses (Content-Length or chunked framing,
 //    random headers, binary bodies), written by http.write_* and parsed back whole, byte by
@@ -13,7 +13,7 @@
 import "core/sys"
 import "std/bytes"
 import "std/io"
-import "fuzz"
+import "rng.ei" as fuzz
 import "../http.ei"
 import "../parse.ei"
 

@@ -6,7 +6,7 @@
 //! `detail` for this occurrence, and `errors`, the extension member that says which parts of
 //! the request were wrong (`{"in": "body", "pointer": "#/title", "detail": "..."}` for the
 //! body, `{"in": "query", "name": "limit", "detail": "..."}` for a parameter). Typed handlers
-//! (packages/openapi) return `Result[U, ApiError]`; `middleware.errors` turns a handler that
+//! (eider-openapi) return `Result[U, ApiError]`; `middleware.errors` turns a handler that
 //! returns `Result[http.Response, ApiError]` into an ordinary one, and `middleware.problems`
 //! rewrites the package's plain-text error responses (404, 405, 413, ...) the same way, so a
 //! service answers every error in one format.
