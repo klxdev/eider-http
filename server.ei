@@ -92,8 +92,7 @@ const STOP: i64 = 2
 const CONN: i64 = 3
 
 fn bump(sh: sync.Lock[Shared], what: i32) {
-    sh.update(|s: Shared| -> Shared {
-        let mut t = s.copy()
+    sh.modify(|inout t: Shared| -> () {
         if what == 0 { t.stats.connections += 1 }
         if what == 1 { t.stats.rejected += 1 }
         if what == 2 { t.stats.requests += 1 }
@@ -101,11 +100,10 @@ fn bump(sh: sync.Lock[Shared], what: i32) {
         if what == 4 { t.stats.timeouts += 1 }
         if what == 5 { t.waiting += 1 }
         if what == 6 { t.waiting -= 1 }
-        t
     })
 }
 
-fn waiting(sh: sync.Lock[Shared]) -> i64 { sh.with(|s: Shared| -> (Shared, i64) (s, s.waiting)) }
+fn waiting(sh: sync.Lock[Shared]) -> i64 { sh.modify(|inout s: Shared| -> i64 s.waiting) }
 
 impl Server {
     /// The address the server listens on (with the real port when it was 0).

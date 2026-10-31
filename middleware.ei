@@ -209,15 +209,13 @@ pub fn access_log[W: stream.Writer + Copy](out: sync.Lock[W], h: http.Handler) -
         let resp = h(req)
         let mut line = log_line(time.wall_ns(), req, resp, time.mono_ns() - t0)
         line.push(10)
-        out.update(|w: W| -> W {
-            let mut v = w.copy()
+        out.modify(|inout v: W| -> () {
             match stream.write_all(inout v, line) {
                 Ok(z) => {
                     let f = v.flush()
                 }
                 Err(e) => {}
             }
-            v
         })
         resp
     }

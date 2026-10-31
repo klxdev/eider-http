@@ -101,29 +101,19 @@ impl Metrics {
         let k = Key(method_label(method), status)
         let us = dur_ns / 1000
         let bs = self.bounds_us
-        self.st.update(|s: St| -> St {
-            let mut t = s.copy()
+        self.st.modify(|inout t: St| -> () {
             t.counts.insert(k, t.counts.get(k).unwrap_or(0) + 1)
             for i in 0..bs.len() {
                 if us <= bs[i] { t.buckets[i] += 1 }
             }
             t.sum_ns += dur_ns
             t.count += 1
-            t
         })
     }
 
-    fn enter(self) { self.st.update(|s: St| -> St {
-        let mut t = s.copy()
-        t.in_flight += 1
-        t
-    }) }
+    fn enter(self) { self.st.modify(|inout t: St| -> () { t.in_flight += 1 }) }
 
-    fn leave(self) { self.st.update(|s: St| -> St {
-        let mut t = s.copy()
-        t.in_flight -= 1
-        t
-    }) }
+    fn leave(self) { self.st.modify(|inout t: St| -> () { t.in_flight -= 1 }) }
 
     /// Counts every request `h` answers, and how long it took.
     fn wrap(self, h: http.Handler) -> http.Handler uses clock {
