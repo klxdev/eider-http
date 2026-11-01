@@ -3,6 +3,13 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.2.0
+
+For Eider 0.2 (`eider = "0.2"`): eider-lang's 0.2 builds programs only through LLVM (clang
+17 or newer; U23) and bootstraps the compiler from a WebAssembly seed (seed/eiderc.wasm; U24).
+scripts/env.sh recognises such a checkout (seed/eiderc.wasm, or seed/eiderc.c before).
+Nothing else changed.
+
 ## 0.1.3
 
 The scripts find the Eider toolchain through `eider` (eider-lang#133) instead of a fixed
