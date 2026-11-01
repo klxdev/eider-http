@@ -54,7 +54,7 @@ version = "0.1.0"
 uses = ["net", "io", "clock", "threads"]   # add "fs" for http/profiling's endpoints
 ```
 
-then `eider-pkg fetch` (eider-lang's `scripts/eider-pkg`) and `import http`,
+then `eider fetch` and `import http`,
 `import http.server`, ... A program grants http what the modules it loads use (the
 compiler checks it: E0204).
 
@@ -63,17 +63,24 @@ compiler checks it: E0204).
 ```sh
 sh scripts/build.sh     # fetch the dependencies, check every module
 sh scripts/test.sh      # build, then run tests/*.ei against their .out files (and under TSan)
+EIDER_TOOLCHAIN=../eider-lang sh scripts/test.sh   # the same, against an eider-lang checkout
 ```
 
-The toolchain is the eider-lang checkout `$EIDER_ROOT` (default `../eider-lang`); its
-`VERSION` must have this package's MAJOR.MINOR (the `eider` field of `eider.toml`), else the
-scripts stop with exit 2 and say which release to use.
+The scripts use the toolchain [`eider`](https://github.com/klxdev/eider-lang/blob/main/docs/site/tooling/eider.md)
+picks: `$EIDER_TOOLCHAIN` (an installed toolchain's directory, or an eider-lang checkout for
+unreleased work), else the installed release for `eider.toml`'s `eider = "0.1"` (what
+`eider toolchain show` prints here). Install `eider` and the latest toolchain with
+eider-lang's `install.sh --toolchain` (from its latest release); without either, the
+scripts stop with exit 2 and say so. The toolchain's `VERSION` must have this package's
+MAJOR.MINOR (the `eider` field of `eider.toml`), else they stop with exit 2 and say which
+release to use. eiderc and eider-pkg run through `eider` (`eider eiderc ...`, `eider eider-pkg
+...`, with that toolchain), or directly when `eider` is not on the PATH.
 
 The dependency, eider-json, is a git package. To build offline or against a checkout with
 uncommitted changes, eider-pkg's `EIDER_PKG_OVERRIDE=json=<dir>` takes it from a local
 directory; `scripts/env.sh` sets it for you to `$EIDER_JSON`, else `../eider-json` when that
-checkout exists, else the toolchain's pinned release `$EIDER_ROOT/.vendor/json` (fetched there
-and hash-checked on first use by eider-lang's `scripts/vendor.sh`), else its repository
+checkout exists, else the pinned release `.vendor/json` of an eider-lang checkout used as the toolchain
+(fetched there and hash-checked on first use by its `scripts/vendor.sh`), else its repository
 (network). eider.lock keeps the git source either way (a library doesn't commit its lock).
 
 eider-lang's `scripts/verify.sh` builds and tests this repository against its own checkout

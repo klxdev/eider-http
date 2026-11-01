@@ -4,7 +4,7 @@
 #   sh scripts/build.sh
 #
 # The toolchain, its version check and the local overrides of the dependencies are
-# scripts/env.sh's: EIDER_ROOT (default ../eider-lang), EIDER_PKG_OVERRIDE, EIDER_<NAME>.
+# scripts/env.sh's: EIDER_TOOLCHAIN, else the one `eider` picks; EIDER_PKG_OVERRIDE, EIDER_<NAME>.
 # Writes eider.lock here and in each package under examples/ (`eider-pkg fetch`; a library
 # doesn't commit its lock), then `eiderc check`s a program importing every module (a module
 # can't be checked as a program of its own). Exit 2: no usable toolchain.
@@ -15,7 +15,7 @@ mkdir -p "$here/target"
 for p in "$here" "$here"/examples/*; do
   [ -f "$p/eider.toml" ] || continue
   grep -q '^\[deps\.' "$p/eider.toml" || continue
-  if ! "$eider_pkg" -C "$p" fetch > "$here/target/fetch.log" 2>&1; then
+  if ! eider_pkg -C "$p" fetch > "$here/target/fetch.log" 2>&1; then
     echo "FAIL eider-pkg fetch in $p (EIDER_PKG_OVERRIDE=$EIDER_PKG_OVERRIDE)"
     cat "$here/target/fetch.log"
     exit 1
@@ -29,5 +29,5 @@ for f in "$here"/*.ei; do
   if [ "$m" = "$pkg_name" ]; then echo "import $pkg_name" >> "$probe"; else echo "import $pkg_name.$m" >> "$probe"; fi
 done
 printf '\nfn main() {}\n' >> "$probe"
-"$ei" check "$probe" > "$here/target/check.log" 2>&1 || { echo "FAIL eiderc check (every module: $probe)"; cat "$here/target/check.log"; exit 1; }
-echo "built eider-http $mine (Eider $theirs at $toolchain)"
+ei check "$probe" > "$here/target/check.log" 2>&1 || { echo "FAIL eiderc check (every module: $probe)"; cat "$here/target/check.log"; exit 1; }
+echo "built eider-http $mine (Eider $theirs at $toolchain; $chosen)"

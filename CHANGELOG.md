@@ -3,6 +3,20 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.1.3
+
+The scripts find the Eider toolchain through `eider` (eider-lang#133) instead of a fixed
+eider-lang checkout: scripts/env.sh takes `$EIDER_TOOLCHAIN` (a toolchain directory or an
+eider-lang checkout; eider-lang's scripts/check-tools.sh sets it to its checkout), else the
+toolchain `eider toolchain show --json` names for this repository's `eider = "0.1"` (the
+newest installed 0.1 release), else stops with exit 2 and says to install `eider`
+(install.sh). eiderc and eider-pkg run through `eider` with that toolchain (`eider eiderc`,
+`eider eider-pkg`), or directly when `eider` is not on the PATH. `EIDER_ROOT` and
+`EIDER_LANG` no longer choose the toolchain, and `../eider-lang` is no longer the default.
+The pinned `.vendor/<name>` fallback for a dependency applies when the toolchain is an
+eider-lang checkout. Tested with the released Eider 0.1.0 and with eider-lang main. No
+change to the library's code.
+
 ## 0.1.2
 
 scripts/env.sh takes a dependency that has no `EIDER_<NAME>` and no sibling checkout from the
