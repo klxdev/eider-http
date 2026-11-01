@@ -3,6 +3,14 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.3.0
+
+For Eider 0.3 (`eider = "0.3"`): every plain string literal interpolates (eider-lang U29), so
+the literals with braces here are raw strings or have their braces doubled. Requires eider-json 0.3.0. Nothing else changed.
+
+With eider-lang's automatic grants (#135, #141) a depender's grant covers every module of this
+package: `clock, fs, io, net, threads` (`fs` for `http.profiling`).
+
 ## 0.2.0
 
 For Eider 0.2 (`eider = "0.2"`): eider-lang's 0.2 builds programs only through LLVM (clang
