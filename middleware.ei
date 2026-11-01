@@ -160,7 +160,7 @@ fn digits(inout out: List[u8], n: i64, width: usize) {
 /// One access-log line (without the newline): time, request id, peer, method, path, query,
 /// status, body bytes sent, duration in microseconds.
 pub fn log_line(unix_ns: i64, req: http.Request, resp: http.Response, dur_ns: i64) -> List[u8] {
-    let mut out = sys.lit("{\"time\":")
+    let mut out = sys.lit("{{\"time\":")
     json.quote_into(inout out, rfc3339(unix_ns))
     let id = match req.get_ctx("request_id") {
         Some(v) => v

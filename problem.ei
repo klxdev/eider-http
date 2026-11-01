@@ -63,7 +63,7 @@ impl ApiError {
     /// The problem as JSON text (members in a fixed order: type, title, status, detail,
     /// errors).
     fn body(self) -> List[u8] {
-        let mut out = sys.lit("{\"type\":")
+        let mut out = sys.lit("{{\"type\":")
         if self.type_uri.len() == 0 {
             json.quote_into(inout out, sys.lit("about:blank"))
         } else {
@@ -82,7 +82,7 @@ impl ApiError {
             for i in 0..self.errors.len() {
                 let f = self.errors[i]
                 if i > 0 { out.push(44) }
-                bytes.append(inout out, sys.lit("{\"in\":"))
+                bytes.append(inout out, sys.lit("{{\"in\":"))
                 json.quote_into(inout out, f.location)
                 if bytes.eq(f.location, sys.lit("body")) {
                     bytes.append(inout out, sys.lit(",\"pointer\":"))

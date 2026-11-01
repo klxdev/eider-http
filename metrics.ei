@@ -152,11 +152,11 @@ impl Metrics {
         line(inout out, "# HELP http_requests_total Requests answered, by method and status code.")
         line(inout out, "# TYPE http_requests_total counter")
         for k in keys {
-            bytes.append(inout out, sys.lit("http_requests_total{method=\""))
+            bytes.append(inout out, sys.lit("http_requests_total{{method=\""))
             bytes.append(inout out, k.method)
             bytes.append(inout out, sys.lit("\",code=\""))
             bytes.append(inout out, bytes.from_i64(k.code as i64))
-            bytes.append(inout out, sys.lit("\"} "))
+            bytes.append(inout out, sys.lit("\"}} "))
             bytes.append(inout out, bytes.from_i64(s.counts.get(k).unwrap_or(0)))
             out.push(10)
         }
@@ -168,13 +168,13 @@ impl Metrics {
         line(inout out, "# HELP http_request_duration_seconds Time to answer a request.")
         line(inout out, "# TYPE http_request_duration_seconds histogram")
         for i in 0..self.bounds_us.len() {
-            bytes.append(inout out, sys.lit("http_request_duration_seconds_bucket{le=\""))
+            bytes.append(inout out, sys.lit("http_request_duration_seconds_bucket{{le=\""))
             bytes.append(inout out, seconds_text(self.bounds_us[i]))
-            bytes.append(inout out, sys.lit("\"} "))
+            bytes.append(inout out, sys.lit("\"}} "))
             bytes.append(inout out, bytes.from_i64(s.buckets[i]))
             out.push(10)
         }
-        bytes.append(inout out, sys.lit("http_request_duration_seconds_bucket{le=\"+Inf\"} "))
+        bytes.append(inout out, sys.lit("http_request_duration_seconds_bucket{{le=\"+Inf\"}} "))
         bytes.append(inout out, bytes.from_i64(s.count))
         out.push(10)
         bytes.append(inout out, sys.lit("http_request_duration_seconds_sum "))
