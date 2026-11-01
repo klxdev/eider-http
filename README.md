@@ -72,8 +72,9 @@ scripts stop with exit 2 and say which release to use.
 The dependency, eider-json, is a git package. To build offline or against a checkout with
 uncommitted changes, eider-pkg's `EIDER_PKG_OVERRIDE=json=<dir>` takes it from a local
 directory; `scripts/env.sh` sets it for you to `$EIDER_JSON`, else `../eider-json` when that
-checkout exists, else the toolchain's pinned copy (`$EIDER_ROOT/vendor/json`). eider.lock
-keeps the git source either way (a library doesn't commit its lock).
+checkout exists, else the toolchain's pinned release `$EIDER_ROOT/.vendor/json` (fetched there
+and hash-checked on first use by eider-lang's `scripts/vendor.sh`), else its repository
+(network). eider.lock keeps the git source either way (a library doesn't commit its lock).
 
 eider-lang's `scripts/verify.sh` builds and tests this repository against its own checkout
 when it is next to it (`scripts/check-tools.sh`).

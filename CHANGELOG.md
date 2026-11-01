@@ -3,6 +3,17 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.1.2
+
+scripts/env.sh takes a dependency that has no `EIDER_<NAME>` and no sibling checkout from the
+toolchain's pinned release in `$EIDER_ROOT/.vendor/<name>` when eider-lang's `vendor.lock`
+pins it (its `scripts/vendor.sh fetch <name>` fetches and hash-checks it on first use), else
+from its repository. The toolchain's old `vendor/` is no longer looked at (eider-lang #130 and
+#124; no backwards compatibility). No change to the library's code.
+
+Needs an Eider 0.1 toolchain; the pinned copy needs one with `vendor.lock` (eider-lang #122),
+and without one a dependency comes from a sibling checkout or the network.
+
 ## 0.1.1
 
 Imports in the dotted form (eider-lang C8.26, issue #91): `import std.net`, `import json`,

@@ -1,6 +1,6 @@
 [package]
 name = "http"
-version = "0.1.1"
+version = "0.1.2"
 eider = "0.1"
 description = "HTTP/1.1: a strict incremental parser, a server with deadlines and graceful shutdown, a blocking client, a router, middleware, metrics, problem+json and profiling endpoints (docs/services.md)"
 

@@ -13,8 +13,9 @@
 # docs/site/tooling/eider-pkg.md). This sets it for each of DEPS (every git package in the
 # graph, transitive ones included) that it doesn't name yet: EIDER_<NAME> when set (e.g.
 # EIDER_JSON), else the sibling checkout ../eider-<name> when there is one, else the
-# toolchain's vendored copy (eider-lang's vendor/<name>, a pinned release) when it has one.
-# A dependency with none of these is fetched from its repository (network).
+# toolchain's pinned release in $toolchain/.vendor/<name> when eider-lang's vendor.lock pins
+# it (fetched there and hash-checked by its scripts/vendor.sh on first use). A dependency
+# with none of these is fetched from its repository (network).
 # DEPS: the git packages in this repository's dependency graph (transitive ones included).
 DEPS="json"
 
@@ -39,7 +40,9 @@ for d in $DEPS; do
   var=EIDER_$(echo "$d" | tr 'a-z' 'A-Z')
   eval "dir=\${$var:-}"
   if [ -z "$dir" ] && [ -f "$here/../eider-$d/eider.toml" ]; then dir=$here/../eider-$d; fi
-  if [ -z "$dir" ] && [ -f "$toolchain/vendor/$d/eider.toml" ]; then dir=$toolchain/vendor/$d; fi
+  if [ -z "$dir" ] && [ -f "$toolchain/vendor.lock" ] && grep -q "^name = \"$d\"\$" "$toolchain/vendor.lock"; then
+    sh "$toolchain/scripts/vendor.sh" fetch "$d" >&2 && dir=$toolchain/.vendor/$d
+  fi
   if [ -n "$dir" ]; then
     dir=$(cd "$dir" && pwd -P) || die "$var: no directory $dir"
     EIDER_PKG_OVERRIDE="${EIDER_PKG_OVERRIDE:+$EIDER_PKG_OVERRIDE,}$d=$dir"
