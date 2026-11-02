@@ -1,0 +1,132 @@
+//! http/sse: server-sent events (the HTML standard's `text/event-stream`) over a chunked
+//! response: a handler returns `sse.response(run)`, the server sends the head and calls `run`
+//! on the connection's worker with a `Stream` whose methods write one event each, flushed at
+//! once. `run` returns to end the stream; a write that fails (the client went away) returns
+//! `Err`, and `is_stopping()` says the server is shutting down.
+//!
+//!     r.get("/ticks", |q: http.Request| -> http.Response {
+//!         let from = sse.last_event_id(q)                 // a reconnecting client's Last-Event-ID
+//!         sse.response(|s: sse.Stream| -> () {
+//!             let mut n: i64 = 0
+//!             while !s.is_stopping() && n < 10 {
+//!                 if s.event("tick", bytes.from_i64(n), bytes.from_i64(n)).is_err() { return }
+//!                 n += 1
+//!                 time.sleep(time.seconds(1))
+//!             }
+//!         })
+//!     })
+//!
+//! Event fields are checked, not escaped: `event` and `id` may not contain a line break (the
+//! write fails with `InvalidInput`), a NUL in an id is refused (the standard ignores such
+//! ids), and `data` may contain any text: each of its lines becomes a `data:` line, so a
+//! newline in it can't start a new field. A comment line (`: text`) is the usual keep-alive.
+
+import core.sys
+import std.bytes
+import std.stream
+import http
+
+/// The stream a handler writes events to.
+pub type Stream = { d: http.Duplex }
+
+fn has_break(b: List[u8]) -> bool {
+    for c in b {
+        if c == 10 || c == 13 { return true }
+    }
+    false
+}
+
+fn invalid(what: str) -> stream.Error { stream.error(stream.InvalidInput, what) }
+
+/// The wire form of one event: `id`, `event` (empty: none), `retry` (milliseconds, negative:
+/// none) and `data` (each line a `data:` line), then the blank line that ends it. Err when `event`
+/// or `id` has a line break or `id` a NUL.
+pub fn format_event(event: List[u8], data: List[u8], id: List[u8], retry_ms: i64) -> Result[List[u8], stream.Error] {
+    if has_break(event) { return Err(invalid("an event name can't contain a line break")) }
+    if has_break(id) { return Err(invalid("an event id can't contain a line break")) }
+    for c in id {
+        if c == 0 { return Err(invalid("an event id can't contain NUL")) }
+    }
+    let mut out: List[u8] = List.new()
+    if id.len() > 0 {
+        bytes.append(inout out, sys.lit("id: "))
+        bytes.append(inout out, id)
+        out.push(10)
+    }
+    if event.len() > 0 {
+        bytes.append(inout out, sys.lit("event: "))
+        bytes.append(inout out, event)
+        out.push(10)
+    }
+    if retry_ms >= 0 {
+        bytes.append(inout out, sys.lit("retry: "))
+        bytes.append(inout out, bytes.from_i64(retry_ms))
+        out.push(10)
+    }
+    // lines end at LF, CR or CRLF
+    let mut line: List[u8] = List.new()
+    let mut i: usize = 0
+    let mut any = false
+    while i <= data.len() {
+        let end = i == data.len()
+        let c: u8 = if end { 10 } else { data[i] }
+        if c == 10 || c == 13 {
+            bytes.append(inout out, sys.lit("data: "))
+            bytes.append(inout out, line)
+            out.push(10)
+            line = List.new()
+            any = true
+            if c == 13 && !end && i + 1 < data.len() && data[i + 1] == 10 { i += 1 }
+            if end { break }
+        } else {
+            line.push(c)
+        }
+        i += 1
+    }
+    out.push(10)
+    Ok(out)
+}
+
+impl Stream {
+    /// An event with a name, data and id (empty name or id: left out).
+    fn event(self, name: List[u8], data: List[u8], id: List[u8]) -> Result[(), stream.Error] {
+        let wire = format_event(name, data, id, -1)?
+        self.d.write(wire)
+    }
+
+    /// An event with data only (the client's `message` event).
+    fn data(self, data: List[u8]) -> Result[(), stream.Error] { self.event(List.new(), data, List.new()) }
+
+    /// Tells the client how long to wait before reconnecting (milliseconds).
+    fn retry(self, ms: i64) -> Result[(), stream.Error] {
+        let mut wire = sys.lit("retry: ")
+        bytes.append(inout wire, bytes.from_i64(ms))
+        bytes.append(inout wire, sys.lit("\n\n"))
+        self.d.write(wire)
+    }
+
+    /// A comment line, ignored by clients: a keep-alive that also detects a closed connection.
+    fn comment(self, text: List[u8]) -> Result[(), stream.Error] {
+        if has_break(text) { return Err(invalid("a comment can't contain a line break")) }
+        let mut wire = sys.lit(": ")
+        bytes.append(inout wire, text)
+        bytes.append(inout wire, sys.lit("\n\n"))
+        self.d.write(wire)
+    }
+
+    /// Whether the server is shutting down: end the stream.
+    fn is_stopping(self) -> bool { self.d.is_stopping() }
+}
+
+/// A `200 text/event-stream` response whose events `run` writes.
+pub fn response(run: fn(Stream)) -> http.Response {
+    let mut r = http.response(200)
+    r.set_header("Content-Type", sys.lit("text/event-stream"))
+    r.set_header("Cache-Control", sys.lit("no-cache"))
+    r.set_header("X-Accel-Buffering", sys.lit("no"))
+    r.stream = Some(http.Stream(|d: http.Duplex| -> () { run(Stream(d)) }, false))
+    r
+}
+
+/// The `Last-Event-ID` a reconnecting client sent (empty: none).
+pub fn last_event_id(req: http.Request) -> List[u8] { req.header("last-event-id").unwrap_or(List.new()) }

@@ -48,6 +48,8 @@ the step-by-step guide to both ("Building services").
 | `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` | none; `io, clock` for `access_log` and `timeout`, `io` for `random_ids` |
 | `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format; `by_route` labels both with the route (or operation id) | `clock` for `wrap` |
 | `http/trace` | W3C Trace Context: `traceparent` in, a span per request to a sink (`log_sink`, `collect`), `inject` for outgoing calls | `io, clock` for `wrap` and `inject` |
+| `http/sse` | server-sent events over a chunked response: `response(run)`, `Stream.event/data/comment/retry`, `format_event` | none |
+| `http/ws` | WebSockets (RFC 6455): `accept` (the handshake and the upgrade), `Conn.recv/send_text/send_binary/ping/close`, the frame codec, SHA-1, a test client (`dial`) | `clock` for `recv`, `dial` needs `net, io, clock` |
 | `http/sock` | sending before a deadline, lingering close | `net, io, clock` |
 | `http/profiling` | profiler labels per route, `/debug/profile` and `/debug/heap` (eider-lang's docs/site/tooling/profiler.md) | `fs, clock` for the endpoints |
 
@@ -353,3 +355,30 @@ the server writes the head (`Transfer-Encoding: chunked`), calls `run` with an `
 the worker, each `write` is one flushed chunk (bounded by `write_timeout`), and the terminating
 chunk is written when `run` returns; the connection then serves the next request. `is_stopping()`
 tells a long stream the server is shutting down. A `raw` stream is an upgrade (http/ws).
+
+## Server-sent events and WebSockets
+
+Both ride on `Response.stream` (above).
+
+**`http/sse`.** `sse.response(run)` is a `200 text/event-stream` response (`Cache-Control: no-cache`)
+whose chunked body `run` writes through an `sse.Stream`: `event(name, data, id)`, `data(text)`,
+`retry(ms)` and `comment(text)` (the keep-alive), each flushed at once. Fields are checked: a line
+break in a name or id is `InvalidInput`, and each line of the data becomes a `data:` line so it can't
+start another field. A failed write means the client went away: return. `is_stopping()` tells the
+server is shutting down. `last_event_id(req)` is a reconnecting client's `Last-Event-ID`.
+
+**`http/ws`.** `ws.accept(req, opts, run)` validates the handshake (GET, HTTP/1.1, `Upgrade` and
+`Connection`, a 16-byte base64 `Sec-WebSocket-Key`, version 13 (426 with `Sec-WebSocket-Version` if
+not), the `Origin` against `opts.origins`, a subprotocol from `opts.protocols`) and returns `101` with a
+raw stream: the server writes the head, calls `run(Conn)` on the worker, and closes the connection when
+`run` returns. `Conn.recv()` returns `Text`, `Binary` (fragments joined) or `Closed(code, reason)`;
+it answers pings, skips pongs, echoes a close, and closes with the right code on a violation: 1002
+(an unmasked client frame, reserved bits, a malformed control frame, an unknown opcode, a stray
+continuation), 1007 (text that isn't UTF-8), 1009 (a frame over `max_frame` or a message over
+`max_message`, refused from the header), 1001 (idle past `opts.idle`, or the server stopping).
+Sends are whole frames under a lock, so several threads may send. The codec (`encode_frame`,
+`Decoder`), SHA-1 and the accept key are public and tested against the RFC's examples and FIPS 180's
+vectors; SHA-1 is written here (a few lines, no dependency on packages/crypto, which would need a
+libcrypto at link time). Handlers that call `recv` need `uses clock` on the function that builds them.
+`ws.dial` is a masking client for tests and tools. Not done: permessage-deflate and other
+extensions, TLS (put a proxy in front), backpressure beyond the write deadline.

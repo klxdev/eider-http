@@ -1,0 +1,88 @@
+-- sha-1 and the handshake key
+da39a3ee5e6b4b0d3255bfef95601890afd80709
+a9993e364706816aba3e25717850c26c9cd0d89d
+84983e441c3bd26ebaae4aa1f95129e5e54670f1
+34aa973cd4c4daa4f61eeb2bdbad27316534016f
+s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+-- frames (RFC 6455 5.7)
+810548656c6c6f
+818537fa213d7f9f4d5158
+010348656c
+80026c6f
+890548656c6c6f
+827e0100
+827f0000000000010000
+-- decoding
+a fin 1 Hello
+a need more
+b need more
+b fin 1 Hello
+unmasked client frame fail 1002 a client frame must be masked
+masked server frame fail 1002 a server frame must not be masked
+rsv1 fail 1002 reserved bits are set (no extensions are negotiated)
+over max_frame fail 1009 a frame over the limit
+fragmented ping fail 1002 a control frame is not fragmented and has at most 125 bytes
+opcode 3 fail 1002 an unknown opcode
+non-minimal length fail 1002 a length not in its shortest form
+true
+false
+false
+true
+-- server-sent events
+id: 7
+event: tick
+retry: 3000
+data: one
+
+data: a
+data: b
+data: c
+data: d
+
+data: 
+
+true
+true
+-- the handshake
+101 upgrade=websocket connection=Upgrade sec-websocket-accept=s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+101 upgrade=websocket connection=Upgrade sec-websocket-accept=s3pPLMBiTxaQ9kYGzzhZRbK+xOo= sec-websocket-protocol=chat.v2
+403 x-websocket-error=origin not allowed
+426 sec-websocket-version=13 x-websocket-error=only WebSocket version 13
+400 x-websocket-error=no Sec-WebSocket-Key
+400 x-websocket-error=Sec-WebSocket-Key is not 16 bytes of base64
+400 x-websocket-error=no Upgrade: websocket
+405 x-websocket-error=a WebSocket handshake is a GET
+-- an echo conversation
+chat.v1
+text 1 fin héllo
+binary 2 fin bin
+joined 1 fin fragmented
+pong 10 fin p
+empty 1 fin 
+close 1009
+-- closing
+0
+close 1000
+-- protocol violations
+close 1002
+close 1007
+close 1009
+close 1002
+-- a refused handshake over HTTP
+400 connection=close x-websocket-error=no Upgrade: websocket
+-- server-sent events
+content-type=text/event-stream
+cache-control=no-cache
+transfer-encoding=chunked
+: hello
+
+id: 1
+event: tick
+data: 1
+
+data: two
+data: lines
+
+retry: 2500
+
+true

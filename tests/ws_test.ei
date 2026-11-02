@@ -1,0 +1,344 @@
+// http/ws and http/sse: SHA-1 and the handshake key against their published vectors, frames
+// (RFC 6455's own examples), handshake refusals, and over loopback an echo server with fragments,
+// ping, close, protocol violations and limits; server-sent events as a chunked response.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.fd
+import std.io
+import std.net
+import std.stream
+import std.task
+import std.time
+import http
+import http.parse
+import http.router
+import http.server
+import http.client
+import http.ws
+import http.sse
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn hex(b: List[u8]) -> String { encoding.hex(b) }
+
+fn fin_text(f: bool) -> List[u8] {
+    if f { return lit(" fin ") }
+    lit(" frag ")
+}
+
+fn cat(a: str, b: String) -> String {
+    let mut t = String.from(a)
+    t.append(b)
+    t
+}
+
+fn say(label: str, step: ws.Step) uses io {
+    match step {
+        ws.NeedMore => print(cat(label, String.from(" need more")))
+        ws.Got(f) => {
+            let mut l = lit(label)
+            bytes.append(inout l, fin_text(f.fin))
+            bytes.append(inout l, bytes.from_i64(f.opcode as i64))
+            l.push(32)
+            bytes.append(inout l, f.payload)
+            io.outln(l)
+        }
+        ws.Fail(code, why) => {
+            let mut l = lit(label)
+            bytes.append(inout l, lit(" fail "))
+            bytes.append(inout l, bytes.from_i64(code as i64))
+            l.push(32)
+            bytes.append(inout l, why.bytes())
+            io.outln(l)
+        }
+    }
+}
+
+fn codec_part() uses io {
+    print("-- sha-1 and the handshake key")
+    print(hex(ws.sha1(lit(""))))
+    print(hex(ws.sha1(lit("abc"))))
+    print(hex(ws.sha1(lit("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))))
+    let mut million: List[u8] = List.new()
+    for i in 0..(1000000 as i64) { million.push(97) }
+    print(hex(ws.sha1(million)))
+    io.outln(ws.accept_key(lit("dGhlIHNhbXBsZSBub25jZQ==")))
+
+    print("-- frames (RFC 6455 5.7)")
+    print(hex(ws.encode_frame(true, ws.TEXT, lit("Hello"), List.new())))
+    let mut key: List[u8] = List.new()
+    for b in [55, 250, 33, 61] { key.push(b as u8) }
+    print(hex(ws.encode_frame(true, ws.TEXT, lit("Hello"), key)))
+    print(hex(ws.encode_frame(false, ws.TEXT, lit("Hel"), List.new())))
+    print(hex(ws.encode_frame(true, ws.CONTINUATION, lit("lo"), List.new())))
+    print(hex(ws.encode_frame(true, ws.PING, lit("Hello"), List.new())))
+    let mut b256: List[u8] = List.new()
+    for i in 0..(256 as i32) { b256.push(1) }
+    print(hex(bytes.slice(ws.encode_frame(true, ws.BINARY, b256, List.new()), 0, 4)))
+    let mut b64k: List[u8] = List.new()
+    for i in 0..(65536 as i32) { b64k.push(1) }
+    print(hex(bytes.slice(ws.encode_frame(true, ws.BINARY, b64k, List.new()), 0, 10)))
+
+    print("-- decoding")
+    let mut d = ws.decoder(false, 1000)
+    d.feed(ws.encode_frame(true, ws.TEXT, lit("Hello"), List.new()))
+    say("a", d.next())
+    say("a", d.next())
+    let mut ds = ws.decoder(true, 1000)
+    let wire = ws.encode_frame(true, ws.TEXT, lit("Hello"), key)
+    ds.feed(bytes.slice(wire, 0, 3))
+    say("b", ds.next())
+    ds.feed(bytes.slice(wire, 3, wire.len()))
+    say("b", ds.next())
+    let mut u = ws.decoder(true, 1000)
+    u.feed(ws.encode_frame(true, ws.TEXT, lit("x"), List.new()))
+    say("unmasked client frame", u.next())
+    let mut m = ws.decoder(false, 1000)
+    m.feed(ws.encode_frame(true, ws.TEXT, lit("x"), key))
+    say("masked server frame", m.next())
+    let mut r = ws.decoder(false, 1000)
+    let mut rsv: List[u8] = List.new()
+    rsv.push(193)
+    rsv.push(0)
+    r.feed(rsv)
+    say("rsv1", r.next())
+    let mut big = ws.decoder(false, 10)
+    big.feed(ws.encode_frame(true, ws.BINARY, lit("0123456789ab"), List.new()))
+    say("over max_frame", big.next())
+    let mut ctl = ws.decoder(false, 1000)
+    ctl.feed(ws.encode_frame(false, ws.PING, lit("x"), List.new()))
+    say("fragmented ping", ctl.next())
+    let mut op = ws.decoder(false, 1000)
+    op.feed(ws.encode_frame(true, 3, lit("x"), List.new()))
+    say("opcode 3", op.next())
+    let mut long = ws.decoder(false, 1000)
+    let mut nonmin: List[u8] = List.new()
+    for b in [130, 126, 0, 5, 1, 2, 3, 4, 5] { nonmin.push(b as u8) }
+    long.feed(nonmin)
+    say("non-minimal length", long.next())
+    print(ws.valid_close_code(1000))
+    print(ws.valid_close_code(1005))
+    print(ws.valid_close_code(2999))
+    print(ws.valid_close_code(4000))
+
+    print("-- server-sent events")
+    io.out(sse.format_event(lit("tick"), lit("one"), lit("7"), 3000).unwrap())
+    io.out(sse.format_event(List.new(), lit("a\nb\r\nc\rd"), List.new(), -1).unwrap())
+    io.out(sse.format_event(List.new(), List.new(), List.new(), -1).unwrap())
+    print(sse.format_event(lit("a\nb"), lit("x"), List.new(), -1).is_err())
+    print(sse.format_event(List.new(), lit("x"), lit("1\n2"), -1).is_err())
+}
+
+fn bad_utf8() -> List[u8] {
+    let mut b: List[u8] = List.new()
+    b.push(255)
+    b.push(254)
+    b
+}
+
+fn upgrade(extra: str) -> http.Request {
+    let mut r = http.request("GET", lit("/chat"))
+    r.set_header("Host", lit("x"))
+    r.set_header("Upgrade", lit("websocket"))
+    r.set_header("Connection", lit("keep-alive, Upgrade"))
+    r.set_header("Sec-WebSocket-Key", lit("dGhlIHNhbXBsZSBub25jZQ=="))
+    r.set_header("Sec-WebSocket-Version", lit("13"))
+    r
+}
+
+fn show_head(r: http.Response) uses io {
+    let mut l = bytes.from_i64(r.status as i64)
+    for name in ["upgrade", "connection", "sec-websocket-accept", "sec-websocket-protocol", "sec-websocket-version", "x-websocket-error"] {
+        match r.header(name) {
+            Some(v) => {
+                l.push(32)
+                bytes.append(inout l, lit(name))
+                l.push(61)
+                bytes.append(inout l, v)
+            }
+            None => {}
+        }
+    }
+    io.outln(l)
+}
+
+fn handshake_part() uses io, clock {
+    print("-- the handshake")
+    let run = |c: ws.Conn| -> () {}
+    let opts = ws.options().allow_origin("https://app.example").protocol("chat.v2").protocol("chat.v1")
+    show_head(ws.accept(upgrade(""), opts, run))
+    let mut with_proto = upgrade("")
+    with_proto.set_header("Sec-WebSocket-Protocol", lit("chat.v1, chat.v2, other"))
+    with_proto.set_header("Origin", lit("https://app.example"))
+    show_head(ws.accept(with_proto, opts, run))
+    let mut bad_origin = upgrade("")
+    bad_origin.set_header("Origin", lit("https://evil.example"))
+    show_head(ws.accept(bad_origin, opts, run))
+    let mut v8 = upgrade("")
+    v8.headers = http.without(v8.headers, lit("sec-websocket-version"))
+    v8.set_header("Sec-WebSocket-Version", lit("8"))
+    show_head(ws.accept(v8, opts, run))
+    let mut nokey = upgrade("")
+    nokey.headers = http.without(nokey.headers, lit("sec-websocket-key"))
+    show_head(ws.accept(nokey, opts, run))
+    let mut shortkey = upgrade("")
+    shortkey.headers = http.without(shortkey.headers, lit("sec-websocket-key"))
+    shortkey.set_header("Sec-WebSocket-Key", lit("c2hvcnQ="))
+    show_head(ws.accept(shortkey, opts, run))
+    let mut noupgrade = upgrade("")
+    noupgrade.headers = http.without(noupgrade.headers, lit("upgrade"))
+    show_head(ws.accept(noupgrade, opts, run))
+    let mut post = upgrade("")
+    post.method = lit("POST")
+    show_head(ws.accept(post, opts, run))
+}
+
+fn app() -> router.Router uses io, clock {
+    let mut r = router.new()
+    r.get("/chat", |q: http.Request| -> http.Response {
+        let opts = ws.options().protocol("chat.v1").limits(1024, 2048).idle_timeout(time.seconds(5))
+        ws.accept(q, opts, |c: ws.Conn| -> () {
+            while true {
+                match c.recv() {
+                    Ok(ws.Text(t)) => {
+                        let z = c.send_text(t)
+                    }
+                    Ok(ws.Binary(b)) => {
+                        let z = c.send_binary(b)
+                    }
+                    Ok(ws.Closed(code, why)) => { return }
+                    Err(e) => { return }
+                }
+            }
+        })
+    })
+    r.get("/events", |q: http.Request| -> http.Response {
+        sse.response(|s: sse.Stream| -> () {
+            let a = s.comment(lit("hello"))
+            let b = s.event(lit("tick"), lit("1"), lit("1"))
+            let c = s.data(lit("two\nlines"))
+            let d = s.retry(2500)
+        })
+    })
+    r
+}
+
+fn expect_frame(c: ws.Client, dl: time.Deadline) -> Result[ws.Frame, String] uses net, io, clock {
+    let mut cc = c.copy()
+    cc.recv_frame(dl)
+}
+
+fn show_frame(label: str, r: Result[ws.Frame, String]) uses io {
+    match r {
+        Ok(f) => {
+            let mut l = lit(label)
+            l.push(32)
+            bytes.append(inout l, bytes.from_i64(f.opcode as i64))
+            bytes.append(inout l, fin_text(f.fin))
+            bytes.append(inout l, f.payload)
+            io.outln(l)
+        }
+        Err(e) => print(cat(label, cat(" error: ", e)))
+    }
+}
+
+fn close_text(f: ws.Frame) -> String {
+    if f.payload.len() < 2 { return String.from("close (no code)") }
+    let mut t = String.from("close ")
+    t.append(String.from_int((f.payload[0] as i64) * 256 + (f.payload[1] as i64)))
+    t
+}
+
+fn main() uses io, net, clock, threads {
+    codec_part()
+    handshake_part()
+    let dl = time.after_ms(20000)
+    let mut cfg = server.config()
+    cfg.workers = 4
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let a = srv.addr()
+    let h = router.handler(app())
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+
+    print("-- an echo conversation")
+    let mut protos: List[List[u8]] = List.new()
+    protos.push(lit("chat.v1"))
+    let mut c = ws.dial(a, "/chat", protos, dl).unwrap()
+    io.outln(c.protocol)
+    c.send_text(String.from("héllo"), dl).unwrap()
+    show_frame("text", c.recv_frame(dl))
+    c.send_binary(lit("bin"), dl).unwrap()
+    show_frame("binary", c.recv_frame(dl))
+    c.send_text_split(lit("frag"), lit("mented"), dl).unwrap()
+    show_frame("joined", c.recv_frame(dl))
+    c.ping(lit("p"), dl).unwrap()
+    show_frame("pong", c.recv_frame(dl))
+    c.send_text(String.from(""), dl).unwrap()
+    show_frame("empty", c.recv_frame(dl))
+    // a message over max_message in fragments of max_frame size
+    let mut chunk: List[u8] = List.new()
+    for i in 0..(1000 as i32) { chunk.push(97) }
+    c.send_frame(false, ws.TEXT, chunk, dl).unwrap()
+    c.send_frame(false, ws.CONTINUATION, chunk, dl).unwrap()
+    c.send_frame(false, ws.CONTINUATION, chunk, dl).unwrap()
+    match c.recv_frame(dl) {
+        Ok(f) => print(close_text(f))
+        Err(e) => print(cat("error: ", e))
+    }
+    c.drop_connection()
+
+    print("-- closing")
+    let mut c2 = ws.dial(a, "/chat", List.new(), dl).unwrap()
+    print(c2.protocol.len())
+    c2.close(1000, "bye", dl).unwrap()
+    match c2.recv_frame(dl) {
+        Ok(f) => print(close_text(f))
+        Err(e) => print(cat("error: ", e))
+    }
+    c2.drop_connection()
+
+    print("-- protocol violations")
+    // an unmasked frame from a client, bad UTF-8, a frame over max_frame, an orphan continuation
+    for which in [0, 1, 2, 3] {
+        let mut cv = ws.dial(a, "/chat", List.new(), dl).unwrap()
+        let mut wire: List[u8] = List.new()
+        let mut key: List[u8] = List.new()
+        for b in [1, 2, 3, 4] { key.push(b as u8) }
+        if which == 0 { wire = ws.encode_frame(true, ws.TEXT, lit("x"), List.new()) }
+        if which == 1 { wire = ws.encode_frame(true, ws.TEXT, bad_utf8(), key) }
+        if which == 2 {
+            let mut over: List[u8] = List.new()
+            for i in 0..(1025 as i32) { over.push(98) }
+            wire = ws.encode_frame(true, ws.BINARY, over, key)
+        }
+        if which == 3 { wire = ws.encode_frame(true, ws.CONTINUATION, lit("x"), key) }
+        net.send_all(cv.fd, wire).unwrap()
+        match cv.recv_frame(dl) {
+            Ok(f) => print(close_text(f))
+            Err(e) => print(cat("error: ", e))
+        }
+        cv.drop_connection()
+    }
+
+    print("-- a refused handshake over HTTP")
+    let mut plain = http.request("GET", lit("/chat"))
+    show_head(client.fetch(a, plain, dl).unwrap())
+
+    print("-- server-sent events")
+    let ev = client.fetch(a, http.request("GET", lit("/events")), dl).unwrap()
+    for name in ["content-type", "cache-control", "transfer-encoding"] {
+        let mut l = lit(name)
+        l.push(61)
+        bytes.append(inout l, ev.header(name).unwrap_or(lit("-")))
+        io.outln(l)
+    }
+    io.out(ev.body)
+
+    tok.cancel()
+    let stats = th.join()
+    print(stats.requests > 0)
+}

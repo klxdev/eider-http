@@ -596,14 +596,16 @@ pub fn write_request(r: Request, host: List[u8], keep_alive: bool) -> Result[Lis
     bytes.append(inout out, r.target)
     bytes.append(inout out, sys.lit(" HTTP/1.1\r\n"))
     if count(r.headers, sys.lit("host")) == 0 { put_header(inout out, sys.lit("Host"), host) }
+    // an upgrade request (WebSocket) says `Connection: Upgrade` itself
+    let upgrade = has_token(r.headers, sys.lit("connection"), sys.lit("upgrade")) && count(r.headers, sys.lit("upgrade")) > 0
     for h in r.headers {
-        if !is_framing(h.name) { put_header(inout out, h.name, h.value) }
+        if !is_framing(h.name) || (upgrade && eq_ci(h.name, sys.lit("connection"))) { put_header(inout out, h.name, h.value) }
     }
     let m = r.method
     if r.body.len() > 0 || bytes.eq(m, sys.lit("POST")) || bytes.eq(m, sys.lit("PUT")) || bytes.eq(m, sys.lit("PATCH")) {
         put_header(inout out, sys.lit("Content-Length"), bytes.from_u64(r.body.len() as u64))
     }
-    if !keep_alive { put_header(inout out, sys.lit("Connection"), sys.lit("close")) }
+    if !keep_alive && !upgrade { put_header(inout out, sys.lit("Connection"), sys.lit("close")) }
     bytes.append(inout out, sys.lit("\r\n"))
     bytes.append(inout out, r.body)
     Ok(out)

@@ -1,0 +1,632 @@
+//! http/ws: WebSockets (RFC 6455) on the server and a client for tests and tools.
+//!
+//! Server: a handler answers the upgrade request with `ws.accept(req, opts, run)`: it checks the
+//! handshake (GET, HTTP/1.1, `Upgrade: websocket`, `Connection: Upgrade`, a `Sec-WebSocket-Key`
+//! that is 16 bytes of base64, `Sec-WebSocket-Version: 13`, the `Origin` if `opts.origins` lists
+//! some, a subprotocol from `opts.protocols`), answers a bad one with 400, 403 or 426, and
+//! otherwise returns `101 Switching Protocols` with `Sec-WebSocket-Accept` and a raw stream
+//! (http.Stream): the server writes the head and calls `run(Conn)` on the connection's worker;
+//! when `run` returns the connection is closed (send a close first: `Conn.close`).
+//!
+//!     r.get("/chat", |q: http.Request| -> http.Response {
+//!         ws.accept(q, ws.options(), |c: ws.Conn| -> () {
+//!             while true {
+//!                 match c.recv() {
+//!                     Ok(ws.Text(t)) => { let z = c.send_text(t) }       // echo
+//!                     Ok(ws.Binary(b)) => { let z = c.send_binary(b) }
+//!                     Ok(ws.Closed(code, why)) => { return }              // the reply is sent
+//!                     Err(e) => { return }
+//!                 }
+//!             }
+//!         })
+//!     })
+//!
+//! What the connection enforces, with the close code it answers: client frames must be masked,
+//! reserved bits and extensions are not supported (1002); a control frame is at most 125 bytes
+//! and not fragmented (1002); a frame longer than `max_frame` or a message (fragments joined)
+//! longer than `max_message` is 1009; text must be UTF-8 (1007); an unknown opcode or a
+//! continuation without a start is 1002. A ping is answered with a pong by `recv`, a close is
+//! echoed. `recv` waits at most `opts.idle` for the next frame (then closes with 1001 and
+//! returns Err), and notices the server stopping (closes with 1001). Writes are whole frames
+//! under a lock, so several threads may send; only one calls `recv`.
+//!
+//! The codec is separate (`encode_frame`, `Decoder`), and so is SHA-1 (`sha1`), which the
+//! handshake needs and no std module has; it is the plain algorithm, tested against its published
+//! vectors. Not here: permessage-deflate and other extensions, TLS (use a proxy).
+//!
+//! Client: `dial(addr, target, deadline)` performs the handshake over a client.Conn and returns a
+//! `Client` that masks what it sends; `send_text`, `send_binary`, `recv`, `close`.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.fd
+import std.net
+import std.random
+import std.stream
+import std.sync
+import std.time
+import std.utf8
+import http
+import http.client
+
+// ---- SHA-1 (FIPS 180-4), in u64 arithmetic masked to 32 bits
+
+const M32: u64 = 4294967295
+
+fn rol(x: u64, n: u64) -> u64 { ((x << n) | (x >> (32 - n))) & M32 }
+
+/// The SHA-1 digest (20 bytes) of `msg`.
+pub fn sha1(msg: List[u8]) -> List[u8] {
+    let mut h0: u64 = 1732584193
+    let mut h1: u64 = 4023233417
+    let mut h2: u64 = 2562383102
+    let mut h3: u64 = 271733878
+    let mut h4: u64 = 3285377520
+    let mut data = msg.copy()
+    data.push(128)
+    while data.len() % 64 != 56 { data.push(0) }
+    let bits = (msg.len() as u64) * 8
+    let mut k: i64 = 7
+    while k >= 0 {
+        data.push(((bits >> ((k * 8) as u64)) & 255) as u8)
+        k -= 1
+    }
+    let mut off: usize = 0
+    while off < data.len() {
+        let mut w: List[u64] = List.new()
+        for i in 0..(16 as usize) {
+            let b = off + i * 4
+            w.push(((data[b] as u64) << 24) | ((data[b + 1] as u64) << 16) | ((data[b + 2] as u64) << 8) | (data[b + 3] as u64))
+        }
+        for i in (16 as usize)..(80 as usize) {
+            w.push(rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1))
+        }
+        let mut a = h0.copy()
+        let mut b = h1.copy()
+        let mut c = h2.copy()
+        let mut d = h3.copy()
+        let mut e = h4.copy()
+        for i in 0..(80 as usize) {
+            let mut f: u64 = 0
+            let mut kk: u64 = 0
+            if i < 20 {
+                f = (b & c) | ((b ^ M32) & d)
+                kk = 1518500249
+            } else if i < 40 {
+                f = b ^ c ^ d
+                kk = 1859775393
+            } else if i < 60 {
+                f = (b & c) | (b & d) | (c & d)
+                kk = 2400959708
+            } else {
+                f = b ^ c ^ d
+                kk = 3395469782
+            }
+            let t = (rol(a, 5) + f + e + kk + w[i]) & M32
+            e = d
+            d = c
+            c = rol(b, 30)
+            b = a
+            a = t
+        }
+        h0 = (h0 + a) & M32
+        h1 = (h1 + b) & M32
+        h2 = (h2 + c) & M32
+        h3 = (h3 + d) & M32
+        h4 = (h4 + e) & M32
+        off += 64
+    }
+    let mut out: List[u8] = List.new()
+    for h in [h0, h1, h2, h3, h4] {
+        out.push(((h >> 24) & 255) as u8)
+        out.push(((h >> 16) & 255) as u8)
+        out.push(((h >> 8) & 255) as u8)
+        out.push((h & 255) as u8)
+    }
+    out
+}
+
+/// The `Sec-WebSocket-Accept` for a `Sec-WebSocket-Key` (RFC 6455 4.2.2).
+pub fn accept_key(key: List[u8]) -> List[u8] {
+    let mut m = key.copy()
+    bytes.append(inout m, sys.lit("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+    encoding.base64(sha1(m)).bytes()
+}
+
+// ---- frames
+
+pub const CONTINUATION: u8 = 0
+pub const TEXT: u8 = 1
+pub const BINARY: u8 = 2
+pub const CLOSE: u8 = 8
+pub const PING: u8 = 9
+pub const PONG: u8 = 10
+
+/// A frame on the wire: `payload` is unmasked.
+pub type Frame = { fin: bool, opcode: u8, payload: List[u8] }
+
+/// A frame as bytes. `mask` is a 4-byte key (clients must mask; servers must not): empty for none.
+pub fn encode_frame(fin: bool, opcode: u8, payload: List[u8], mask: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let fin_bit: u8 = if fin { 128 } else { 0 }
+    out.push(fin_bit | opcode)
+    let m: u8 = if mask.len() == 4 { 128 } else { 0 }
+    let n = payload.len()
+    if n < 126 {
+        out.push(m | (n as u8))
+    } else if n < 65536 {
+        out.push(m | 126)
+        out.push((n / 256) as u8)
+        out.push((n % 256) as u8)
+    } else {
+        out.push(m | 127)
+        let mut k: i64 = 7
+        while k >= 0 {
+            out.push((((n as u64) >> ((k * 8) as u64)) & 255) as u8)
+            k -= 1
+        }
+    }
+    if mask.len() == 4 {
+        bytes.append(inout out, mask)
+        for i in 0..n { out.push(payload[i] ^ mask[i % 4]) }
+    } else {
+        bytes.append(inout out, payload)
+    }
+    out
+}
+
+/// What a decoder found.
+pub type Step = | NeedMore | Got(f: Frame) | Fail(code: i32, why: String)
+
+/// An incremental frame decoder. `server` true: the peer is a client, so frames must be masked.
+pub type Decoder = { buf: List[u8], pos: usize, server: bool, max_frame: usize }
+
+pub fn decoder(server: bool, max_frame: usize) -> Decoder { Decoder(List.new(), 0, server, max_frame) }
+
+fn fail(code: i32, why: str) -> Step { Fail(code, String.from(why)) }
+
+impl Decoder {
+    fn feed(inout self, data: List[u8]) { bytes.append(inout self.buf, data) }
+
+    /// Bytes buffered and not yet consumed.
+    fn buffered(self) -> usize { self.buf.len() - self.pos }
+
+    /// The next frame, if the bytes so far hold one. A frame over `max_frame` is refused from its
+    /// header, before its payload arrives.
+    fn next(inout self) -> Step {
+        let b = self.buf
+        let p = self.pos.copy()
+        let have = b.len() - p
+        if have < 2 { return NeedMore }
+        let b0 = b[p]
+        let b1 = b[p + 1]
+        if (b0 & 112) != 0 { return fail(1002, "reserved bits are set (no extensions are negotiated)") }
+        let opcode = b0 & 15
+        let fin = (b0 & 128) != 0
+        let masked = (b1 & 128) != 0
+        let mut len: u64 = (b1 & 127) as u64
+        let mut hdr: usize = 2
+        if len == 126 {
+            if have < 4 { return NeedMore }
+            len = ((b[p + 2] as u64) << 8) | (b[p + 3] as u64)
+            hdr = 4
+            if len < 126 { return fail(1002, "a length not in its shortest form") }
+        } else if len == 127 {
+            if have < 10 { return NeedMore }
+            len = 0
+            for i in (2 as usize)..(10 as usize) { len = (len << 8) | (b[p + i] as u64) }
+            hdr = 10
+            if (len >> 63) != 0 { return fail(1002, "the length's top bit is set") }
+            if len < 65536 { return fail(1002, "a length not in its shortest form") }
+        }
+        let control = opcode >= 8
+        if control && (!fin || len > 125) { return fail(1002, "a control frame is not fragmented and has at most 125 bytes") }
+        if !(opcode <= 2 || (opcode >= 8 && opcode <= 10)) { return fail(1002, "an unknown opcode") }
+        if self.server && !masked { return fail(1002, "a client frame must be masked") }
+        if !self.server && masked { return fail(1002, "a server frame must not be masked") }
+        if len > (self.max_frame as u64) { return fail(1009, "a frame over the limit") }
+        let key_len: usize = if masked { 4 } else { 0 }
+        let total = hdr + key_len + (len as usize)
+        if have < total { return NeedMore }
+        let start = p + hdr + key_len
+        let mut payload: List[u8] = List.new()
+        if masked {
+            for i in 0..(len as usize) { payload.push(b[start + i] ^ b[p + hdr + (i % 4)]) }
+        } else {
+            payload = bytes.slice(b, start, start + (len as usize))
+        }
+        self.pos = p + total
+        if self.pos > 65536 {
+            self.buf = bytes.slice(self.buf, self.pos, self.buf.len())
+            self.pos = 0
+        }
+        Got(Frame(fin, opcode, payload))
+    }
+}
+
+// ---- close codes
+
+/// Codes an endpoint may send in a close frame (RFC 6455 7.4): 1000-1003, 1007-1011, 3000-4999.
+pub fn valid_close_code(c: i32) -> bool {
+    (c >= 1000 && c <= 1003) || (c >= 1007 && c <= 1011) || (c >= 3000 && c <= 4999)
+}
+
+fn close_payload(code: i32, reason: List[u8]) -> List[u8] {
+    let mut p: List[u8] = List.new()
+    p.push((code / 256) as u8)
+    p.push((code % 256) as u8)
+    // a control frame has at most 125 bytes: the reason is cut to 123 at a character boundary
+    let mut n: usize = reason.len()
+    if n > 123 { n = 123 }
+    while n > 0 && !utf8.is_boundary(reason, n) { n -= 1 }
+    bytes.append(inout p, bytes.slice(reason, 0, n))
+    p
+}
+
+// ---- the server side
+
+/// What `accept` allows.
+/// - `origins`: allowed `Origin` values (empty: any; a request without an Origin header, as from
+///   a non-browser client, is allowed);
+/// - `protocols`: subprotocols the server speaks, in preference order (the first one the client
+///   offers is chosen; none offered or none in common: no subprotocol);
+/// - `max_frame`, `max_message`: byte limits (1009 beyond);
+/// - `idle`: how long `recv` waits for a frame before closing with 1001.
+pub type Options = {
+    origins: List[List[u8]],
+    protocols: List[List[u8]],
+    max_frame: usize,
+    max_message: usize,
+    idle: time.Duration,
+}
+
+/// Any origin, no subprotocols, 1 MiB frames, 4 MiB messages, 60 s idle.
+pub fn options() -> Options { Options(List.new(), List.new(), 1048576, 4194304, time.seconds(60)) }
+
+impl Options {
+    fn allow_origin(self, o: str) -> Options {
+        let mut c = self.copy()
+        c.origins.push(sys.lit(o))
+        c
+    }
+
+    fn protocol(self, p: str) -> Options {
+        let mut c = self.copy()
+        c.protocols.push(sys.lit(p))
+        c
+    }
+
+    fn limits(self, max_frame: usize, max_message: usize) -> Options {
+        let mut c = self.copy()
+        c.max_frame = max_frame
+        c.max_message = max_message
+        c
+    }
+
+    fn idle_timeout(self, d: time.Duration) -> Options {
+        let mut c = self.copy()
+        c.idle = d
+        c
+    }
+}
+
+/// A message `recv` returns.
+pub type Message = | Text(s: String) | Binary(b: List[u8]) | Closed(code: i32, reason: String)
+
+/// One WebSocket connection (see the module comment). Every method takes `self`: the read
+/// state and the write lock are shared handles, so the `send_...` and `close` calls are safe
+/// from several threads; only one thread should call `recv`.
+pub type Conn = {
+    d: http.Duplex,
+    wlock: sync.Lock[bool],
+    rs: sync.Lock[RState],
+    opts: Options,
+    protocol: List[u8],
+}
+
+/// What `recv` keeps between calls.
+type RState = { dec: Decoder, closed: bool, sent_close: bool }
+
+fn make_conn(d: http.Duplex, opts: Options, server: bool, protocol: List[u8]) -> Conn {
+    Conn(d, sync.lock(true), sync.lock(RState(decoder(server, opts.max_frame), false, false)), opts, protocol)
+}
+
+fn mask_key() -> List[u8] uses io {
+    match random.bytes(4) {
+        Ok(b) => b
+        Err(e) => sys.lit("\x01\x02\x03\x04")
+    }
+}
+
+impl Conn {
+    /// The subprotocol the handshake chose (empty: none).
+    fn subprotocol(self) -> List[u8] { self.protocol }
+
+    fn frame(self, fin: bool, opcode: u8, payload: List[u8]) -> Result[(), stream.Error] {
+        let key: List[u8] = List.new()
+        let wire = encode_frame(fin, opcode, payload, key)
+        let d = self.d
+        self.wlock.modify(|inout ok: bool| -> Result[(), stream.Error] { d.write(wire) })
+    }
+
+    fn send_text(self, s: String) -> Result[(), stream.Error] { self.frame(true, TEXT, s.bytes()) }
+
+    fn send_binary(self, b: List[u8]) -> Result[(), stream.Error] { self.frame(true, BINARY, b) }
+
+    fn ping(self, data: List[u8]) -> Result[(), stream.Error] {
+        if data.len() > 125 { return Err(stream.error(stream.InvalidInput, "a ping carries at most 125 bytes")) }
+        self.frame(true, PING, data)
+    }
+
+    /// Sends a close frame with `code` (1000 normal; see `valid_close_code`) and `reason`. The
+    /// connection is over once the peer's close arrives (`recv` returns `Closed`) or `run` returns.
+    fn close(self, code: i32, reason: str) -> Result[(), stream.Error] {
+        if !valid_close_code(code) { return Err(stream.error(stream.InvalidInput, "not a close code an endpoint may send")) }
+        self.frame(true, CLOSE, close_payload(code, sys.lit(reason)))
+    }
+
+    /// The next message: text or binary (fragments joined), or `Closed` when the peer closed
+    /// (the reply close frame is sent first). Pings are answered, pongs skipped. Err: the wait
+    /// timed out, the connection broke, or the peer broke the protocol (the close frame with the
+    /// code was sent).
+    fn recv(self) -> Result[Message, stream.Error] uses clock {
+        let me = self
+        self.rs.modify(|inout st: RState| -> Result[Message, stream.Error] { recv_in(me, inout st) })
+    }
+}
+
+fn fail_text(c: Conn, inout st: RState, code: i32, why: String) -> stream.Error {
+    if !st.sent_close {
+        st.sent_close = true
+        let z = c.frame(true, CLOSE, close_payload(code, why.bytes()))
+    }
+    st.closed = true
+    stream.error_text(stream.InvalidData, why)
+}
+
+fn fail_with(c: Conn, inout st: RState, code: i32, why: str) -> stream.Error { fail_text(c, inout st, code, String.from(why)) }
+
+/// The next frame, waiting up to `idle`; a Frame, or the error of the wait (with the close
+/// frame already sent for protocol errors, 1001 for the idle timeout and the server stopping).
+fn next_frame(c: Conn, inout st: RState) -> Result[Frame, stream.Error] uses clock {
+    let dl = time.after(c.opts.idle)
+    while true {
+        match st.dec.next() {
+            Got(f) => { return Ok(f) }
+            Fail(code, why) => { return Err(fail_text(c, inout st, code, why)) }
+            NeedMore => {}
+        }
+        let mut step: Result[List[u8], stream.Error] = Err(stream.error(stream.TimedOut, "idle"))
+        if !dl.expired() { step = c.d.read_by(65536, dl) }
+        match step {
+            Ok(b) => {
+                if b.len() == 0 {
+                    st.closed = true
+                    return Err(stream.error(stream.UnexpectedEof, "the peer closed the connection"))
+                }
+                st.dec.feed(b)
+            }
+            Err(e) => {
+                if e.kind == stream.Interrupted && !c.d.is_stopping() { continue }
+                if e.kind == stream.TimedOut || e.kind == stream.Interrupted {
+                    if !st.sent_close {
+                        st.sent_close = true
+                        let z = c.frame(true, CLOSE, close_payload(1001, sys.lit("going away")))
+                    }
+                    st.closed = true
+                }
+                return Err(e)
+            }
+        }
+    }
+    Err(stream.error(stream.Other, "unreachable"))
+}
+
+fn recv_in(c: Conn, inout st: RState) -> Result[Message, stream.Error] uses clock {
+    if st.closed { return Err(stream.error(stream.BrokenPipe, "the connection is closed")) }
+    let mut msg: List[u8] = List.new()
+    let mut kind: u8 = 255
+    while true {
+        let f = next_frame(c, inout st)?
+        if f.opcode == PING {
+            let z = c.frame(true, PONG, f.payload)
+        } else if f.opcode == PONG {
+            // unsolicited or answered: nothing to do
+        } else if f.opcode == CLOSE {
+            let mut code = 1005
+            let mut reason = String.from("")
+            if f.payload.len() == 1 { return Err(fail_with(c, inout st, 1002, "a close frame's payload is 0 or at least 2 bytes")) }
+            if f.payload.len() >= 2 {
+                code = (f.payload[0] as i32) * 256 + (f.payload[1] as i32)
+                if !valid_close_code(code) { return Err(fail_with(c, inout st, 1002, "an invalid close code")) }
+                let r = bytes.slice(f.payload, 2, f.payload.len())
+                if !utf8.valid(r) { return Err(fail_with(c, inout st, 1007, "the close reason is not UTF-8")) }
+                reason = String.from_bytes(r).unwrap_or(String.from(""))
+            }
+            if !st.sent_close {
+                st.sent_close = true
+                let mut echo: List[u8] = List.new()
+                if f.payload.len() >= 2 { echo = bytes.slice(f.payload, 0, 2) }
+                let z = c.frame(true, CLOSE, echo)
+            }
+            st.closed = true
+            return Ok(Closed(code, reason))
+        } else {
+            if f.opcode == CONTINUATION {
+                if kind == 255 { return Err(fail_with(c, inout st, 1002, "a continuation without a message")) }
+            } else {
+                if kind != 255 { return Err(fail_with(c, inout st, 1002, "a new message in the middle of a fragmented one")) }
+                kind = f.opcode
+            }
+            if msg.len() + f.payload.len() > c.opts.max_message { return Err(fail_with(c, inout st, 1009, "a message over the limit")) }
+            bytes.append(inout msg, f.payload)
+            if f.fin {
+                if kind == TEXT {
+                    if !utf8.valid(msg) { return Err(fail_with(c, inout st, 1007, "a text message that is not UTF-8")) }
+                    return Ok(Text(String.from_bytes(msg).unwrap_or(String.from(""))))
+                }
+                return Ok(Binary(msg))
+            }
+        }
+    }
+    Err(stream.error(stream.Other, "unreachable"))
+}
+
+fn bad(status: i32, why: str) -> http.Response {
+    let mut r = http.error_response(status)
+    r.set_header("X-WebSocket-Error", sys.lit(why))
+    r
+}
+
+/// Answers the upgrade request `req`: a failure response, or `101` with a stream that runs
+/// `run` on the connection (see the module comment).
+pub fn accept(req: http.Request, opts: Options, run: fn(Conn)) -> http.Response {
+    if !bytes.eq(req.method, sys.lit("GET")) {
+        let mut r = bad(405, "a WebSocket handshake is a GET")
+        r.set_header("Allow", sys.lit("GET"))
+        return r
+    }
+    if req.version != 11 { return bad(400, "a WebSocket handshake needs HTTP/1.1") }
+    if !http.has_token(req.headers, sys.lit("upgrade"), sys.lit("websocket")) { return bad(400, "no Upgrade: websocket") }
+    if !http.has_token(req.headers, sys.lit("connection"), sys.lit("upgrade")) { return bad(400, "no Connection: Upgrade") }
+    let key = match req.header("sec-websocket-key") {
+        Some(k) => k
+        None => { return bad(400, "no Sec-WebSocket-Key") }
+    }
+    match encoding.unbase64(key) {
+        Ok(raw) => {
+            if raw.len() != 16 { return bad(400, "Sec-WebSocket-Key is not 16 bytes of base64") }
+        }
+        Err(e) => { return bad(400, "Sec-WebSocket-Key is not base64") }
+    }
+    if !bytes.eq(req.header("sec-websocket-version").unwrap_or(List.new()), sys.lit("13")) {
+        let mut r = bad(426, "only WebSocket version 13")
+        r.set_header("Sec-WebSocket-Version", sys.lit("13"))
+        return r
+    }
+    if opts.origins.len() > 0 {
+        match req.header("origin") {
+            Some(o) => {
+                if !opts.origins.contains(o) { return bad(403, "origin not allowed") }
+            }
+            None => {}
+        }
+    }
+    let mut chosen: List[u8] = List.new()
+    match req.header("sec-websocket-protocol") {
+        Some(v) => {
+            let offered = http.list_items(v)
+            for want in opts.protocols {
+                if chosen.len() == 0 && offered.contains(want) { chosen = want }
+            }
+        }
+        None => {}
+    }
+    let mut resp = http.response(101)
+    resp.set_header("Upgrade", sys.lit("websocket"))
+    resp.set_header("Connection", sys.lit("Upgrade"))
+    resp.set_header("Sec-WebSocket-Accept", accept_key(key))
+    if chosen.len() > 0 { resp.set_header("Sec-WebSocket-Protocol", chosen) }
+    let proto = chosen.copy()
+    resp.stream = Some(http.Stream(|d: http.Duplex| -> () { run(make_conn(d, opts, true, proto)) }, true))
+    resp
+}
+
+// ---- the client
+
+/// A client connection: it masks what it sends. Not thread-safe (one user at a time).
+pub type Client = { fd: i32, dec: Decoder, closed: bool, idle_ms: i64, protocol: List[u8] }
+
+/// Connects to `addr`, performs the handshake for `target` (with `protocols` offered) and returns
+/// the connection. Err: no connection, not a 101, or a wrong `Sec-WebSocket-Accept`.
+pub fn dial(addr: net.Addr, target: str, protocols: List[List[u8]], dl: time.Deadline) -> Result[Client, String] uses net, io, clock {
+    let mut c = client.connect(addr, dl)?
+    let raw = random.bytes(16)?
+    let key = encoding.base64(raw).bytes()
+    let mut req = http.request("GET", sys.lit(target))
+    req.set_header("Upgrade", sys.lit("websocket"))
+    req.set_header("Connection", sys.lit("Upgrade"))
+    req.set_header("Sec-WebSocket-Key", key)
+    req.set_header("Sec-WebSocket-Version", sys.lit("13"))
+    if protocols.len() > 0 { req.set_header("Sec-WebSocket-Protocol", bytes.join(protocols, sys.lit(", "))) }
+    let resp = c.request(req, dl)?
+    if resp.status != 101 {
+        let mut m = String.from("the server answered ")
+        m.append(String.from_int(resp.status as i64))
+        return Err(m)
+    }
+    if !bytes.eq(resp.header("sec-websocket-accept").unwrap_or(List.new()), accept_key(key)) {
+        return Err(String.from("wrong Sec-WebSocket-Accept"))
+    }
+    // bytes the server sent after the 101 are in the client's parser
+    let mut dec = decoder(false, 16777216)
+    dec.feed(bytes.slice(c.parser.buf, c.parser.pos, c.parser.buf.len()))
+    Ok(Client(c.fd, dec, false, 20000, resp.header("sec-websocket-protocol").unwrap_or(List.new())))
+}
+
+impl Client {
+    fn send_frame(self, fin: bool, opcode: u8, payload: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock {
+        let wire = encode_frame(fin, opcode, payload, mask_key())
+        if !send_bytes(self.fd, wire, dl) { return Err(String.from("send failed")) }
+        Ok(())
+    }
+
+    fn send_text(self, s: String, dl: time.Deadline) -> Result[(), String] uses net, io, clock { self.send_frame(true, TEXT, s.bytes(), dl) }
+
+    fn send_binary(self, b: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock { self.send_frame(true, BINARY, b, dl) }
+
+    /// A text message in two fragments (for tests of fragmentation).
+    fn send_text_split(self, a: List[u8], b: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock {
+        self.send_frame(false, TEXT, a, dl)?
+        self.send_frame(true, CONTINUATION, b, dl)
+    }
+
+    fn ping(self, data: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock { self.send_frame(true, PING, data, dl) }
+
+    fn close(self, code: i32, reason: str, dl: time.Deadline) -> Result[(), String] uses net, io, clock {
+        self.send_frame(true, CLOSE, close_payload(code, sys.lit(reason)), dl)
+    }
+
+    /// The next frame from the server before `dl`.
+    fn recv_frame(inout self, dl: time.Deadline) -> Result[Frame, String] uses net, io, clock {
+        while true {
+            match self.dec.next() {
+                Got(f) => { return Ok(f) }
+                Fail(code, why) => { return Err(why) }
+                NeedMore => {}
+            }
+            match fd.read_by(self.fd, 65536, dl) {
+                Ok(Some(b)) => {
+                    if b.len() == 0 { return Err(String.from("closed")) }
+                    self.dec.feed(b)
+                }
+                Ok(None) => { return Err(String.from("timed out")) }
+                Err(e) => { return Err(e) }
+            }
+        }
+        Err(String.from("unreachable"))
+    }
+
+    /// Closes the socket.
+    fn drop_connection(self) uses io {
+        let z = fd.close(self.fd)
+    }
+}
+
+/// Sends all of `data` before `dl` (the client's socket is blocking-compatible: non-blocking and waited on).
+fn send_bytes(s: i32, data: List[u8], dl: time.Deadline) -> bool uses net, io, clock {
+    let mut rest = data.copy()
+    while rest.len() > 0 {
+        match fd.wait_ready(s, fd.READY_WRITE, dl) {
+            Ok(true) => {}
+            Ok(false) => { return false }
+            Err(e) => { return false }
+        }
+        match net.send(s, rest) {
+            Ok(n) => { rest = bytes.slice(rest, n as usize, rest.len()) }
+            Err(e) => { return false }
+        }
+    }
+    true
+}

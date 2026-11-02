@@ -22,6 +22,10 @@ with (`eider` in eider.toml), the PATCH its own.
   `Request` and `Response` have a new last field (`stream`), `Msg` has `streaming`, `Config` has
   `plan`, the parser has the `body_next` side. Parsing and responses without a plan are unchanged.
 
+- WebSockets and server-sent events (eider-http#4): `http/ws` (handshake, framing, close handshake and
+  limits, pure SHA-1, `dial` client) and `http/sse`, on `Response.stream`. `write_request` keeps a
+  `Connection: Upgrade` header on upgrade requests.
+
 ## 0.4.0
 
 For Eider 0.4 (`eider = "0.4"`). Requires eider-json 0.4.0. Nothing else changed.
