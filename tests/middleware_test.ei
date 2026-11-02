@@ -8,6 +8,7 @@ import core.sys
 import std.bytes
 import std.encoding
 import std.io
+import std.log
 import std.stream
 import std.sync
 import std.task
@@ -96,12 +97,12 @@ fn main() uses io, clock, threads {
     io.outln(ids.next())
 
     print("-- access log")
-    let log = sync.lock(stream.buffer())
+    let sink = sync.lock(stream.buffer())
     let mut q = get("/todos?done=true")
     q.peer = lit("127.0.0.1:4000")
-    let logged = middleware.request_id(ids, middleware.access_log(log, hello()))
+    let logged = middleware.request_id(ids, middleware.access_log(sink, hello()))
     show(logged(q))
-    let line = log.get().bytes()
+    let line = sink.get().bytes()
     let d = json.parse(bytes.slice(line, 0, line.len() - 1)).unwrap()
     for k in ["id", "peer", "method", "path", "query", "status", "bytes"] {
         let mut o = lit(k)
@@ -114,6 +115,19 @@ fn main() uses io, clock, threads {
     io.outln(middleware.rfc3339(0))
     io.outln(middleware.rfc3339(1793434502250000000))
     io.outln(middleware.rfc3339(951782400999999999))
+
+    print("-- access log through std/log")
+    let lg = log.new(log.Info).with(log.fields().text("service", String.from("shop")).text("version", String.from("1.2")))
+    let mut q2 = get("/todos?done=true")
+    q2.peer = lit("127.0.0.1:4000")
+    q2.set_ctx("request_id", lit("req-7"))
+    let hh = hello()
+    let mut ok = hh(q2)
+    ok.set_ctx("principal", lit("ada"))
+    io.outln(middleware.access_line(lg, 1793434502250, q2, ok, 1500000))
+    io.outln(middleware.access_line(lg, 1793434502251, get("/boom"), http.error_response(503), 20000))
+    let via = middleware.access_log_with(lg.at(log.Error), hello())
+    show(via(q2))
 
     print("-- errors and problems")
     let e = middleware.errors(|q: http.Request| -> Result[http.Response, problem.ApiError] {

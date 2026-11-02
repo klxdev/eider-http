@@ -24,6 +24,10 @@ true
 1970-01-01T00:00:00.000Z
 2026-10-31T08:15:02.250Z
 2000-02-29T00:00:00.999Z
+-- access log through std/log
+{"time":"2026-10-31T08:15:02.250Z","level":"info","msg":"request","service":"shop","version":"1.2","id":"req-7","peer":"127.0.0.1:4000","method":"GET","path":"/todos","query":"done=true","status":200,"bytes":14,"duration_us":1500,"principal":"ada"}
+{"time":"2026-10-31T08:15:02.251Z","level":"error","msg":"request","service":"shop","version":"1.2","id":"","peer":"","method":"GET","path":"/boom","status":503,"bytes":24,"duration_us":20}
+200 Content-Type=text/plain | hello id=req-7
 -- errors and problems
 200 Content-Type=text/plain | 12
 400 Content-Type=application/problem+json | {"type":"about:blank","title":"Bad Request","status":400,"detail":"n is missing"}

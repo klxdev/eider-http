@@ -3,6 +3,12 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+- `middleware.access_log_with(logger, h)`, `access_fields` and `access_line`: the access record
+  through a `std/log` Logger (typed fields, the logger's level and base fields) (eider-http#8).
+  `access_log(out, h)` is unchanged.
+
 ## 0.4.0
 
 For Eider 0.4 (`eider = "0.4"`). Requires eider-json 0.4.0. Nothing else changed.

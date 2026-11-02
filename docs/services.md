@@ -45,7 +45,7 @@ the step-by-step guide to both ("Building services").
 | `http/client` | `connect`, `Conn.request`, `fetch`, `get`, `post` | `net, io, clock` |
 | `http/router` | method + path patterns with parameters, 404/405 | none |
 | `http/problem` | `ApiError`: errors as values, written as RFC 9457 problem+json | none |
-| `http/middleware` | `request_id`, `access_log`, `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` | none; `io, clock` for `access_log` and `timeout`, `io` for `random_ids` |
+| `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` | none; `io, clock` for `access_log` and `timeout`, `io` for `random_ids` |
 | `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format | `clock` for `wrap` |
 | `http/sock` | sending before a deadline, lingering close | `net, io, clock` |
 | `http/profiling` | profiler labels per route, `/debug/profile` and `/debug/heap` (eider-lang's docs/site/tooling/profiler.md) | `fs, clock` for the endpoints |
