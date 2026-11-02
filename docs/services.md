@@ -46,7 +46,8 @@ the step-by-step guide to both ("Building services").
 | `http/router` | method + path patterns with parameters, 404/405 | none |
 | `http/problem` | `ApiError`: errors as values, written as RFC 9457 problem+json | none |
 | `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` | none; `io, clock` for `access_log` and `timeout`, `io` for `random_ids` |
-| `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format | `clock` for `wrap` |
+| `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format; `by_route` labels both with the route (or operation id) | `clock` for `wrap` |
+| `http/trace` | W3C Trace Context: `traceparent` in, a span per request to a sink (`log_sink`, `collect`), `inject` for outgoing calls | `io, clock` for `wrap` and `inject` |
 | `http/sock` | sending before a deadline, lingering close | `net, io, clock` |
 | `http/profiling` | profiler labels per route, `/debug/profile` and `/debug/heap` (eider-lang's docs/site/tooling/profiler.md) | `fs, clock` for the endpoints |
 
@@ -286,7 +287,7 @@ Recorded rather than worked around; none blocks the design.
 
 1. **Middleware and observability:** done in a first form (above). Still to do: panics
    turned into 500 once traps can be contained (N5); a `Forwarded`-aware peer address behind
-   a configured proxy; metrics per route (the operation id as a label); rate limiting;
+   a configured proxy; rate limiting;
    tracing (W3C `traceparent`, carried like the request id).
 2. **Streaming:** request and response bodies as readers and writers (P0.4) instead of
    whole Lists, chunked responses, and `Content-Length` checked against a stream.
@@ -303,3 +304,22 @@ Recorded rather than worked around; none blocks the design.
    compiler has them (C4), keeping `serve` and the handler type; per-connection pollers go
    away (N4).
 6. **TLS 1.3 in Eider** (P1.4), then HTTP/2 (P1.7) for gRPC.
+
+
+## Tracing and per-route metrics
+
+`trace.wrap(tracer, h)` joins the trace in a request's `traceparent` header (strictly parsed) or
+starts one, gives the request a span id, and puts `trace_id`, `span_id`, `traceparent` and
+`tracestate` in the request's context like the request id; the response carries `traceresponse`.
+When `h` returns, the span (name `METHOD route`, start, duration, status, parent) goes to the
+sink if the trace is sampled: `trace.log_sink(logger)` writes it as a `std/log` record,
+`trace.collect(lock)` collects them. `tracer.inject(req, out)` puts a `traceparent` for a new child
+span on a request this service sends, so the trace continues downstream. The access record
+(`middleware.access_fields`) carries `trace_id`, which ties a log line to its span.
+
+The router puts the matched pattern in the request's context and in the response's (`route`), and
+`metrics.by_route(m)` labels `http_requests_total` with `route` and keeps a latency histogram per
+route: `{route="/todos/:id",le="0.005"}`. A handler or layer that sets the response context
+`operation` (an OpenAPI operation id) is labelled by that instead; requests no route took are
+`unmatched`, so the label set is bounded by the routes. `metrics.new()` without `by_route` writes the
+series as before. Sampling profiles of a running service are `http/profiling` with eider-profiler.

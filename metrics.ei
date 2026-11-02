@@ -6,9 +6,10 @@
 //!     let app = m.wrap(router.handler(r))
 //!
 //! Series:
-//!   http_requests_total{method, code}        counter: requests answered
+//!   http_requests_total{method, code}        counter: requests answered (`by_route`: and route)
 //!   http_requests_in_flight                  gauge: requests being handled now
-//!   http_request_duration_seconds{le}        histogram: time in the wrapped handler
+//!   http_request_duration_seconds{le}        histogram: time in the wrapped handler (`by_route`: one
+//!                                            histogram per route, `{route, le}`)
 //! `method` is one of GET HEAD POST PUT PATCH DELETE OPTIONS or OTHER (a client chooses the
 //! method, so it can't be allowed to make new series); `code` is the status. Series are
 //! written sorted by method, then code, so the output is stable. A `Metrics` is shared by its
@@ -22,13 +23,15 @@ import std.sync
 import std.time
 import http
 
-type Key = { method: List[u8], code: i32 }
+type Key = { method: List[u8], route: List[u8], code: i32 }
 
-type St = { counts: Map[Key, i64], buckets: List[i64], sum_ns: i64, count: i64, in_flight: i64 }
+type Hist = { buckets: List[i64], sum_ns: i64, count: i64 }
+
+type St = { counts: Map[Key, i64], hists: Map[List[u8], Hist], in_flight: i64 }
 
 /// Counters shared by copies (see the module comment). `bounds_us`: the histogram's upper
 /// bounds in microseconds, ascending.
-pub type Metrics = { st: sync.Lock[St], bounds_us: List[i64] }
+pub type Metrics = { st: sync.Lock[St], bounds_us: List[i64], per_route: bool }
 
 /// Prometheus's default buckets: 5 ms to 10 s.
 pub fn new() -> Metrics {
@@ -39,10 +42,14 @@ pub fn new() -> Metrics {
 
 /// A histogram with these upper bounds (microseconds, ascending; `+Inf` is added).
 pub fn with_buckets(bounds_us: List[i64]) -> Metrics {
-    let mut zero: List[i64] = List.new()
-    for k in 0..bounds_us.len() { zero.push(0) }
-    Metrics(sync.lock(St(Map.new(), zero, 0, 0, 0)), bounds_us)
+    Metrics(sync.lock(St(Map.new(), Map.new(), 0)), bounds_us, false)
 }
+
+/// The same series labelled by route as well (`http_requests_total{method,route,code}`, a latency
+/// histogram per route): the label is the route pattern the router matched (`/todos/:id`), the
+/// operation id when an OpenAPI service set one, and `unmatched` for requests no route took
+/// (404, 405), so a client can't make new series. Copies share the numbers.
+pub fn by_route(m: Metrics) -> Metrics { Metrics(m.st, m.bounds_us, true) }
 
 /// The method as a label value (see the module comment).
 pub fn method_label(m: List[u8]) -> List[u8] {
@@ -90,24 +97,54 @@ fn ns_seconds(ns: i64) -> List[u8] {
     out
 }
 
+/// A label value: `\\`, `"` and newline escaped, as the exposition format asks.
+fn escape(v: List[u8]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    for c in v {
+        if c == 92 || c == 34 {
+            o.push(92)
+            o.push(c)
+        } else if c == 10 {
+            o.push(92)
+            o.push(110)
+        } else {
+            o.push(c)
+        }
+    }
+    o
+}
+
 fn line(inout out: List[u8], s: str) {
     bytes.append(inout out, sys.lit(s))
     out.push(10)
 }
 
 impl Metrics {
-    /// Counts one answered request that took `dur_ns`.
-    fn observe(self, method: List[u8], status: i32, dur_ns: i64) {
-        let k = Key(method_label(method), status)
+    /// Counts one answered request that took `dur_ns` (no route: `observe_route` with "").
+    fn observe(self, method: List[u8], status: i32, dur_ns: i64) { self.observe_route(method, List.new(), status, dur_ns) }
+
+    /// Counts one answered request on `route` (used as a label when `by_route`).
+    fn observe_route(self, method: List[u8], route: List[u8], status: i32, dur_ns: i64) {
+        let label: List[u8] = if self.per_route { route.copy() } else { List.new() }
+        let k = Key(method_label(method), label.copy(), status)
         let us = dur_ns / 1000
         let bs = self.bounds_us
         self.st.modify(|inout t: St| -> () {
             t.counts.insert(k, t.counts.get(k).unwrap_or(0) + 1)
-            for i in 0..bs.len() {
-                if us <= bs[i] { t.buckets[i] += 1 }
+            let mut h = match t.hists.get(label) {
+                Some(x) => x
+                None => {
+                    let mut zero: List[i64] = List.new()
+                    for j in 0..bs.len() { zero.push(0) }
+                    Hist(zero, 0, 0)
+                }
             }
-            t.sum_ns += dur_ns
-            t.count += 1
+            for i in 0..bs.len() {
+                if us <= bs[i] { h.buckets[i] += 1 }
+            }
+            h.sum_ns += dur_ns
+            h.count += 1
+            t.hists.insert(label, h)
         })
     }
 
@@ -124,7 +161,11 @@ impl Metrics {
             let resp = h(req)
             let d = time.mono_ns() - t0
             m.leave()
-            m.observe(req.method, resp.status, d)
+            let route = match resp.get_ctx("operation") {
+                Some(o) => o
+                None => resp.get_ctx("route").unwrap_or(sys.lit("unmatched"))
+            }
+            m.observe_route(req.method, route, resp.status, d)
             resp
         }
     }
@@ -146,6 +187,9 @@ impl Metrics {
             let c = bytes.compare(a.method, b.method)
             if c < 0 { return Less }
             if c > 0 { return Greater }
+            let r = bytes.compare(a.route, b.route)
+            if r < 0 { return Less }
+            if r > 0 { return Greater }
             a.code.compare(b.code)
         })
         let mut out: List[u8] = List.new()
@@ -154,6 +198,10 @@ impl Metrics {
         for k in keys {
             bytes.append(inout out, sys.lit("http_requests_total{{method=\""))
             bytes.append(inout out, k.method)
+            if self.per_route {
+                bytes.append(inout out, sys.lit("\",route=\""))
+                bytes.append(inout out, escape(k.route))
+            }
             bytes.append(inout out, sys.lit("\",code=\""))
             bytes.append(inout out, bytes.from_i64(k.code as i64))
             bytes.append(inout out, sys.lit("\"}} "))
@@ -167,22 +215,63 @@ impl Metrics {
         out.push(10)
         line(inout out, "# HELP http_request_duration_seconds Time to answer a request.")
         line(inout out, "# TYPE http_request_duration_seconds histogram")
-        for i in 0..self.bounds_us.len() {
-            bytes.append(inout out, sys.lit("http_request_duration_seconds_bucket{{le=\""))
-            bytes.append(inout out, seconds_text(self.bounds_us[i]))
-            bytes.append(inout out, sys.lit("\"}} "))
-            bytes.append(inout out, bytes.from_i64(s.buckets[i]))
+        let mut labels: List[List[u8]] = List.new()
+        if self.per_route {
+            labels = sort.sort_by(s.hists.keys(), |a: List[u8], b: List[u8]| -> Ordering {
+                let c = bytes.compare(a, b)
+                if c < 0 { return Less }
+                if c > 0 { return Greater }
+                Equal
+            })
+        } else {
+            labels.push(List.new())
+        }
+        for label in labels {
+            let h = match s.hists.get(label) {
+                Some(x) => x
+                None => {
+                    let mut zero: List[i64] = List.new()
+                    for j in 0..self.bounds_us.len() { zero.push(0) }
+                    Hist(zero, 0, 0)
+                }
+            }
+            let mut lab: List[u8] = List.new()
+            if self.per_route {
+                bytes.append(inout lab, sys.lit("route=\""))
+                bytes.append(inout lab, escape(label))
+                bytes.append(inout lab, sys.lit("\","))
+            }
+            for i in 0..self.bounds_us.len() {
+                bytes.append(inout out, sys.lit("http_request_duration_seconds_bucket{{"))
+                bytes.append(inout out, lab)
+                bytes.append(inout out, sys.lit("le=\""))
+                bytes.append(inout out, seconds_text(self.bounds_us[i]))
+                bytes.append(inout out, sys.lit("\"}} "))
+                bytes.append(inout out, bytes.from_i64(h.buckets[i]))
+                out.push(10)
+            }
+            bytes.append(inout out, sys.lit("http_request_duration_seconds_bucket{{"))
+            bytes.append(inout out, lab)
+            bytes.append(inout out, sys.lit("le=\"+Inf\"}} "))
+            bytes.append(inout out, bytes.from_i64(h.count))
+            out.push(10)
+            let mut tail: List[u8] = List.new()
+            if self.per_route {
+                tail.push(123)
+                bytes.append(inout tail, bytes.slice(lab, 0, lab.len() - 1))
+                tail.push(125)
+            }
+            bytes.append(inout out, sys.lit("http_request_duration_seconds_sum"))
+            bytes.append(inout out, tail)
+            out.push(32)
+            bytes.append(inout out, ns_seconds(h.sum_ns))
+            out.push(10)
+            bytes.append(inout out, sys.lit("http_request_duration_seconds_count"))
+            bytes.append(inout out, tail)
+            out.push(32)
+            bytes.append(inout out, bytes.from_i64(h.count))
             out.push(10)
         }
-        bytes.append(inout out, sys.lit("http_request_duration_seconds_bucket{{le=\"+Inf\"}} "))
-        bytes.append(inout out, bytes.from_i64(s.count))
-        out.push(10)
-        bytes.append(inout out, sys.lit("http_request_duration_seconds_sum "))
-        bytes.append(inout out, ns_seconds(s.sum_ns))
-        out.push(10)
-        bytes.append(inout out, sys.lit("http_request_duration_seconds_count "))
-        bytes.append(inout out, bytes.from_i64(s.count))
-        out.push(10)
         out
     }
 

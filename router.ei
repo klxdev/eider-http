@@ -202,8 +202,14 @@ impl Router {
             Some(i) => {
                 let mut r = req.copy()
                 r.params = best_params
+                let route = pattern_text(self.routes[i].segs)
+                r.set_ctx("route", route)
                 let h = self.routes[i].h
-                h(r)
+                let mut resp = h(r)
+                // the matched pattern goes back out to the layers around the router (metrics,
+                // tracing): a bounded set of names, unlike the paths clients send
+                resp.set_ctx("route", route)
+                resp
             }
             None => {
                 if allowed.len() == 0 {

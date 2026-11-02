@@ -235,6 +235,10 @@ pub fn access_fields(req: http.Request, resp: http.Response, dur_ns: i64) -> log
     let mut f = log.fields()
     f = f.text("id", sys.to_string(id))
     f = f.text("peer", sys.to_string(req.peer))
+    match req.get_ctx("trace_id") {
+        Some(t) => { f = f.text("trace_id", sys.to_string(t)) }
+        None => {}
+    }
     f = f.text("method", sys.to_string(req.method))
     f = f.text("path", sys.to_string(req.path))
     if req.query.len() > 0 { f = f.text("query", sys.to_string(req.query)) }

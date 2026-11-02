@@ -19,6 +19,7 @@ import http.router
 import http.problem
 import http.middleware
 import http.metrics
+import http.trace
 
 fn lit(s: str) -> List[u8] { sys.lit(s) }
 
@@ -273,4 +274,69 @@ fn main() uses io, clock, threads {
         }
     }
     io.outln(served(get("/metrics")).header("content-type").unwrap())
+
+    print("-- metrics by route")
+    let mut rt = router.new()
+    rt.get("/todos/:id", hello())
+    rt.get("/todos", hello())
+    let mut bounds2: List[i64] = List.new()
+    bounds2.push(1000)
+    bounds2.push(1000000)
+    let mr = metrics.by_route(metrics.with_buckets(bounds2))
+    let routed = mr.wrap(router.handler(rt))
+    show(routed(get("/todos/7")))
+    show(routed(get("/todos/8")))
+    show(routed(get("/todos")))
+    show(routed(get("/nope/1")))
+    mr.observe_route(lit("GET"), lit("getTodo"), 200, 2000000)
+    for l in bytes.lines(mr.render()) {
+        if !bytes.starts_with(l, lit("#")) && bytes.find(l, lit("_sum"), 0).is_none() { io.outln(l) }
+    }
+
+    print("-- tracing")
+    let none_yet: List[trace.Span] = List.new()
+    let spans = sync.lock(none_yet)
+    let tr = trace.seeded(7, trace.collect(spans))
+    let mut tr_router = router.new()
+    tr_router.get("/todos/:id", |q: http.Request| -> http.Response {
+        let out = tr.inject(q, http.request("GET", lit("/downstream")))
+        http.respond(200, "text/plain", bytes.concat(lit("outgoing "), out.header("traceparent").unwrap_or(lit("none"))))
+    })
+    let traced = trace.wrap(tr, router.handler(tr_router))
+    let ta = traced(get("/todos/1"))
+    io.outln(ta.body)
+    io.outln(ta.header("traceresponse").unwrap())
+    let mut joined = get("/todos/2")
+    joined.set_header("traceparent", lit("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"))
+    joined.set_header("tracestate", lit("vendor=x"))
+    let jb = traced(joined)
+    io.outln(jb.body)
+    let mut off = get("/todos/3")
+    off.set_header("traceparent", lit("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00"))
+    let tc = traced(off)
+    io.outln(tc.header("traceresponse").unwrap())
+    for bad in ["", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331", "ff-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", "00-00000000000000000000000000000000-b7ad6b7169203331-01", "00-0AF7651916CD43DD8448EB211C80319C-b7ad6b7169203331-01", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-extra", "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-extra"] {
+        print(trace.parse(lit(bad)).is_some())
+    }
+    let nd = traced(get("/nope"))
+    print(nd.status)
+    for sp in spans.get() {
+        let mut l = sp.name.copy()
+        l.push(32)
+        bytes.append(inout l, sp.trace_id)
+        l.push(32)
+        bytes.append(inout l, sp.span_id)
+        l.push(32)
+        bytes.append(inout l, sp.parent_id)
+        l.push(32)
+        bytes.append(inout l, bytes.from_i64(sp.status as i64))
+        l.push(32)
+        bytes.append(inout l, sp.tracestate)
+        io.outln(l)
+    }
+    let fixed = trace.span_fields(trace.Span(lit("0af7651916cd43dd8448eb211c80319c"), lit("50f5647d2380309d"), lit("b7ad6b7169203331"), lit("GET /todos/:id"), 0, 1500000, 200, true, List.new()))
+    io.outln(log.format(1793434502250, log.Info, String.from("span"), lg.base, fixed))
+    let mut tq = get("/x")
+    tq.set_ctx("trace_id", lit("abc"))
+    io.outln(middleware.access_line(lg, 1793434502250, tq, http.response(200), 1000))
 }

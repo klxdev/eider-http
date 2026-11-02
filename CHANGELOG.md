@@ -9,6 +9,12 @@ with (`eider` in eider.toml), the PATCH its own.
   through a `std/log` Logger (typed fields, the logger's level and base fields) (eider-http#8).
   `access_log(out, h)` is unchanged.
 
+- http/trace (eider-http#5): W3C `traceparent` propagation (`wrap`, `inject`, `parse`), request spans
+  to a sink (`log_sink`, `collect`), `trace_id` in access records; the router sets the matched route
+  in the request and response context; `metrics.by_route`: `route` label on the counters and one
+  histogram per route (`observe_route`; the label is the pattern, or the `operation` context an
+  OpenAPI layer sets). Without `by_route` the exposition is unchanged.
+
 ## 0.4.0
 
 For Eider 0.4 (`eider = "0.4"`). Requires eider-json 0.4.0. Nothing else changed.

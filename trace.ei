@@ -1,0 +1,285 @@
+//! http/trace: distributed tracing in the W3C Trace Context format (traceparent,
+//! https://www.w3.org/TR/trace-context/): a request joins the trace its caller sent or starts
+//! one, handlers and outgoing calls carry it, and each request ends as a span handed to a sink.
+//!
+//!     let tr = trace.tracer(trace.log_sink(lg))                  // spans as std/log records
+//!     let app = middleware.request_id(ids, trace.wrap(tr, router.handler(r)))
+//!     // in a handler: calling another service as part of the same trace
+//!     let out = tr.inject(req, http.request("GET", target))      // sets `traceparent`
+//!
+//! `wrap` reads the request's `traceparent` (strictly: version 00 or a later version's first
+//! four fields, lowercase hex, no all-zero ids; anything else is ignored and a new trace starts),
+//! gives the request a new span id, and puts the trace in the request's context like the request
+//! id: `trace_id`, `span_id`, `traceparent` (this span's) and `tracestate` (passed on as it came).
+//! The response gets `traceresponse` (the same value in the draft Trace Context level 2 response
+//! header), and when the handler returns, the span is sent to the sink: its name is the method and
+//! route (`GET /todos/:id`; the router sets the route, `unmatched` for a 404), its
+//! start (wall clock, nanoseconds), duration, status and parent. Only sampled traces are sent
+//! (the sampled flag of the incoming traceparent; new traces are sampled by default,
+//! `Tracer.sampling(false)` turns them off). `access_fields` in http/middleware adds the
+//! `trace_id` to access records so a log line and its span find each other.
+//!
+//! Ids: random from the OS by default (`tracer`), counter-based and reproducible for tests
+//! (`seeded`).
+
+import core.sys
+import std.bytes
+import std.atomic
+import std.encoding
+import std.log
+import std.random
+import std.sync
+import std.time
+import http
+
+/// What gets finished spans.
+pub type Sink = fn(Span)
+
+/// A finished request span.
+pub type Span = {
+    trace_id: List[u8],
+    span_id: List[u8],
+    parent_id: List[u8],
+    name: List[u8],
+    start_unix_ns: i64,
+    dur_ns: i64,
+    status: i32,
+    sampled: bool,
+    tracestate: List[u8],
+}
+
+/// A caller's trace context.
+pub type Parent = { trace_id: List[u8], span_id: List[u8], sampled: bool }
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 && c <= 57 { return (c - 48) as i32 }
+    if c >= 97 && c <= 102 { return (c - 87) as i32 }
+    -1
+}
+
+fn all_hex(b: List[u8]) -> bool {
+    for c in b {
+        if hexval(c) < 0 { return false }
+    }
+    true
+}
+
+fn all_zero(b: List[u8]) -> bool {
+    for c in b {
+        if c != 48 { return false }
+    }
+    true
+}
+
+/// A `traceparent` value: `version-trace_id-parent_id-flags` with a 2-hex version other than
+/// `ff`, a 32-hex trace id and a 16-hex parent id (lowercase, not all zeros) and 2-hex flags;
+/// version 00 has exactly these four fields, a later version may add more after a `-`.
+pub fn parse(v: List[u8]) -> Option[Parent] {
+    if v.len() < 55 { return None }
+    let version = bytes.slice(v, 0, 2)
+    let trace_id = bytes.slice(v, 3, 35)
+    let span_id = bytes.slice(v, 36, 52)
+    let flags = bytes.slice(v, 53, 55)
+    if v[2] != 45 || v[35] != 45 || v[52] != 45 { return None }
+    if !all_hex(version) || !all_hex(trace_id) || !all_hex(span_id) || !all_hex(flags) { return None }
+    if bytes.eq(version, sys.lit("ff")) { return None }
+    if all_zero(trace_id) || all_zero(span_id) { return None }
+    if bytes.eq(version, sys.lit("00")) {
+        if v.len() != 55 { return None }
+    } else if v.len() > 55 && v[55] != 45 {
+        return None
+    }
+    let sampled = (hexval(flags[1]) & 1) == 1
+    Some(Parent(trace_id, span_id, sampled))
+}
+
+/// The `traceparent` value for a span.
+pub fn format(trace_id: List[u8], span_id: List[u8], sampled: bool) -> List[u8] {
+    let mut o = sys.lit("00-")
+    bytes.append(inout o, trace_id)
+    o.push(45)
+    bytes.append(inout o, span_id)
+    let flags = if sampled { "-01" } else { "-00" }
+    bytes.append(inout o, sys.lit(flags))
+    o
+}
+
+/// Where ids come from.
+type Source = | Os | Seeded(counter: atomic.Atomic, seed: i64)
+
+/// Starts traces and spans and sends finished spans to `sink`. Copies share their counter.
+pub type Tracer = { src: Source, sink: Sink, sample: bool }
+
+/// A tracer with OS-random ids; `sink` gets every finished sampled span.
+pub fn tracer(sink: Sink) -> Tracer { Tracer(Os, sink, true) }
+
+/// A tracer whose ids come from `seed` and a counter (reproducible: for tests).
+pub fn seeded(seed: i64, sink: Sink) -> Tracer { Tracer(Seeded(atomic.new(0), seed), sink, true) }
+
+fn mix(x: u64) -> u64 {
+    // splitmix64 finalizer
+    let mut z = x +% 11400714819323198485
+    z = (z ^ (z >> 30)) *% 13787848793156543929
+    z = (z ^ (z >> 27)) *% 10723151780598845931
+    z ^ (z >> 31)
+}
+
+fn u64_bytes(v: u64) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    let mut k: i64 = 7
+    while k >= 0 {
+        o.push(((v >> ((k * 8) as u64)) & 255) as u8)
+        k -= 1
+    }
+    o
+}
+
+impl Tracer {
+    /// Whether new traces are sampled (an incoming traceparent's flag wins).
+    fn sampling(self, on: bool) -> Tracer { Tracer(self.src, self.sink, on) }
+
+    /// `n` bytes of id as hex (never all zero).
+    fn id(self, n: usize) -> List[u8] uses io {
+        let mut raw: List[u8] = List.new()
+        match self.src {
+            Os => {
+                match random.bytes(n as i64) {
+                    Ok(b) => { raw = b }
+                    Err(e) => {}
+                }
+            }
+            Seeded(c, seed) => {
+                let k = c.add(1, atomic.Relaxed) + 1
+                let mut x = mix((seed as u64) +% (k as u64))
+                while raw.len() < n {
+                    bytes.append(inout raw, u64_bytes(x))
+                    x = mix(x)
+                }
+                raw = bytes.slice(raw, 0, n)
+            }
+        }
+        // an all-zero id is invalid; the OS source failing or returning zeros is as good as never
+        let mut zero = raw.len() < n
+        if !zero {
+            zero = true
+            for b in raw {
+                if b != 0 { zero = false }
+            }
+        }
+        if zero {
+            raw = List.new()
+            for i in 0..n { raw.push(1) }
+        }
+        encoding.hex(raw).bytes()
+    }
+
+    /// `out` (a request this service is about to send) with a `traceparent` for a new span
+    /// under the span of `req` (and the `tracestate` it came with); `out` unchanged when `req`
+    /// has no trace.
+    fn inject(self, req: http.Request, out: http.Request) -> http.Request uses io {
+        let tid = match req.get_ctx("trace_id") {
+            Some(t) => t
+            None => { return out }
+        }
+        let sampled = req.get_ctx("traceparent").unwrap_or(List.new()).len() == 55 && bytes.ends_with(req.get_ctx("traceparent").unwrap_or(List.new()), sys.lit("-01"))
+        let mut r = out.copy()
+        r.headers = http.without(r.headers, sys.lit("traceparent"))
+        r.set_header("traceparent", format(tid, self.id(8), sampled))
+        match req.get_ctx("tracestate") {
+            Some(ts) => {
+                r.headers = http.without(r.headers, sys.lit("tracestate"))
+                r.set_header("tracestate", ts)
+            }
+            None => {}
+        }
+        r
+    }
+}
+
+fn route_name(method: List[u8], resp: http.Response) -> List[u8] {
+    let mut n = method.copy()
+    n.push(32)
+    bytes.append(inout n, resp.get_ctx("route").unwrap_or(sys.lit("unmatched")))
+    n
+}
+
+/// Traces every request `h` answers (see the module comment).
+pub fn wrap(t: Tracer, h: http.Handler) -> http.Handler uses io, clock {
+    |req: http.Request| -> http.Response {
+        let mut parent_id: List[u8] = List.new()
+        let mut trace_id: List[u8] = List.new()
+        let mut sampled = t.sample.copy()
+        let tp = req.header("traceparent")
+        let mut joined = false
+        match tp {
+            Some(v) => {
+                match parse(v) {
+                    Some(p) => {
+                        parent_id = p.span_id
+                        trace_id = p.trace_id
+                        sampled = p.sampled
+                        joined = true
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        if !joined { trace_id = t.id(16) }
+        let span_id = t.id(8)
+        let me = format(trace_id, span_id, sampled)
+        let mut r = req.copy()
+        r.set_ctx("trace_id", trace_id)
+        r.set_ctx("span_id", span_id)
+        r.set_ctx("traceparent", me)
+        let mut tracestate: List[u8] = List.new()
+        if joined {
+            match req.header("tracestate") {
+                Some(ts) => {
+                    tracestate = ts
+                    r.set_ctx("tracestate", ts)
+                }
+                None => {}
+            }
+        }
+        let start = time.wall_ns()
+        let t0 = time.mono_ns()
+        let mut resp = h(r)
+        let dur = time.mono_ns() - t0
+        resp.set_header("traceresponse", me)
+        if sampled {
+            let sink = t.sink
+            sink(Span(trace_id, span_id, parent_id, route_name(req.method, resp), start, dur, resp.status, sampled, tracestate))
+        }
+        resp
+    }
+}
+
+/// A sink that writes each span as a `std/log` record (`msg` "span", level info): trace_id,
+/// span_id, parent_id (when there is one), name, status, duration_us and start (RFC 3339 is
+/// the record's own `time`, the span's end).
+pub fn log_sink(lg: log.Logger) -> Sink uses io, clock {
+    |s: Span| -> () {
+        lg.info("span", span_fields(s))
+    }
+}
+
+/// The typed fields of a span's log record.
+pub fn span_fields(s: Span) -> log.Fields {
+    let mut f = log.fields()
+    f = f.text("trace_id", sys.to_string(s.trace_id))
+    f = f.text("span_id", sys.to_string(s.span_id))
+    if s.parent_id.len() > 0 { f = f.text("parent_id", sys.to_string(s.parent_id)) }
+    f = f.text("name", sys.to_string(s.name))
+    f = f.int("status", s.status as i64)
+    f = f.int("duration_us", s.dur_ns / 1000)
+    f
+}
+
+/// A sink that appends finished spans to a list held in a Lock (for tests and for exporters
+/// that read them in batches).
+pub fn collect(out: sync.Lock[List[Span]]) -> Sink {
+    |s: Span| -> () {
+        out.modify(|inout v: List[Span]| -> () { v.push(s) })
+    }
+}
