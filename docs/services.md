@@ -150,9 +150,10 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   (`http.error_response`, such as the router's 404 and 405) as problem+json and keeps their
   headers (`Allow`, `Retry-After`). A handler's own text is left alone. Turning a *trap* into
   a 500 still needs N5.
-- **Body limits per route** (C86). `body_limit(n, h)` answers 413 above `n` bytes. The
-  check comes after the server has read the body (up to `Limits.max_body`, the server-wide
-  ceiling), because bodies are not streams yet (N16).
+- **Body limits per route** (C86). `body_limit(n, h)` answers 413 above `n` bytes, after the
+  server has read the body (up to `Limits.max_body`, the server-wide ceiling). To refuse
+  before reading, give the route a plan: `r.route_with("POST", "/upload", http.Plan(4096,
+  false), h)` and `cfg.plan = r.planner()` (see "Streaming bodies" below).
 - **Timeouts per route** (C85). `timeout(d, pool, h)` runs `h` on a worker of `pool` and
   sets `req.deadline`. If the answer isn't there by the deadline, the response is 503
   (problem+json, `Connection: close`). A late handler can't be interrupted (N15): it runs
@@ -280,7 +281,7 @@ Recorded rather than worked around; none blocks the design.
 | N13 | A method chain continued on the next line (a line starting with `.field(...)`, or ending with `.`; the first is done: eider-lang's docs/compiler.md "C8.25") | schema and operation builders | reassignments: `s = s.field(...)` |
 | N14 | Grants checked per imported module, not against everything the program loads of a package | eider-openapi is pure but programs load http/server | openapi grants http `net, io, clock, threads` |
 | N15 | Interrupting a handler (cancellation reaching blocked code; with N6) | `middleware.timeout` | 503 at the deadline; the handler finishes on its pool's worker, `req.deadline` for cooperation |
-| N16 | A per-route body limit before the body is read (the router consulted after the head) or streaming bodies | `middleware.body_limit` | checked after reading, up to the server's `max_body` |
+| ~~N16~~ | A per-route body limit before the body is read (the router consulted after the head) or streaming bodies | `middleware.body_limit` | done: `http.Plan`, `Router.planner`, streamed bodies (below); `body_limit` remains for handlers behind other layers |
 | N17 | A List literal (`["a", "b"]` is a fixed array) and `if` as a call argument (E0103) | builders, tests | `push` loops and `let`s |
 
 ## Next steps toward OpenAPI
@@ -289,8 +290,8 @@ Recorded rather than worked around; none blocks the design.
    turned into 500 once traps can be contained (N5); a `Forwarded`-aware peer address behind
    a configured proxy; rate limiting;
    tracing (W3C `traceparent`, carried like the request id).
-2. **Streaming:** request and response bodies as readers and writers (P0.4) instead of
-   whole Lists, chunked responses, and `Content-Length` checked against a stream.
+2. **Streaming:** done: request bodies as readers, chunked responses from a producer, per-route
+   limits before the body (see "Streaming bodies"); not done: streaming *client* bodies.
 3. **Typed services (P1.1, eider-rpc):** with JSON derive (P0.10) and `dyn Trait` (P0.7), a service is a
    trait whose methods become `add_typed` entries and a client stub, generated from the
    types instead of written by hand; then Connect (HTTP + JSON) as the second wire format.
@@ -323,3 +324,32 @@ route: `{route="/todos/:id",le="0.005"}`. A handler or layer that sets the respo
 `operation` (an OpenAPI operation id) is labelled by that instead; requests no route took are
 `unmatched`, so the label set is bounded by the routes. `metrics.new()` without `by_route` writes the
 series as before. Sampling profiles of a running service are `http/profiling` with eider-profiler.
+
+
+## Streaming bodies and per-route limits
+
+**Plans.** After a request's head is parsed and before any body byte is read, the parser asks a
+`http.Planner` (`fn(method, path) -> http.Plan`, `Config.plan`) what the body may be:
+`Plan { max_body, stream }`. `max_body` is the route's own limit (0: `Limits.max_body`): a
+`Content-Length` above it is answered 413 from the head alone, a chunked body is cut off the moment
+its total passes it. `router.planner()` is the planner of a router's routes, which are given plans
+with `route_with(method, pattern, plan, h)` (the most specific matching route, as for dispatch;
+HEAD takes GET's); `cfg.plan = r.planner()` connects it. Routes added with `get`/`post`... have the
+server's limit and are buffered.
+
+**Streamed request bodies.** A route whose plan says `stream: true` gets a request with an empty
+`body` and `req.stream: Option[http.Body]`. `Body` implements `std/stream`'s `Reader`: `read(max)`
+returns 1 to `max` bytes or none at the end of the body, `read_by(max, deadline)` waits no longer
+than the deadline; each wait is bounded by `read_timeout` too (the gap between reads, not the whole
+body, so a slow upload that keeps moving is fine). A body over its limit, malformed, or cut short
+by the client is an `Err` (`InvalidData`, `UnexpectedEof`, `TimedOut`); `Expect: 100-continue` is
+answered at the first read. What the handler leaves unread is read and dropped after it returns
+(if that fails the connection is closed after the response). Handlers that read need `uses io` on
+the function that builds them. The parser's side is `Parser.set_plan` and `body_next(max)`
+(`Data`, `End`, `Wait`, `Broken`).
+
+**Streamed responses.** A response with `stream: Some(http.Stream(run, false))` is sent chunked:
+the server writes the head (`Transfer-Encoding: chunked`), calls `run` with an `http.Duplex` on
+the worker, each `write` is one flushed chunk (bounded by `write_timeout`), and the terminating
+chunk is written when `run` returns; the connection then serves the next request. `is_stopping()`
+tells a long stream the server is shutting down. A `raw` stream is an upgrade (http/ws).

@@ -15,6 +15,13 @@ with (`eider` in eider.toml), the PATCH its own.
   histogram per route (`observe_route`; the label is the pattern, or the `operation` context an
   OpenAPI layer sets). Without `by_route` the exposition is unchanged.
 
+- Streaming bodies and per-route limits before the body (eider-http#2): `http.Plan` / `Planner`
+  (`Config.plan`, `Router.route_with`, `Router.planner`, `Parser.set_plan`); `Request.stream`, an
+  `http.Body` that is a `stream.Reader`; `Response.stream`, chunked responses from a producer
+  (`http.Stream`, `Duplex`). **Breaking for code that builds the records by position:**
+  `Request` and `Response` have a new last field (`stream`), `Msg` has `streaming`, `Config` has
+  `plan`, the parser has the `body_next` side. Parsing and responses without a plan are unchanged.
+
 ## 0.4.0
 
 For Eider 0.4 (`eider = "0.4"`). Requires eider-json 0.4.0. Nothing else changed.

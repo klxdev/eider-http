@@ -49,6 +49,7 @@ pub type Msg = {
     headers: List[http.Header],
     body: List[u8],
     keep_alive: bool,
+    streaming: bool,
 }
 
 /// What `next` found.
@@ -57,6 +58,9 @@ pub type Msg = {
 /// - `Bad(status, why)`: the input is not acceptable HTTP; `status` is the response a
 ///   server should send (400, 413, 414, 431, 501, 505).
 pub type Step = | More | Done(m: Msg) | Bad(status: i32, why: List[u8])
+
+/// What `body_next` found.
+pub type Body = | Data(b: List[u8]) | End | Wait | Broken(status: i32, why: List[u8])
 
 pub type Parser = {
     response: bool,
@@ -75,13 +79,21 @@ pub type Parser = {
     trailers: usize,
     bad_status: i32,
     bad_why: List[u8],
+    plan: http.Planner,
+    max: usize,
+    got: usize,
+    streaming: bool,
+    in_stream: bool,
+    chunk: List[u8],
 }
 
-fn empty_msg() -> Msg { Msg(List.new(), List.new(), 0, 11, List.new(), List.new(), true) }
+fn empty_msg() -> Msg { Msg(List.new(), List.new(), 0, 11, List.new(), List.new(), true, false) }
 
 fn make(response: bool, lim: http.Limits) -> Parser {
-    Parser(response, lim, List.new(), 0, 0, 0, 0, 0, HEAD, empty_msg(), 0, false, false, 0, 0, List.new())
+    Parser(response, lim, List.new(), 0, 0, 0, 0, 0, HEAD, empty_msg(), 0, false, false, 0, 0, List.new(), no_plan, lim.max_body, 0, false, false, List.new())
 }
+
+fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) }
 
 /// A parser for requests (a server's).
 pub fn requests(lim: http.Limits) -> Parser { make(false, lim) }
@@ -92,10 +104,10 @@ pub fn responses(lim: http.Limits) -> Parser { make(true, lim) }
 /// The request a message is (path and query split from the target).
 pub fn to_request(m: Msg) -> http.Request {
     let (p, q) = http.split_target(m.target)
-    http.Request(m.method, m.target, p, q, m.version, m.headers, m.body, List.new(), m.keep_alive, List.new(), time.never(), List.new())
+    http.Request(m.method, m.target, p, q, m.version, m.headers, m.body, List.new(), m.keep_alive, List.new(), time.never(), List.new(), None)
 }
 
-pub fn to_response(m: Msg) -> http.Response { http.Response(m.status, m.headers, m.body, m.version, m.keep_alive, List.new()) }
+pub fn to_response(m: Msg) -> http.Response { http.Response(m.status, m.headers, m.body, m.version, m.keep_alive, List.new(), None) }
 
 impl Parser {
     /// Adds bytes that arrived.
@@ -112,6 +124,40 @@ impl Parser {
     fn wants_continue(self) -> bool { self.continue_wanted }
 
     fn continue_sent(inout self) { self.continue_wanted = false }
+
+    /// Decides, once a request's head is complete, what its body may be (`http.Planner`: the
+    /// route's body limit, and whether the body is streamed). The limit is enforced before any
+    /// body byte is read (a Content-Length over it is 413 at once); a streamed request is
+    /// reported by `next` as `Done` with an empty body and `streaming` set, and its body is read
+    /// with `body_next`. Requests only; the default plan is the parser's `Limits`, buffered.
+    fn set_plan(inout self, f: http.Planner) { self.plan = f }
+
+    /// The next piece of a streamed request's body (see `set_plan`), at most `max` bytes: `Data`
+    /// (more may follow), `End` (the body is complete and the parser is ready for the next
+    /// request), `Wait` (feed more bytes) or `Broken` (a framing error or the body over its limit;
+    /// the connection must be closed).
+    fn body_next(inout self, max: usize) -> Body {
+        if self.chunk.len() == 0 {
+            if !self.in_stream { return End }
+            let s = self.next()
+            match s {
+                Done(m) => { self.in_stream = false }
+                Bad(st, why) => {
+                    // the bytes that came before the error are delivered first; the next call fails again
+                    if self.chunk.len() == 0 { return Broken(st, why) }
+                }
+                More => {}
+            }
+            if self.chunk.len() == 0 {
+                if self.in_stream { return Wait }
+                return End
+            }
+        }
+        let n = if self.chunk.len() < max { self.chunk.len() } else { max }
+        let out = bytes.slice(self.chunk, 0, n)
+        self.chunk = bytes.slice(self.chunk, n, self.chunk.len())
+        Data(out)
+    }
 
     /// The next response answers a HEAD request (it has no body whatever its headers say).
     fn expect_no_body(inout self) { self.no_body = true }
@@ -173,6 +219,9 @@ fn finish(inout p: Parser) -> Step {
     p.no_body = false
     p.continue_wanted = false
     p.trailers = 0
+    p.max = p.lim.max_body
+    p.got = 0
+    p.streaming = false
     Done(m)
 }
 
@@ -190,7 +239,12 @@ fn advance(inout p: Parser) -> Step {
             if avail == 0 { return More }
             let n = if avail < p.left { avail } else { p.left }
             let start = p.pos
-            for i in start..start + n { p.m.body.push(p.buf[i]) }
+            if p.streaming {
+                for i in start..start + n { p.chunk.push(p.buf[i]) }
+            } else {
+                for i in start..start + n { p.m.body.push(p.buf[i]) }
+            }
+            p.got += n
             p.pos += n
             p.left -= n
             if p.left == 0 {
@@ -277,7 +331,7 @@ fn chunk_line(inout p: Parser) -> Option[Step] {
         p.phase = TRAILER
         return None
     }
-    if p.m.body.len() + size > p.lim.max_body { return Some(fail(inout p, 413, "body too large")) }
+    if p.got + size > p.max { return Some(fail(inout p, 413, "body too large")) }
     p.left = size
     p.phase = CHUNK_DATA
     None
@@ -478,6 +532,14 @@ fn framing(inout p: Parser) -> Option[Step] {
         return Some(fail(inout p, 400, "invalid Content-Length"))
     }
     if p.response && (p.no_body || http.bodyless(p.m.status)) { return Some(finish(inout p)) }
+    // the route's say over the body, now that the head is known and before a body byte is read
+    if !p.response {
+        let (path, q) = http.split_target(p.m.target)
+        let decide = p.plan
+        let pl = decide(p.m.method, path)
+        if pl.max_body > 0 { p.max = pl.max_body }
+        p.streaming = pl.stream
+    }
     if te_n > 0 {
         if v == 10 && !p.response { return Some(fail(inout p, 400, "Transfer-Encoding in an HTTP/1.0 request")) }
         let codings = http.list_items(http.find(hs, sys.lit("transfer-encoding")).unwrap())
@@ -494,16 +556,16 @@ fn framing(inout p: Parser) -> Option[Step] {
         if n > 1 { return Some(fail(inout p, 501, "transfer codings other than chunked are not supported")) }
         p.phase = CHUNK_SIZE
         expect(inout p)
-        return None
+        return stream_head(inout p)
     }
     if cl_n > 0 {
         let len = bytes.parse_u64(http.find(hs, sys.lit("content-length")).unwrap()).unwrap()
-        if len > (p.lim.max_body as u64) { return Some(fail(inout p, 413, "body too large")) }
+        if len > (p.max as u64) { return Some(fail(inout p, 413, "body too large")) }
         if len == 0 { return Some(finish(inout p)) }
         p.left = len as usize
         p.phase = LENGTH
         expect(inout p)
-        return None
+        return stream_head(inout p)
     }
     if p.response {
         p.phase = UNTIL_EOF
@@ -511,6 +573,15 @@ fn framing(inout p: Parser) -> Option[Step] {
         return None
     }
     Some(finish(inout p))
+}
+
+/// A streamed request's head is reported now, its body to follow (see `Parser.set_plan`).
+fn stream_head(inout p: Parser) -> Option[Step] {
+    if !p.streaming { return None }
+    p.in_stream = true
+    let mut h = p.m.copy()
+    h.streaming = true
+    Some(Done(h))
 }
 
 fn expect(inout p: Parser) {

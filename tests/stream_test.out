@@ -1,0 +1,44 @@
+-- the parser's plan
+bad 413 body too large
+done 8
+done 2
+bad 413 body too large
+-- a streamed body, in pieces
+done 0 streaming
+data hel
+data lo
+wait
+wait
+data world
+end
+end
+done 0 streaming
+data abc
+end
+done 0
+done 0 streaming
+data aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+broken 413
+-- per-route limits before the body
+200 content-type=text/plain; charset=utf-8 content-length=8 | small ok
+413 content-type=text/plain; charset=utf-8 content-length=22 connection=close | 413 Content Too Large
+
+413 content-type=text/plain; charset=utf-8 content-length=22 connection=close | 413 Content Too Large
+
+-- streamed bodies
+200 content-type=text/plain content-length=25 | read 20 bytes in 5 pieces
+413 content-type=text/plain; charset=utf-8 content-length=22 connection=close | 413 Content Too Large
+
+200 content-type=text/plain; charset=utf-8 content-length=12 | did not read
+200 content-type=text/plain; charset=utf-8 content-length=5 | hello
+true
+200 content-type=text/plain content-length=25 | read 11 bytes in 3 pieces
+200 content-type=text/plain; charset=utf-8 content-length=5 connection=close | hello
+-- a chunked response
+200 content-type=text/plain transfer-encoding=chunked | one
+two
+three
+
+200 content-type=text/plain; charset=utf-8 content-length=5 | hello
+true
+8

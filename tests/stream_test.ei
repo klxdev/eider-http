@@ -1,0 +1,296 @@
+// Per-route body limits enforced before the body is read, streamed request bodies, chunked
+// (streamed) responses and the parser's plan: first on the parser alone, then over loopback
+// (127.0.0.1, ephemeral ports, every wait with a deadline, nothing sleeps).
+
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.net
+import std.stream
+import std.task
+import std.time
+import http
+import http.parse
+import http.router
+import http.server
+import http.client
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+/// `\n` is CRLF.
+fn wire(s: str) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for c in sys.lit(s) {
+        if c == 10 {
+            out.push(13)
+            out.push(10)
+        } else {
+            out.push(c)
+        }
+    }
+    out
+}
+
+fn plan(method: List[u8], path: List[u8]) -> http.Plan {
+    if bytes.eq(path, lit("/small")) { return http.Plan(8, false) }
+    if bytes.eq(path, lit("/up")) { return http.Plan(100, true) }
+    http.Plan(0, false)
+}
+
+fn step_text(s: parse.Step) -> String {
+    match s {
+        parse.More => String.from("more")
+        parse.Done(m) => {
+            let mut t = String.from("done ")
+            t.append(String.from_int(m.body.len() as i64))
+            if m.streaming { t.push_str(" streaming") }
+            t
+        }
+        parse.Bad(st, why) => {
+            let mut t = String.from("bad ")
+            t.append(String.from_int(st as i64))
+            t.push_str(" ")
+            t.append(sys.to_string(why))
+            t
+        }
+    }
+}
+
+fn body_text(b: parse.Body) -> String {
+    match b {
+        parse.Data(d) => {
+            let mut t = String.from("data ")
+            t.append(sys.to_string(d))
+            t
+        }
+        parse.End => String.from("end")
+        parse.Wait => String.from("wait")
+        parse.Broken(st, why) => {
+            let mut t = String.from("broken ")
+            t.append(String.from_int(st as i64))
+            t
+        }
+    }
+}
+
+fn parser_part() uses io {
+    print("-- the parser's plan")
+    // a Content-Length over the route's limit is refused at the head: no body byte was fed
+    let mut p = parse.requests(http.limits())
+    p.set_plan(plan)
+    p.feed(wire("POST /small HTTP/1.1\nHost: x\nContent-Length: 9\n\n"))
+    print(step_text(p.next()))
+    let mut p2 = parse.requests(http.limits())
+    p2.set_plan(plan)
+    p2.feed(wire("POST /small HTTP/1.1\nHost: x\nContent-Length: 8\n\n12345678POST /x HTTP/1.1\nHost: x\nContent-Length: 2\n\nhi"))
+    print(step_text(p2.next()))
+    print(step_text(p2.next()))
+    // chunked: cut off when the total passes the limit
+    let mut p3 = parse.requests(http.limits())
+    p3.set_plan(plan)
+    p3.feed(wire("POST /small HTTP/1.1\nHost: x\nTransfer-Encoding: chunked\n\n5\n12345\n4\n6789\n"))
+    print(step_text(p3.next()))
+    print("-- a streamed body, in pieces")
+    let mut p4 = parse.requests(http.limits())
+    p4.set_plan(plan)
+    p4.feed(wire("POST /up HTTP/1.1\nHost: x\nContent-Length: 10\n\nhello"))
+    print(step_text(p4.next()))
+    print(body_text(p4.body_next(3)))
+    print(body_text(p4.body_next(3)))
+    print(body_text(p4.body_next(3)))
+    print(body_text(p4.body_next(3)))
+    p4.feed(lit("world"))
+    print(body_text(p4.body_next(100)))
+    print(body_text(p4.body_next(100)))
+    print(body_text(p4.body_next(100)))
+    // pipelined: the next request follows the streamed body
+    let mut p5 = parse.requests(http.limits())
+    p5.set_plan(plan)
+    p5.feed(wire("POST /up HTTP/1.1\nHost: x\nTransfer-Encoding: chunked\n\n3\nabc\n0\n\nGET /hello HTTP/1.1\nHost: x\n\n"))
+    print(step_text(p5.next()))
+    print(body_text(p5.body_next(100)))
+    print(body_text(p5.body_next(100)))
+    print(step_text(p5.next()))
+    // over the route's own limit while streaming
+    let mut p6 = parse.requests(http.limits())
+    p6.set_plan(plan)
+    p6.feed(wire("POST /up HTTP/1.1\nHost: x\nTransfer-Encoding: chunked\n\n40\n"))
+    print(step_text(p6.next()))
+    let mut big: List[u8] = List.new()
+    for i in 0..(64 as i32) { big.push(97) }
+    p6.feed(bytes.concat(big, wire("\n40\n")))
+    print(body_text(p6.body_next(1000)))
+    print(body_text(p6.body_next(1000)))
+}
+
+fn app() -> router.Router uses io {
+    let mut r = router.new()
+    r.route_with("POST", "/small", http.Plan(8, false), |q: http.Request| -> http.Response {
+        http.text(200, "small ok")
+    })
+    r.route_with("POST", "/up", http.Plan(100, true), |q: http.Request| -> http.Response {
+        let mut body = q.stream.unwrap()
+        let mut total: usize = 0
+        let mut pieces: usize = 0
+        while true {
+            match body.read(4) {
+                Ok(b) => {
+                    if b.len() == 0 { break }
+                    total += b.len()
+                    pieces += 1
+                }
+                Err(e) => { return http.respond(400, "text/plain", bytes.concat(lit("body failed: "), e.message.bytes())) }
+            }
+        }
+        let mut t = String.from("read ")
+        t.append(String.from_int(total as i64))
+        t.push_str(" bytes in ")
+        t.append(String.from_int(pieces as i64))
+        t.push_str(" pieces")
+        http.respond(200, "text/plain", t.bytes())
+    })
+    r.route_with("POST", "/lazy", http.Plan(0, true), |q: http.Request| -> http.Response {
+        http.text(200, "did not read")
+    })
+    r.get("/events", |q: http.Request| -> http.Response {
+        let mut resp = http.response(200)
+        resp.set_header("Content-Type", lit("text/plain"))
+        resp.stream = Some(http.Stream(|d: http.Duplex| -> () {
+            let a = d.write(lit("one\n"))
+            let b = d.write(lit("two\n"))
+            let c = d.write(lit("three\n"))
+        }, false))
+        resp
+    })
+    r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello") })
+    r
+}
+
+fn show_resp(r: http.Response) uses io {
+    let mut l = bytes.from_u64(r.status as u64)
+    l.push(32)
+    for name in [lit("content-type"), lit("content-length"), lit("transfer-encoding"), lit("connection")] {
+        match http.find(r.headers, name) {
+            Some(v) => {
+                bytes.append(inout l, name)
+                l.push(61)
+                bytes.append(inout l, v)
+                l.push(32)
+            }
+            None => {}
+        }
+    }
+    bytes.append(inout l, lit("| "))
+    bytes.append(inout l, r.body)
+    io.outln(l)
+}
+
+fn show(r: Result[http.Response, String]) uses io {
+    match r {
+        Ok(resp) => show_resp(resp)
+        Err(e) => print(e)
+    }
+}
+
+fn read_responses(s: i32, n: usize, dl: time.Deadline) uses io, clock, net {
+    let mut p = parse.responses(http.limits())
+    let mut got: usize = 0
+    while got < n {
+        match p.next() {
+            parse.Done(m) => {
+                show_resp(parse.to_response(m))
+                got += 1
+                continue
+            }
+            parse.Bad(st, why) => {
+                io.outln(why)
+                return
+            }
+            parse.More => {}
+        }
+        match fd.read_by(s, 65536, dl) {
+            Ok(Some(b)) => {
+                if b.len() == 0 {
+                    print("eof")
+                    return
+                }
+                p.feed(b)
+            }
+            Ok(None) => {
+                print("timed out")
+                return
+            }
+            Err(e) => {
+                print(e)
+                return
+            }
+        }
+    }
+}
+
+fn main() uses io, net, clock, threads {
+    parser_part()
+    let dl = time.after_ms(20000)
+    let mut cfg = server.config()
+    cfg.workers = 4
+    let r = app()
+    cfg.plan = r.planner()
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let a = srv.addr()
+    let h = router.handler(r)
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+
+    print("-- per-route limits before the body")
+    let mut c = client.connect(a, dl).unwrap()
+    let mut small = http.request("POST", lit("/small"))
+    small.body = lit("12345678")
+    show(c.request(small, dl))
+    let mut over = http.request("POST", lit("/small"))
+    over.body = lit("123456789")
+    show(c.request(over, dl))
+    c.close()
+    // the server answers 413 from the head alone: send only the head of a big body
+    let s = net.socket(net.IPV4, net.STREAM, false).unwrap()
+    net.connect(s, a).unwrap()
+    net.send_all(s, wire("POST /small HTTP/1.1\nHost: x\nContent-Length: 1000000\n\n")).unwrap()
+    read_responses(s, 1, dl)
+    fd.close(s).unwrap()
+
+    print("-- streamed bodies")
+    let mut c2 = client.connect(a, dl).unwrap()
+    let mut up = http.request("POST", lit("/up"))
+    up.body = lit("0123456789abcdefghij")
+    show(c2.request(up, dl))
+    let mut up2 = http.request("POST", lit("/up"))
+    let mut long: List[u8] = List.new()
+    for i in 0..(101 as i32) { long.push(120) }
+    up2.body = long
+    show(c2.request(up2, dl))
+    c2.close()
+    let mut c3 = client.connect(a, dl).unwrap()
+    let mut lazy = http.request("POST", lit("/lazy"))
+    lazy.body = lit("never read by the handler")
+    show(c3.request(lazy, dl))
+    show(c3.request(http.request("GET", lit("/hello")), dl))
+    print(c3.open)
+    c3.close()
+    let s2 = net.socket(net.IPV4, net.STREAM, false).unwrap()
+    net.connect(s2, a).unwrap()
+    net.send_all(s2, wire("POST /up HTTP/1.1\nHost: x\nTransfer-Encoding: chunked\n\n5\nhello\n6\n world\n0\n\nGET /hello HTTP/1.1\nHost: x\nConnection: close\n\n")).unwrap()
+    read_responses(s2, 2, dl)
+    fd.close(s2).unwrap()
+
+    print("-- a chunked response")
+    let mut c4 = client.connect(a, dl).unwrap()
+    show(c4.request(http.request("GET", lit("/events")), dl))
+    show(c4.request(http.request("GET", lit("/hello")), dl))
+    print(c4.open)
+    c4.close()
+
+    tok.cancel()
+    let stats = th.join()
+    print(stats.requests)
+}

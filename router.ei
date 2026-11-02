@@ -23,7 +23,7 @@ const REST: i32 = 2
 
 type Seg = { kind: i32, text: List[u8] }
 
-type Route = { method: List[u8], segs: List[Seg], h: http.Handler }
+type Route = { method: List[u8], segs: List[Seg], h: http.Handler, plan: http.Plan }
 
 pub type Router = { routes: List[Route], not_found: http.Handler }
 
@@ -116,12 +116,66 @@ fn more_specific(a: List[Seg], b: List[Seg]) -> bool {
 impl Router {
     /// Adds a route: `method` ("GET", ...), `pat` (see the module comment), handler `h`.
     fn route(inout self, method: str, pat: str, h: http.Handler) {
-        self.routes.push(Route(sys.lit(method), pattern(sys.lit(pat)), h))
+        self.routes.push(Route(sys.lit(method), pattern(sys.lit(pat)), h, http.Plan(0, false)))
     }
 
     /// `route` with the method and pattern as bytes (for routes built by other packages).
     fn route_bytes(inout self, method: List[u8], pat: List[u8], h: http.Handler) {
-        self.routes.push(Route(method, pattern(pat), h))
+        self.routes.push(Route(method, pattern(pat), h, http.Plan(0, false)))
+    }
+
+    /// `route` with a `Plan` for the body: the route's own body limit, enforced by the server
+    /// before the body is read (`planner`), and whether the handler reads the body as a stream
+    /// (`Request.stream`).
+    fn route_with(inout self, method: str, pat: str, plan: http.Plan, h: http.Handler) {
+        self.routes.push(Route(sys.lit(method), pattern(sys.lit(pat)), h, plan))
+    }
+
+    /// `route_with` with the method and pattern as bytes.
+    fn route_bytes_with(inout self, method: List[u8], pat: List[u8], plan: http.Plan, h: http.Handler) {
+        self.routes.push(Route(method, pattern(pat), h, plan))
+    }
+
+    /// What the server asks after a request's head (`server.Config.plan`, `parse.Parser.set_plan`):
+    /// the `Plan` of the route the request will take (HEAD takes GET's), so the route's body
+    /// limit applies before a byte of the body is read. A request no route takes has the
+    /// server's limit.
+    fn planner(self) -> http.Planner {
+        let r = self.copy()
+        |method: List[u8], path: List[u8]| -> http.Plan { r.plan_for(method, path) }
+    }
+
+    fn plan_for(self, method: List[u8], path: List[u8]) -> http.Plan {
+        let segs = match segments(path) {
+            Some(p) => p
+            None => { return http.Plan(0, false) }
+        }
+        let head = bytes.eq(method, sys.lit("HEAD"))
+        let mut best: Option[usize] = None
+        let mut best_get: Option[usize] = None
+        for i in 0..self.routes.len() {
+            let r = self.routes[i]
+            if match_route(r.segs, segs).is_some() {
+                if bytes.eq(r.method, method) {
+                    let better = match best {
+                        Some(b) => more_specific(r.segs, self.routes[b].segs)
+                        None => true
+                    }
+                    if better { best = Some(i) }
+                } else if head && bytes.eq(r.method, sys.lit("GET")) {
+                    let better = match best_get {
+                        Some(b) => more_specific(r.segs, self.routes[b].segs)
+                        None => true
+                    }
+                    if better { best_get = Some(i) }
+                }
+            }
+        }
+        if best.is_none() { best = best_get }
+        match best {
+            Some(i) => self.routes[i].plan
+            None => http.Plan(0, false)
+        }
     }
 
     fn get(inout self, pat: str, h: http.Handler) { self.route("GET", pat, h) }

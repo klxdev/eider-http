@@ -13,6 +13,7 @@
 
 import core.sys
 import std.bytes
+import std.stream
 import std.time
 
 pub type Header = { name: List[u8], value: List[u8] }
@@ -39,6 +40,7 @@ pub type Request = {
     peer: List[u8],
     deadline: time.Deadline,
     ctx: List[Header],
+    stream: Option[Body],
 }
 
 /// A response. `version` and `keep_alive` are filled in by the parser (what the server
@@ -46,7 +48,78 @@ pub type Request = {
 /// the connection after this response. `ctx` carries values back out to the middleware
 /// around a handler (the `principal` an authentication layer found, for the access log); it
 /// is never sent.
-pub type Response = { status: i32, headers: List[Header], body: List[u8], version: i32, keep_alive: bool, ctx: List[Header] }
+pub type Response = { status: i32, headers: List[Header], body: List[u8], version: i32, keep_alive: bool, ctx: List[Header], stream: Option[Stream] }
+
+/// What a server decides about a request's body once its head is in and before a byte of the
+/// body is read (`parse.Parser.set_plan`, `router.Router.planner`): `max_body` the longest body
+/// this route accepts (0: the server's `Limits.max_body`; a Content-Length over it is answered
+/// 413 without reading the body, a chunked body is cut off at it), `stream` whether the handler
+/// gets the body as a reader (`Request.stream`) instead of buffered in `Request.body`.
+pub type Plan = { max_body: usize, stream: bool }
+
+/// A route's `Plan` from the method and the (percent-encoded) path of a request.
+pub type Planner = fn(List[u8], List[u8]) -> Plan
+
+/// A request body read as it arrives (`Plan.stream`; `Request.body` is then empty). `pull(max,
+/// dl)` gives 1 to `max` bytes, or none at the end of the body; it waits for the client no
+/// longer than `dl` and the server's read timeout (the gap between two reads, not the whole
+/// body) and fails when the body is over its limit, malformed or cut short. It implements
+/// `stream.Reader`. What the handler leaves unread is read and dropped by the server.
+pub type Pull = fn(usize, time.Deadline) -> Result[List[u8], stream.Error]
+
+pub type Body = { pull: Pull }
+
+impl stream.Reader for Body {
+    fn read(inout self, max: usize) -> Result[List[u8], stream.Error] uses io {
+        if max == 0 { return Err(stream.error(stream.InvalidInput, "read of 0 bytes")) }
+        let f = self.pull
+        f(max, time.never())
+    }
+
+    fn read_by(inout self, max: usize, dl: time.Deadline) -> Result[List[u8], stream.Error] uses io, clock {
+        if max == 0 { return Err(stream.error(stream.InvalidInput, "read of 0 bytes")) }
+        let f = self.pull
+        f(max, dl)
+    }
+}
+
+/// A connection a handler's `Stream` talks on: `recv(max, dl)` reads what the client sends
+/// (an upgraded connection; chunked responses have nothing to read), `send(data)` writes it
+/// (flushed at once, framed as a chunk in a chunked response), `stopping()` is true once the
+/// server is shutting down: a long-lived stream should end.
+pub type Duplex = {
+    recv: fn(usize, time.Deadline) -> Result[List[u8], stream.Error],
+    send: fn(List[u8]) -> Result[(), stream.Error],
+    stopping: fn() -> bool,
+}
+
+/// A response whose body is produced while it is sent (`Response.stream`; `body` is ignored).
+/// `run` is called on the connection's worker after the head is written and returns when the
+/// stream ends. `raw` false: a chunked body (`Transfer-Encoding: chunked`, each `send` one
+/// chunk, the terminating chunk written when `run` returns; the connection can serve the
+/// next request). `raw` true: the head is written as it is (an upgrade, `101 Switching
+/// Protocols`) and the bytes that follow are the stream's own protocol; the connection is
+/// closed when `run` returns.
+pub type Stream = { run: fn(Duplex), raw: bool }
+
+impl Duplex {
+    /// Writes `data`.
+    fn write(self, data: List[u8]) -> Result[(), stream.Error] {
+        let f = self.send
+        f(data)
+    }
+
+    /// Reads 1 to `max` bytes (none: the client closed), waiting no longer than `dl`.
+    fn read_by(self, max: usize, dl: time.Deadline) -> Result[List[u8], stream.Error] {
+        let f = self.recv
+        f(max, dl)
+    }
+
+    fn is_stopping(self) -> bool {
+        let f = self.stopping
+        f()
+    }
+}
 
 /// What answers requests: the router's routes, `server.serve`'s argument, what every
 /// middleware takes and returns. A closure takes the capabilities of the function that
@@ -271,17 +344,17 @@ pub fn query_value(query: List[u8], want: List[u8]) -> Option[List[u8]] {
 /// A request for the client: `target` is the origin-form path and query ("/rpc?x=1").
 pub fn request(method: str, target: List[u8]) -> Request {
     let (p, q) = split_target(target)
-    Request(sys.lit(method), target, p, q, 11, List.new(), List.new(), List.new(), true, List.new(), time.never(), List.new())
+    Request(sys.lit(method), target, p, q, 11, List.new(), List.new(), List.new(), true, List.new(), time.never(), List.new(), None)
 }
 
 /// A response with no headers and no body.
-pub fn response(status: i32) -> Response { Response(status, List.new(), List.new(), 11, true, List.new()) }
+pub fn response(status: i32) -> Response { Response(status, List.new(), List.new(), 11, true, List.new(), None) }
 
 /// A response with a body and its Content-Type.
 pub fn respond(status: i32, content_type: str, body: List[u8]) -> Response {
     let mut hs: List[Header] = List.new()
     hs.push(Header(sys.lit("Content-Type"), sys.lit(content_type)))
-    Response(status, hs, body, 11, true, List.new())
+    Response(status, hs, body, 11, true, List.new(), None)
 }
 
 /// A `text/plain` response.
@@ -551,6 +624,41 @@ fn hex_lower(n: usize) -> List[u8] {
         i -= 1
         out.push(rev[i])
     }
+    out
+}
+
+/// The head of a streamed response (`Response.stream`, see `Stream`). Chunked (`raw` false):
+/// the status line, the program's headers minus framing headers, `Date`, `Transfer-Encoding:
+/// chunked` and `Connection: close` when `keep_alive` is false. Raw (an upgrade): the status line
+/// and all the program's headers but `Content-Length` and `Transfer-Encoding` (`Connection:
+/// Upgrade` and `Upgrade` are the program's), no body framing.
+pub fn write_stream_head(r: Response, raw: bool, keep_alive: bool, date: List[u8]) -> Result[List[u8], String] {
+    check_headers(r.headers)?
+    if r.status < 100 || r.status > 999 { return Err(String.from("invalid status code")) }
+    let mut out = sys.lit("HTTP/1.1 ")
+    bytes.append(inout out, bytes.from_u64(r.status as u64))
+    out.push(32)
+    bytes.append(inout out, reason(r.status))
+    bytes.append(inout out, sys.lit("\r\n"))
+    for h in r.headers {
+        let skip = if raw { eq_ci(h.name, sys.lit("content-length")) || eq_ci(h.name, sys.lit("transfer-encoding")) } else { is_framing(h.name) }
+        if !skip { put_header(inout out, h.name, h.value) }
+    }
+    if date.len() > 0 && count(r.headers, sys.lit("date")) == 0 { put_header(inout out, sys.lit("Date"), date) }
+    if !raw {
+        put_header(inout out, sys.lit("Transfer-Encoding"), sys.lit("chunked"))
+        if !keep_alive { put_header(inout out, sys.lit("Connection"), sys.lit("close")) }
+    }
+    bytes.append(inout out, sys.lit("\r\n"))
+    Ok(out)
+}
+
+/// One chunk of the chunked coding: `data` (not empty) with its size line.
+pub fn chunk(data: List[u8]) -> List[u8] {
+    let mut out = hex_lower(data.len())
+    bytes.append(inout out, sys.lit("\r\n"))
+    bytes.append(inout out, data)
+    bytes.append(inout out, sys.lit("\r\n"))
     out
 }
 

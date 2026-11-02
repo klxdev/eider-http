@@ -39,6 +39,7 @@ import std.bytes
 import std.fd
 import std.net
 import std.poll
+import std.stream
 import std.time
 import std.task
 import std.sync
@@ -55,13 +56,18 @@ pub type Config = {
     max_requests: u32,
     limits: http.Limits,
     date: bool,
+    plan: http.Planner,
 }
 
 /// 16 workers, a queue of 64 connections, 5 s idle, 10 s to read a request, 10 s to write a
-/// response, 1000 requests per connection, the default parser limits, `Date` headers.
+/// response, 1000 requests per connection, the default parser limits, `Date` headers, and no
+/// per-route plan (`cfg.plan = router.planner()` gives routes their own body limits, enforced
+/// before the body is read, and streamed request bodies: `http.Plan`).
 pub fn config() -> Config {
-    Config(16, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true)
+    Config(16, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan)
 }
+
+fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) }
 
 /// What a server did, counted over its life.
 /// `connections`: accepted and handed to a worker; `rejected`: answered 503 because the
@@ -269,6 +275,136 @@ fn refuse(c: i32, status: i32, cfg: Config) uses net, io, clock {
 
 fn is_head(m: List[u8]) -> bool { m.len() == 4 && m[0] == 72 && m[1] == 69 && m[2] == 65 && m[3] == 68 }
 
+/// The parser of a connection while a handler reads a streamed request body through it.
+type Link = { parser: parse.Parser }
+
+fn earlier(a: time.Deadline, b: time.Deadline) -> time.Deadline {
+    if a.at_ns < b.at_ns { return a }
+    b
+}
+
+/// The next bytes of a streamed request body, at most `max`, waiting for the client no longer
+/// than `dl` and `read_timeout` (empty: the body is complete). Holds the connection's parser
+/// (`l`); reads the socket when the parser has nothing to give.
+fn pull_once(inout l: Link, max: usize, dl: time.Deadline, c: i32, p: i32, cfg: Config, stop: poll.Waker) -> Result[List[u8], stream.Error] uses net, io, clock {
+    let limit = earlier(dl, time.after(cfg.read_timeout))
+    while true {
+        match l.parser.body_next(max) {
+            parse.Data(b) => { return Ok(b) }
+            parse.End => { return Ok(List.new()) }
+            parse.Broken(st, why) => {
+                return Err(stream.error_text(stream.InvalidData, sys.to_string(why)))
+            }
+            parse.Wait => {
+                if l.parser.wants_continue() {
+                    l.parser.continue_sent()
+                    let cont = sys.lit("HTTP/1.1 100 Continue\r\n\r\n")
+                    if !sock.send_by(c, cont, time.after(cfg.write_timeout)) { return Err(stream.error(stream.BrokenPipe, "the client went away")) }
+                }
+                match wait_conn(p, limit) {
+                    Readable => {
+                        match net.try_recv(c, 65536) {
+                            Ok(Some(b)) => {
+                                if b.len() == 0 {
+                                    let z = l.parser.eof()
+                                    return Err(stream.error(stream.UnexpectedEof, "the client closed the connection before the end of the body"))
+                                }
+                                l.parser.feed(b)
+                            }
+                            Ok(None) => {}
+                            Err(e) => { return Err(stream.error_text(stream.Other, e)) }
+                        }
+                    }
+                    TimedOut => { return Err(stream.error(stream.TimedOut, "timed out waiting for the request body")) }
+                    // the server is stopping: the body already on its way is still read
+                    Stopped => { let z = poll.remove(p, stop.r) }
+                    Failed => { return Err(stream.error(stream.Other, "poll failed")) }
+                }
+            }
+        }
+    }
+    Err(stream.error(stream.Other, "unreachable"))
+}
+
+fn body_pull(link: sync.Lock[Link], c: i32, p: i32, cfg: Config, stop: poll.Waker) -> http.Pull uses net, io, clock {
+    |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
+        link.modify(|inout l: Link| -> Result[List[u8], stream.Error] { pull_once(inout l, max, dl, c, p, cfg, stop) })
+    }
+}
+
+/// Reads and drops the rest of a streamed body: whether it ended cleanly.
+fn drain_body(link: sync.Lock[Link], c: i32, p: i32, cfg: Config, stop: poll.Waker) -> bool uses net, io, clock {
+    link.modify(|inout l: Link| -> bool {
+        while true {
+            match pull_once(inout l, 65536, time.after(cfg.read_timeout), c, p, cfg, stop) {
+                Ok(b) => {
+                    if b.len() == 0 { return true }
+                }
+                Err(e) => { return false }
+            }
+        }
+        false
+    })
+}
+
+fn closed_err() -> stream.Error { stream.error(stream.BrokenPipe, "the connection is closed") }
+
+/// Sends a streamed response (`http.Stream`): the head, then `run` with a Duplex on the
+/// connection. Returns what ends the connection (0 keep serving, 1 lingering close, 2 close now).
+/// `left` is what the parser read beyond the request (for an upgrade: the first bytes the
+/// client sent after its handshake).
+fn run_stream(c: i32, p: i32, resp: http.Response, stm: http.Stream, keep: bool, left: List[u8], cfg: Config, stop: poll.Waker) -> i32 uses net, io, clock {
+    let head = match http.write_stream_head(resp, stm.raw, keep, date_of(cfg)) {
+        Ok(b) => b
+        Err(e) => { return 2 }
+    }
+    if !sock.send_by(c, head, time.after(cfg.write_timeout)) { return 2 }
+    let pending = sync.lock(left)
+    let raw = stm.raw
+    let recv = |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
+        let early = pending.modify(|inout b: List[u8]| -> List[u8] {
+            if b.len() == 0 { return List.new() }
+            let n = if b.len() < max { b.len() } else { max }
+            let out = bytes.slice(b, 0, n)
+            b = bytes.slice(b, n, b.len())
+            out
+        })
+        if early.len() > 0 { return Ok(early) }
+        if !raw { return Err(stream.error(stream.Unsupported, "a chunked response has nothing to read")) }
+        while true {
+            match wait_conn(p, dl) {
+                Readable => {
+                    match net.try_recv(c, max as i64) {
+                        Ok(Some(b)) => { return Ok(b) }
+                        Ok(None) => {}
+                        Err(e) => { return Err(stream.error_text(stream.Other, e)) }
+                    }
+                }
+                TimedOut => { return Err(stream.error(stream.TimedOut, "timed out")) }
+                Stopped => {
+                    let z = poll.remove(p, stop.r)
+                    return Err(stream.error(stream.Interrupted, "the server is stopping"))
+                }
+                Failed => { return Err(stream.error(stream.Other, "poll failed")) }
+            }
+        }
+        Err(closed_err())
+    }
+    let send = |data: List[u8]| -> Result[(), stream.Error] {
+        if data.len() == 0 { return Ok(()) }
+        let wire = if raw { data } else { http.chunk(data) }
+        if sock.send_by(c, wire, time.after(cfg.write_timeout)) { return Ok(()) }
+        Err(closed_err())
+    }
+    let stopping = || -> bool { stop_signalled(stop) }
+    let run = stm.run
+    run(http.Duplex(recv, send, stopping))
+    if raw { return 1 }
+    if !sock.send_by(c, sys.lit("0\r\n\r\n"), time.after(cfg.write_timeout)) { return 2 }
+    if keep { return 0 }
+    1
+}
+
 /// One connection, request after request (see the module comment). Owns `c`; `peer` is the
 /// client's address as text (it goes in every Request).
 fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.Waker, sh: sync.Lock[Shared]) uses net, io, clock {
@@ -283,6 +419,7 @@ fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.W
     let mut ok = poll.add(p, c, poll.READ, CONN).is_ok() && poll.add(p, stop.r, poll.READ, STOP).is_ok()
     let mut stopping = false
     let mut parser = parse.requests(cfg.limits)
+    parser.set_plan(cfg.plan)
     let mut served: u32 = 0
     // what ends the connection: 0 keep going, 1 close after a response (a lingering
     // close), 2 close now
@@ -376,6 +513,7 @@ fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.W
         // handle it
         served += 1
         bump(sh, 2)
+        let streaming_req = m.streaming
         let mut req = parse.to_request(m)
         req.peer = peer
         let head_only = is_head(req.method)
@@ -384,8 +522,37 @@ fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.W
         // bytes sent after the stop too), so the signal is checked again here: a request in
         // flight at the stop is answered with `Connection: close`
         if !stopping && stop_signalled(stop) { stopping = true }
-        let keep = req.keep_alive && served < cfg.max_requests && !stopping && waiting(sh) == 0
-        let resp = h(req)
+        let mut keep = req.keep_alive && served < cfg.max_requests && !stopping && waiting(sh) == 0
+        let mut resp = http.response(500)
+        if streaming_req {
+            // the body is read by the handler as it goes: the parser is shared with the reader
+            let link = sync.lock(Link(parser.copy()))
+            req.stream = Some(http.Body(body_pull(link, c, p, cfg, stop)))
+            resp = h(req)
+            // what the handler left unread is read and dropped; a body that can't be finished
+            // ends the connection after the response
+            if !drain_body(link, c, p, cfg, stop) { keep = false }
+            parser = link.get().parser.copy()
+        } else {
+            resp = h(req)
+        }
+        match resp.stream {
+            Some(stm) => {
+                if head_only {
+                    let mut hr = resp.copy()
+                    hr.stream = None
+                    hr.body = List.new()
+                    resp = hr
+                } else {
+                    let left = bytes.slice(parser.buf, parser.pos, parser.buf.len())
+                    end = run_stream(c, p, resp, stm, keep, left, cfg, stop)
+                    if end == 0 { resp.keep_alive = true }
+                    if end != 0 { break }
+                    continue
+                }
+            }
+            None => {}
+        }
         let out = match http.write_response(resp, head_only, keep, date_of(cfg)) {
             Ok(b) => b
             Err(e) => http.write_response(http.error_response(500), head_only, false, date_of(cfg)).unwrap()
