@@ -5,6 +5,12 @@ with (`eider` in eider.toml), the PATCH its own.
 
 ## Unreleased
 
+- `http/testing` (eider-lang#30): an in-process test client, `testing.client(handler)` with `get`,
+  `post`, `put`, `delete`, `post_json`, `send`, default headers (`with_header`) and a peer address
+  (`from_peer`); no socket or thread. Requests are validated as `write_request` does and the
+  handler's response is serialized with `write_response`, so a response the server would refuse to
+  send fails the test. `testing.text`, `header`, `is` read the response.
+
 - `middleware.access_log_with(logger, h)`, `access_fields` and `access_line`: the access record
   through a `std/log` Logger (typed fields, the logger's level and base fields) (eider-http#8).
   `access_log(out, h)` is unchanged.

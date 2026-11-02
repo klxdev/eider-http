@@ -1,0 +1,116 @@
+//! http/testing: an in-process test client. It calls a `Handler` (a router, or a router
+//! wrapped in middleware) with no socket, thread or port, and gives back the `Response`, so
+//! a service's routes are tested the way `eiderc test` runs everything else: fast and
+//! deterministic.
+//!
+//!     let c = testing.client(router.handler(app))
+//!     let r = c.get("/users/42")
+//!     assert(r.status == 200)
+//!     assert(testing.text(r) == "{\"id\":42}")
+//!
+//! What goes through is checked like what goes over the wire: a request is built with
+//! `http.request` and its headers are validated as `http.write_request` does, and a response
+//! is serialized with `http.write_response`, so a handler that produces a header the server
+//! would refuse to send (a newline in a value, a bad name) panics here, in the test, not at
+//! the first real connection. The client sets `Host`, keeps default headers
+//! (`with_header`, for a token or a Content-Type) and a request id of its own is not
+//! invented. Nothing here uses the network.
+
+import core.sys
+import std.bytes
+import std.io
+import http
+
+/// A client of one handler, with the headers it adds to every request.
+pub type Client = { h: http.Handler, headers: List[http.Header], peer: List[u8] }
+
+/// A client for `h` that behaves like a connection from `127.0.0.1`.
+pub fn client(h: http.Handler) -> Client {
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header(sys.lit("Host"), sys.lit("test.invalid")))
+    Client(h, hs, sys.lit("127.0.0.1"))
+}
+
+impl Client {
+    /// The client with one more default header (replacing one of the same name).
+    fn with_header(self, name: str, value: str) -> Client {
+        let mut hs = http.without(self.headers, sys.lit(name))
+        hs.push(http.Header(sys.lit(name), sys.lit(value)))
+        Client(self.h, hs, self.peer)
+    }
+
+    /// The client acting as the peer address `addr` (what `Request.peer` holds).
+    fn from_peer(self, addr: str) -> Client { Client(self.h, self.headers, sys.lit(addr)) }
+
+    /// Send a request: `headers` are added to the default ones (replacing the same name),
+    /// `body` is the whole body, with a Content-Length when it is not empty.
+    fn send(self, method: str, target: str, headers: List[http.Header], body: List[u8]) -> http.Response uses io {
+        let mut req = http.request(method, sys.lit(target))
+        req.peer = self.peer
+        for h in self.headers { req.headers.push(h) }
+        for h in headers {
+            req.headers = http.without(req.headers, h.name)
+            req.headers.push(h)
+        }
+        if body.len() > 0 {
+            req.headers = http.without(req.headers, sys.lit("Content-Length"))
+            req.headers.push(http.Header(sys.lit("Content-Length"), bytes.from_u64(body.len() as u64)))
+        }
+        req.body = body
+        match http.write_request(req, sys.lit("test.invalid"), true) {
+            Ok(_) => {}
+            Err(why) => {
+                io.errln(bytes.concat(sys.lit("testing: the request is not valid HTTP: "), why.bytes()))
+                panic("testing: invalid request")
+            }
+        }
+        let resp = self.h(req)
+        match http.write_response(resp, method == "HEAD", true, sys.lit("Thu, 01 Jan 1970 00:00:00 GMT")) {
+            Ok(_) => {}
+            Err(why) => {
+                io.errln(bytes.concat(sys.lit("testing: the handler's response can't be sent: "), why.bytes()))
+                panic("testing: unsendable response")
+            }
+        }
+        resp
+    }
+
+    fn get(self, target: str) -> http.Response uses io { self.send("GET", target, List.new(), List.new()) }
+
+    fn delete(self, target: str) -> http.Response uses io { self.send("DELETE", target, List.new(), List.new()) }
+
+    fn post(self, target: str, content_type: str, body: List[u8]) -> http.Response uses io {
+        self.send("POST", target, ctype(content_type), body)
+    }
+
+    fn put(self, target: str, content_type: str, body: List[u8]) -> http.Response uses io {
+        self.send("PUT", target, ctype(content_type), body)
+    }
+
+    /// POST a JSON text.
+    fn post_json(self, target: str, body: str) -> http.Response uses io {
+        self.post(target, "application/json", sys.lit(body))
+    }
+}
+
+fn ctype(content_type: str) -> List[http.Header] {
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header(sys.lit("Content-Type"), sys.lit(content_type)))
+    hs
+}
+
+/// A response header by name (case-insensitive).
+pub fn header(r: http.Response, name: str) -> Option[List[u8]] { http.find(r.headers, sys.lit(name)) }
+
+/// The body as text.
+pub fn text(r: http.Response) -> String { sys.to_string(r.body) }
+
+/// Whether the response has this status and, when `content_type` is not empty, that media type.
+pub fn is(r: http.Response, status: i32, content_type: str) -> bool {
+    if r.status != status { return false }
+    if content_type.len() == 0 { return true }
+    match http.find(r.headers, sys.lit("Content-Type")) {
+        Some(v) => bytes.eq(http.media_type(v), sys.lit(content_type))
+        None => false
+    }
+}

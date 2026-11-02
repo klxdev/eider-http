@@ -61,6 +61,21 @@ then `eider fetch` and `import http`,
 `import http.server`, ... A program grants http what the modules it loads use (the
 compiler checks it: E0204).
 
+### Testing handlers
+
+`http/testing` calls a handler (a router, or a router in middleware) in-process, with no port:
+
+```eider,ignore
+import http.router
+import http.testing
+
+test "user by id" {
+    let c = testing.client(router.handler(app()))
+    let r = c.get("/users/42")
+    assert(testing.is(r, 200, "application/json"))
+}
+```
+
 ## Developing
 
 ```sh

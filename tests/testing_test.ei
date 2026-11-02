@@ -1,0 +1,59 @@
+// http/testing: the in-process client drives a router with no socket: methods, bodies,
+// default headers, path parameters, the 404/405 answers, and the checks that what the handler
+// returns could be sent.
+
+import core.sys
+import std.bytes
+import std.io
+import http
+import http.router
+import http.testing
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn app() -> http.Handler {
+    let mut rt = router.new()
+    rt.get("/users/:id", |q: http.Request| -> http.Response {
+        let id = match http.find(q.params, lit("id")) {
+            Some(v) => v
+            None => lit("?")
+        }
+        http.json_response(200, bytes.concat(lit("id="), id))
+    })
+    rt.post("/echo", |q: http.Request| -> http.Response {
+        http.respond(201, "text/plain", q.body)
+    })
+    rt.get("/whoami", |q: http.Request| -> http.Response {
+        let a = match http.find(q.headers, lit("Authorization")) {
+            Some(v) => v
+            None => lit("anonymous")
+        }
+        http.respond(200, "text/plain", bytes.concat(a, bytes.concat(lit(" @ "), q.peer)))
+    })
+    router.handler(rt)
+}
+
+fn main() uses io {
+    let c = testing.client(app())
+    let r = c.get("/users/42")
+    print(r.status)
+    print(testing.text(r))
+    print(testing.is(r, 200, "application/json"))
+
+    let e = c.post("/echo", "text/plain", lit("hello"))
+    print(e.status)
+    print(testing.text(e))
+
+    let n = c.get("/nowhere")
+    print(n.status)
+    let m = c.delete("/echo")
+    print(m.status)
+    match testing.header(m, "Allow") {
+        Some(v) => print(sys.to_string(v))
+        None => print("no Allow")
+    }
+
+    let w = c.with_header("Authorization", "Bearer t").from_peer("10.0.0.7").get("/whoami")
+    print(testing.text(w))
+    print(testing.text(c.get("/whoami")))
+}
