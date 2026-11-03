@@ -3,7 +3,11 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.5.0
+
+For Eider 0.5 (`eider = "0.5"`). Requires eider-json 0.5.0.
+
+**Breaking:** `Request` and `Response` have a new last field (`stream`), `Msg` has `streaming` and `Config` has `plan`: code that builds these records by position must be updated (build them with field names). Without a plan or a stream, parsing and responses behave as before. eider-http#5 (tracing) is partly done and stays open.
 
 - `http/testing` (eider-lang#30): an in-process test client, `testing.client(handler)` with `get`,
   `post`, `put`, `delete`, `post_json`, `send`, default headers (`with_header`) and a peer address
