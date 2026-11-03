@@ -282,6 +282,33 @@ fn main() uses io, net, clock, threads {
     let st3 = th3.join()
     print(st3.rejected)
 
+    print("-- many connections")
+    // a task per connection: a thousand open at once, none of them waiting for a worker
+    let tok5 = task.root()
+    let (m5, th5) = start(server.config(), tok5)
+    var socks: List[i32] = List.new()
+    for i in 0..1000 {
+        let s = raw(m5)
+        net.send_all(s, wire("GET /hello HTTP/1.1\nHost: x\n\n")).unwrap()
+        socks.push(s)
+    }
+    var answered = 0
+    for s in socks {
+        match fd.read_by(s, 65536, dl) {
+            Ok(Some(b)) => {
+                if b.len() > 12 && b[9] == 50 && b[10] == 48 && b[11] == 48 { answered += 1 }
+            }
+            Ok(None) => {}
+            Err(e) => {}
+        }
+        fd.close(s).unwrap()
+    }
+    print(answered)
+    tok5.cancel()
+    let st5 = th5.join()
+    print(st5.connections)
+    print(st5.rejected)
+
     print("-- graceful shutdown")
     let tok4 = task.root()
     let (e, th4) = start(server.config(), tok4)

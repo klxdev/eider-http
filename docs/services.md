@@ -74,17 +74,18 @@ for the next one, so pipelined requests come out one per call. After `Bad` the p
 failed: the connection's framing is lost and it must be closed. The tests check that every
 input gives the same steps whether fed whole, byte by byte or in random pieces.
 
-**Server** (`server.ei`), the concurrency model (C41). One accepting thread (the caller of
-`serve`) and a fixed pool of worker threads (`std/task.Pool`). Each accepted connection is
-a job; a worker serves it request after request with blocking-style code: wait (with a
+**Server** (`server.ei`), the concurrency model (C41). One accepting task (the caller of
+`serve`) and one lightweight task per connection (eider-lang C830). Each accepted connection
+gets a task that serves it request after request with blocking-style code, parking when it waits: wait (with a
 deadline) on the connection and the stop signal, read, feed the parser, call the handler,
-write the response before its deadline. It is the simplest sound model while there are no
-stackless tasks (C4): no shared mutable state except one Lock of counters, a fixed number
-of threads, and the handler is ordinary code. Its cost is an OS thread per connection being
-served, so `workers` bounds concurrency. When the compiler makes stackless tasks, `serve`
-keeps its signature and the worker loop runs as a task per connection on the event loop.
+write the response before its deadline. No shared mutable state except one Lock of counters, and the handler is ordinary code. A
+connection waits for its socket and the server's stop signal together (`fd.wait_ready2`, so
+there is no poller per connection); tens of thousands of connections are tens of thousands of
+parked tasks. `workers` is the number of connections served at once (default 10,000) and
+`queue` the number that may wait for a slot; a handler that computes without waiting occupies
+a scheduler thread.
 
-- *Back-pressure:* connections wait for a worker in the pool's bounded queue; when it is
+- *Back-pressure:* connections wait for a slot (one of `workers`), at most `queue` of them; when that is
   full, the acceptor answers `503` (`Retry-After: 1`) and closes. While any connection
   waits, a worker gives up keep-alive after its current response, so idle keep-alive
   clients can't starve new ones.
@@ -98,7 +99,7 @@ keeps its signature and the worker loop runs as a task per connection on the eve
   close, drain what the client still sends (up to 1 s or 64 KiB), close, so the client reads
   the response instead of a reset.
 - *Graceful shutdown (C49):* cancel the token passed to `serve`. A watcher thread blocked on
-  the token wakes a waker that is never drained, so every poller watching it (the
+  the token wakes a waker that is never drained, so every wait that watches it (the
   acceptor's and each connection's) sees the stop from then on. The acceptor takes what is
   already in the listen backlog and closes the listener; every worker finishes the request
   it is reading or handling and answers it with `Connection: close` (the stop is checked
@@ -195,7 +196,7 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
 | Reading one request | 10 s from its first byte | `Config.read_timeout` | 408, closed |
 | Writing one response | 10 s | `Config.write_timeout` | dropped |
 | Requests per connection | 1000 | `Config.max_requests` | `Connection: close` |
-| Connections served at once | 16 | `Config.workers` | queued |
+| Connections served at once | 10,000 | `Config.workers` | queued |
 | Connections queued | 64 | `Config.queue` | 503 |
 
 ## Security posture

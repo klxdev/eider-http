@@ -3,6 +3,15 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased (for Eider 0.6)
+
+- **`http/server` serves a task per connection** (eider-lang#14, decision C830): `serve` keeps its
+  signature and its behaviour (deadlines, back-pressure with `queue` and 503, graceful shutdown,
+  lingering close). A connection waits for its socket and the stop signal with one
+  `fd.wait_ready2` and parks, so there is no thread and no poller per connection; the default
+  `Config.workers` is now 10,000 connections served at once (it was 16 threads), `queue` stays 64.
+  A handler that computes for long without waiting occupies a scheduler thread. Needs Eider 0.6.
+
 ## 0.5.0
 
 For Eider 0.5 (`eider = "0.5"`). Requires eider-json 0.5.0.

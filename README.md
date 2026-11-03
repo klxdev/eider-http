@@ -27,7 +27,7 @@ fn main() uses io, net, clock, threads {
 |---|---|
 | `http` | `Request`, `Response`, headers, `Limits`, query strings, writing messages |
 | `http/parse` | the incremental parser (requests and responses) |
-| `http/server` | `listen`, `Server.serve(handler, token)`: a worker pool, deadlines, graceful shutdown |
+| `http/server` | `listen`, `Server.serve(handler, token)`: a task per connection, deadlines, graceful shutdown |
 | `http/client` | `connect`, `Conn.request`, `fetch`, `get`, `post` |
 | `http/router` | method and path patterns with parameters, 404 and 405 |
 | `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` |

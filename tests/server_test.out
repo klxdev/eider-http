@@ -67,6 +67,10 @@ true
 false
 200 content-type=text/plain content-length=6 | user b
 1
+-- many connections
+1000
+1000
+0
 -- graceful shutdown
 200 content-type=text/plain; charset=utf-8 content-length=12 | hello, world
 true
