@@ -3,6 +3,10 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.7.0
+
+For Eider 0.7 (`eider = "0.7"`). Requires eider-json 0.7.0. Nothing else changed.
+
 ## 0.6.0
 
 For Eider 0.6 (`eider = "0.6"`).
