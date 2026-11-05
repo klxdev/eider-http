@@ -1,0 +1,383 @@
+//! http/static: serves files from a directory, for a router's rest route.
+//!
+//!     var r = router.new()
+//!     static.mount(inout r, "/assets", "web/dist", static.options()).unwrap()   // GET /assets/*path
+//!     static.mount(inout r, "", "web/dist", static.options().with_spa("index.html")).unwrap()
+//!
+//! Only `fs` is used here. What it does:
+//! - GET and HEAD; other methods are 405 (`Allow: GET, HEAD`). `Range` is not supported (the
+//!   whole file is sent, which a client must accept), and so is no `Last-Modified` (std/fs has no
+//!   file times); the validator is a strong `ETag` from the content (length and two 32-bit hashes),
+//!   and `If-None-Match` (a list, `*`, weak tags compared weakly) answers 304.
+//! - `Content-Type` by extension (`application/wasm`, js, css, html, json, svg, images, fonts, ...;
+//!   text types with `charset=utf-8`; unknown: `application/octet-stream`), always with
+//!   `X-Content-Type-Options: nosniff`.
+//! - `Cache-Control`: a file whose name carries a content hash (a `.`, `-` or `_` separated token of
+//!   8 or more hex digits with both digits and letters: `app.3f2a9c1b.js`) is `public,
+//!   max-age=31536000, immutable`; everything else is `no-cache` (revalidate with the ETag).
+//! - A directory serves its `index.html` (`Options.index`); with no index, or for any listing, 404:
+//!   directories are never listed. `/dir` (no trailing slash) is redirected to `/dir/` (301,
+//!   Location built from the validated request path).
+//! - SPA fallback (`with_spa(file)`): a GET for a missing path whose last segment has no extension
+//!   serves that one file with 200 (the file is fixed at construction, never taken from the
+//!   request); a missing `/app.js` is still 404.
+//!
+//! The request path (the router's `*path`, percent-decoded once per segment by the router) is
+//! refused with 404 unless every segment passes: not empty (so no absolute path, no `//`), not `.`
+//! or `..`, not starting with a dot (`.env`, `.git`, `.htaccess`: dot files are never served;
+//! `with_well_known()` allows the single top-level `.well-known` directory), no byte below 0x20,
+//! DEL or `\`, no NUL, valid UTF-8. An encoded variant (`%2e%2e`, `%2F`, `%00`) has been decoded
+//! by then and fails the same checks; `%252e%252e` is decoded once, so it is the file literally
+//! named `%2e%2e`. After those lexical checks the path is resolved with `fs.canonical` and
+//! must be inside the root's canonical path, compared by path components (`/srv/www-private`
+//! is not inside `/srv/www`): a symlink that leaves the root is 404, one that stays inside works.
+//! The file is checked again for being a regular file (not a socket or device). The check and the
+//! read are two steps: do not make the root writable by anyone you do not trust (they could swap
+//! a link between them).
+//!
+//! Files are read whole (`Options.max_size`, 16 MiB; larger ones are 404): serve big downloads
+//! from a CDN or a proxy. A response is built per request; put a cache in front for hot assets.
+
+import core.sys
+import std.bytes
+import std.fs
+import std.utf8
+import http
+import http.router
+
+/// Settings; `options()` has the defaults.
+pub type Options = {
+    index: List[u8],
+    spa: Option[List[u8]],
+    well_known: bool,
+    max_size: usize,
+    hashed_cache: List[u8],
+    other_cache: List[u8],
+}
+
+/// `index.html`, no SPA fallback, no dot files, 16 MiB, hashed names cached for a year
+/// (`immutable`), the rest revalidated (`no-cache`).
+pub fn options() -> Options {
+    Options(sys.lit("index.html"), None, false, 16777216, sys.lit("public, max-age=31536000, immutable"), sys.lit("no-cache"))
+}
+
+impl Options {
+    /// The file served (200) for a missing path without an extension, relative to the root.
+    fn with_spa(self, file: str) -> Options {
+        Options(self.index, Some(sys.lit(file)), self.well_known, self.max_size, self.hashed_cache, self.other_cache)
+    }
+
+    /// Serves `/.well-known/...` (and only that dot directory).
+    fn with_well_known(self) -> Options {
+        Options(self.index, self.spa, true, self.max_size, self.hashed_cache, self.other_cache)
+    }
+
+    fn with_index(self, name: str) -> Options {
+        Options(sys.lit(name), self.spa, self.well_known, self.max_size, self.hashed_cache, self.other_cache)
+    }
+
+    fn with_max_size(self, n: usize) -> Options {
+        Options(self.index, self.spa, self.well_known, n, self.hashed_cache, self.other_cache)
+    }
+
+    /// The `Cache-Control` values of hashed files and of the others.
+    fn with_cache(self, hashed: str, other: str) -> Options {
+        Options(self.index, self.spa, self.well_known, self.max_size, sys.lit(hashed), sys.lit(other))
+    }
+}
+
+// ---- the request path
+
+/// The segments of a request path (the router's `*path`) if every one may be served, else None.
+/// See the module comment for the rules.
+pub fn clean_path(rel: List[u8], well_known: bool) -> Option[List[List[u8]]] {
+    if rel.len() > 4096 { return None }
+    if !utf8.valid(rel) { return None }
+    let mut out: List[List[u8]] = List.new()
+    if rel.len() == 0 { return Some(out) }
+    let parts = bytes.split(rel, 47)
+    let mut i: usize = 0
+    for p in parts {
+        i += 1
+        if p.len() == 0 {
+            // only the very last segment may be empty (a trailing slash)
+            if i == parts.len() && i > 1 { continue }
+            return None
+        }
+        for c in p {
+            if c < 32 || c == 127 || c == 92 { return None }
+        }
+        if p.len() == 1 && p[0] == 46 { return None }
+        if p.len() == 2 && p[0] == 46 && p[1] == 46 { return None }
+        if p[0] == 46 {
+            if !(well_known && i == 1 && bytes.eq(p, sys.lit(".well-known"))) { return None }
+        }
+        out.push(p)
+    }
+    Some(out)
+}
+
+// ---- content
+
+fn ext_of(name: List[u8]) -> List[u8] {
+    match bytes.rfind_byte(name, 46) {
+        Some(i) => http.lower(bytes.slice(name, i + 1, name.len()))
+        None => List.new()
+    }
+}
+
+/// The media type of a file name by its extension.
+pub fn media_type(name: List[u8]) -> List[u8] {
+    let e = ext_of(name)
+    for (x, t) in [("html", "text/html; charset=utf-8"), ("htm", "text/html; charset=utf-8"), ("css", "text/css; charset=utf-8"), ("js", "text/javascript; charset=utf-8"), ("mjs", "text/javascript; charset=utf-8"), ("json", "application/json"), ("map", "application/json"), ("wasm", "application/wasm"), ("txt", "text/plain; charset=utf-8"), ("md", "text/markdown; charset=utf-8"), ("csv", "text/csv; charset=utf-8"), ("xml", "application/xml"), ("svg", "image/svg+xml"), ("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"), ("gif", "image/gif"), ("webp", "image/webp"), ("avif", "image/avif"), ("ico", "image/x-icon"), ("woff", "font/woff"), ("woff2", "font/woff2"), ("ttf", "font/ttf"), ("otf", "font/otf"), ("pdf", "application/pdf"), ("webmanifest", "application/manifest+json"), ("mp4", "video/mp4"), ("webm", "video/webm"), ("mp3", "audio/mpeg"), ("wav", "audio/wav"), ("zip", "application/zip"), ("gz", "application/gzip")] {
+        if bytes.eq(e, sys.lit(x)) { return sys.lit(t) }
+    }
+    sys.lit("application/octet-stream")
+}
+
+fn is_hex(c: u8) -> bool { (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70) }
+
+/// Whether a file name carries a content hash: a token between `.`, `-` or `_` of 8 or more hex
+/// digits that has both digits and letters (`app.3f2a9c1b.js`; not `20240101` or `deadbeef`).
+pub fn is_hashed(name: List[u8]) -> bool {
+    let mut run: usize = 0
+    let mut digits = false
+    let mut letters = false
+    let mut i: usize = 0
+    while i <= name.len() {
+        let c: u8 = if i < name.len() { name[i] } else { 46 }
+        if c == 46 || c == 45 || c == 95 {
+            if run >= 8 && digits && letters { return true }
+            run = 0
+            digits = false
+            letters = false
+        } else if is_hex(c) {
+            run += 1
+            if c >= 48 && c <= 57 { digits = true } else { letters = true }
+        } else {
+            // a non-hex byte spoils the token
+            run = 0
+            digits = false
+            letters = false
+            // skip to the next separator
+            while i + 1 < name.len() && name[i + 1] != 46 && name[i + 1] != 45 && name[i + 1] != 95 { i += 1 }
+        }
+        i += 1
+    }
+    false
+}
+
+fn hex32(v: u64) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut shift: i32 = 28
+    while shift >= 0 {
+        let d = (v / (1 << (shift as u64))) % 16
+        out.push(if d < 10 { (48 + d) as u8 } else { (87 + d) as u8 })
+        shift -= 4
+    }
+    out
+}
+
+/// A strong ETag for content: `"<length hex>-<fnv1a>-<djb2-ish>"`.
+pub fn etag(data: List[u8]) -> List[u8] {
+    let mut a: u64 = 2166136261
+    let mut b: u64 = 5381
+    for c in data {
+        a = ((a ^ (c as u64)) * 16777619) % 4294967296
+        b = (b * 33 + (c as u64) + 7) % 4294967296
+    }
+    let mut out: List[u8] = List.new()
+    out.push(34)
+    bytes.append(inout out, bytes.hex(bytes.from_u64(data.len() as u64)))
+    out.push(45)
+    bytes.append(inout out, hex32(a))
+    bytes.append(inout out, hex32(b))
+    out.push(34)
+    out
+}
+
+/// Whether an `If-None-Match` value matches `tag` (weak comparison; `*` matches).
+pub fn none_match(value: List[u8], tag: List[u8]) -> bool {
+    for item in http.list_items(value) {
+        if bytes.eq(item, sys.lit("*")) { return true }
+        let w = if bytes.starts_with(item, sys.lit("W/")) { bytes.slice(item, 2, item.len()) } else { item }
+        if bytes.eq(w, tag) { return true }
+    }
+    false
+}
+
+// ---- serving
+
+/// A directory served: the canonical root (ending in "/") and the options.
+pub type Dir = { root: List[u8], opts: Options }
+
+/// Opens `root` (a directory) for serving. Err if it does not exist or is not a directory.
+pub fn dir(root: str, opts: Options) -> Result[Dir, String] uses fs {
+    let canon = fs.canonical(sys.lit(root))?
+    if !fs.is_dir(canon) { return Err(String.from("static: the root is not a directory")) }
+    if bytes.find_byte(opts.index, 47, 0).is_some() || opts.index.len() == 0 { return Err(String.from("static: the index is a file name")) }
+    match opts.spa {
+        Some(f) => {
+            match clean_path(f, false) {
+                Some(segs) => { if segs.len() == 0 { return Err(String.from("static: bad SPA fallback")) } }
+                None => { return Err(String.from("static: bad SPA fallback")) }
+            }
+        }
+        None => {}
+    }
+    let mut r = canon.copy()
+    if r.len() == 0 || r[r.len() - 1] != 47 { r.push(47) }
+    Ok(Dir(r, opts))
+}
+
+fn inside(d: Dir, canon: List[u8]) -> bool {
+    // the root with its trailing slash; the root itself is `canon` without it
+    if bytes.starts_with(canon, d.root) { return true }
+    let mut me = canon.copy()
+    me.push(47)
+    bytes.eq(me, d.root)
+}
+
+/// The regular file at `segs` under the root, resolved through symlinks, if it is inside the root.
+fn locate(d: Dir, segs: List[List[u8]]) -> Option[List[u8]] uses fs {
+    let mut p = d.root.copy()
+    let mut first = true
+    for s in segs {
+        if !first { p.push(47) }
+        first = false
+        bytes.append(inout p, s)
+    }
+    let canon = match fs.canonical(p) {
+        Ok(c) => c
+        Err(e) => { return None }
+    }
+    if !inside(d, canon) { return None }
+    Some(canon)
+}
+
+fn read_file(d: Dir, canon: List[u8]) -> Option[List[u8]] uses fs {
+    match fs.kind(canon) {
+        fs.File => {}
+        _ => { return None }
+    }
+    match fs.read(canon) {
+        Ok(data) => {
+            if data.len() > d.opts.max_size { return None }
+            Some(data)
+        }
+        Err(e) => None
+    }
+}
+
+fn not_found() -> http.Response { http.error_response(404) }
+
+fn file_response(d: Dir, req: http.Request, name: List[u8], data: List[u8]) -> http.Response {
+    let tag = etag(data)
+    let cache = if is_hashed(name) { d.opts.hashed_cache } else { d.opts.other_cache }
+    let mut r = http.response(200)
+    match req.header("if-none-match") {
+        Some(v) => {
+            if none_match(v, tag) { r = http.response(304) }
+        }
+        None => {}
+    }
+    r.set_header("ETag", tag)
+    r.set_header("Cache-Control", cache)
+    r.set_header("X-Content-Type-Options", sys.lit("nosniff"))
+    if r.status == 304 { return r }
+    r.set_header("Content-Type", media_type(name))
+    r.body = data
+    r
+}
+
+impl Dir {
+    /// The handler: serves `req.param(param)`, the router's rest parameter, from the directory.
+    fn handler(self, param: str) -> http.Handler uses fs {
+        let d = self
+        |req: http.Request| -> http.Response {
+            if !(bytes.eq(req.method, sys.lit("GET")) || bytes.eq(req.method, sys.lit("HEAD"))) {
+                let mut r = http.error_response(405)
+                r.set_header("Allow", sys.lit("GET, HEAD"))
+                return r
+            }
+            let rel = req.param(param).unwrap_or(List.new())
+            let segs = match clean_path(rel, d.opts.well_known) {
+                Some(s) => s
+                None => { return not_found() }
+            }
+            let wants_dir = rel.len() == 0 || rel[rel.len() - 1] == 47
+            match locate(d, segs) {
+                Some(canon) => {
+                    if fs.is_dir(canon) {
+                        if !wants_dir && segs.len() > 0 { return slash_redirect(req) }
+                        let mut ip = canon.copy()
+                        ip.push(47)
+                        bytes.append(inout ip, d.opts.index)
+                        // the index is itself resolved: a link out of the root is refused
+                        let ic = match fs.canonical(ip) {
+                            Ok(c) => c
+                            Err(e) => { return not_found() }
+                        }
+                        if !inside(d, ic) { return not_found() }
+                        match read_file(d, ic) {
+                            Some(data) => { return file_response(d, req, d.opts.index, data) }
+                            None => { return not_found() }
+                        }
+                    }
+                    if wants_dir { return not_found() }
+                    match read_file(d, canon) {
+                        Some(data) => file_response(d, req, segs[segs.len() - 1], data)
+                        None => not_found()
+                    }
+                }
+                None => spa(d, req, segs)
+            }
+        }
+    }
+}
+
+/// 301 to the same path with a slash (the request path was validated: it starts with one `/`).
+fn slash_redirect(req: http.Request) -> http.Response {
+    if req.path.len() < 2 || req.path[0] != 47 || req.path[1] == 47 { return not_found() }
+    let mut loc = req.path.copy()
+    loc.push(47)
+    if req.query.len() > 0 {
+        loc.push(63)
+        bytes.append(inout loc, req.query)
+    }
+    let mut r = http.response(301)
+    r.set_header("Location", loc)
+    r
+}
+
+/// The SPA fallback for a missing path: its last segment has no extension.
+fn spa(d: Dir, req: http.Request, segs: List[List[u8]]) -> http.Response uses fs {
+    match d.opts.spa {
+        Some(f) => {
+            if !bytes.eq(req.method, sys.lit("GET") ) && !bytes.eq(req.method, sys.lit("HEAD")) { return not_found() }
+            if segs.len() > 0 && bytes.find_byte(segs[segs.len() - 1], 46, 0).is_some() { return not_found() }
+            let fsegs = match clean_path(f, false) {
+                Some(s) => s
+                None => { return not_found() }
+            }
+            match locate(d, fsegs) {
+                Some(c) => {
+                    match read_file(d, c) {
+                        Some(data) => file_response(d, req, f, data)
+                        None => not_found()
+                    }
+                }
+                None => not_found()
+            }
+        }
+        None => not_found()
+    }
+}
+
+/// Adds `GET <prefix>/*path` to `r`, serving `root`. `prefix` is "" (everything), or
+/// "/assets" (not ending in a slash). Err when the root cannot be served (`dir`).
+pub fn mount(inout r: router.Router, prefix: str, root: str, opts: Options) -> Result[(), String] uses fs {
+    let d = dir(root, opts)?
+    r.route_bytes(sys.lit("GET"), bytes.concat(sys.lit(prefix), sys.lit("/*path")), d.handler("path"))
+    Ok(())
+}

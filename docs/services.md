@@ -48,6 +48,7 @@ the step-by-step guide to both ("Building services").
 | `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `recover`, `chain` | none; `io, clock` for `access_log`, `timeout` and `recover`, `io` for `random_ids` |
 | `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format; `by_route` labels both with the route (or operation id) | `clock` for `wrap` |
 | `http/trace` | W3C Trace Context: `traceparent` in, a span per request to a sink (`log_sink`, `collect`), `inject` for outgoing calls | `io, clock` for `wrap` and `inject` |
+| `http/static` | serves a directory for a rest route: media types, ETag/`If-None-Match`, cache rules for hashed names, index files, SPA fallback, strict path checks | `fs` |
 | `http/health` | `/healthz` (liveness), `/readyz` (readiness with checks, 503 while draining), the drain flag | none |
 | `http/service` | production defaults: `handler(router, options)` stacks request ids, trusted-proxy peer, access log, metrics, rate limit, trap containment, problem+json and mounts the probes and `/metrics`; `serve`/`run` drain on SIGTERM | `net, io, clock, threads, fs` |
 | `http/proxy` | the client address behind trusted proxies: `trust_none().allow("10.0.0.0/8")`, `.use_forwarded()`, `middleware(trust, h)`, strict IP and CIDR parsing | none |
@@ -255,6 +256,19 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   all clients share the proxy's bucket. The table is bounded (`max_keys`, 10,000; beyond that new
   clients share one bucket, so spraying addresses throttles the sprayer) and a key is cut at 128
   bytes. 429 carries `Retry-After`. `except` skips health checks.
+- **Static files** (eider-http#7). `http/static` refuses with 404 every request path with an
+  empty segment (so no absolute path, no `//`), a `.` or `..` segment, a segment starting with a
+  dot (dot files and directories are never served; `.well-known` only on request), bytes below
+  0x20, DEL, `\\` or NUL, invalid UTF-8, or more than 4096 bytes; all after the router's single
+  percent-decoding, so `%2e%2e`, `..%2f`, `%00` and overlong UTF-8 are checked as what they
+  decode to, and `%252e%252e` is only a file literally named `%2e%2e`. The resolved path
+  (`fs.canonical`, symlinks followed) must lie inside the canonical root by path components, so a
+  symlink out of the root, or to a sibling directory with the same prefix, is 404 and one inside
+  works; the target must be a regular file. Directories are never listed; an index that is a
+  link out of the root is refused too. The `/dir` redirect is built from the validated request
+  path (starting with exactly one `/`), so it can't become `//host`. Left open: a link swapped
+  between the check and the read by someone who can write in the root; do not make the root
+  writable by untrusted users. Files are read whole (default limit 16 MiB).
 - **Resource limits.** Every wait has a deadline; heads, bodies and batches have limits;
   threads and queued connections are bounded (503 beyond). A slow client can hold a worker
   for at most `read_timeout` (plus 1 s of lingering close).
@@ -291,6 +305,15 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   while a streamed request body is half read and in a streamed response's producer do not leak the
   connection, 40 traps mixed with good requests leave the counts right (`Stats.traps`), and
   `recover` under `metrics.wrap` shows the 500 and an in-flight gauge of 0.
+- `static_test`: a fixture tree under `target/` (rebuilt every run) with a secret outside the
+  root and symlinks to it (a file, a directory, a sibling sharing the root's prefix, an absolute
+  target, a dangling link, an index that links out): about 80 traversal and hostile paths (`..`,
+  `%2e%2e`, `..%2f`, `..%5c`, overlong UTF-8, `%00`, control bytes, `//`, absolute, dot files, double
+  encoding, `.well-known`), each checked to be 404 and never to leak the secret, including `..` that
+  would have stayed inside the root; media types, hashed-name caching, ETag and `If-None-Match`
+  (list, `*`, weak), HEAD and method checks, the directory rules and redirect (with a hostile
+  `//host` path), the SPA fallback (which does not mask a missing asset or a refused path), size
+  limit, options and root errors, a root reached through a symlink.
 - `proxy_test`: the default trusts nothing; spoofed `X-Forwarded-For`/`Forwarded` from untrusted
   peers (also just outside a range, or from garbage peers); the walk from the right (forged left
   sides, trusted hops, every hop trusted); about 30 malformed addresses (octal, short, long, ports,

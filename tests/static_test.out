@@ -1,0 +1,189 @@
+-- files and media types
+index => 200 text/html; charset=utf-8 | no-cache | <h1>home</h1>
+hashed js => 200 text/javascript; charset=utf-8 | public, max-age=31536000, immutable | console.log(1)
+plain js => 200 text/javascript; charset=utf-8 | no-cache | console.log(2)
+upper-case extension => 200 text/css; charset=utf-8 | no-cache | body{}
+wasm => 200 application/wasm | no-cache | asm
+unknown => 200 application/octet-stream | no-cache | bits
+no extension => 200 application/octet-stream | no-cache | no extension
+space => 200 text/plain; charset=utf-8 | no-cache | space
+deep => 200 text/plain; charset=utf-8 | no-cache | deep
+missing => 404 text/plain; charset=utf-8 | 404 Not Found
+
+literal %2e%2e file via double encoding => 200 application/octet-stream | no-cache | literal percent name
+link inside the root => 200 text/plain; charset=utf-8 | no-cache | page
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+-- validators
+"3134-0cc95f2bf963fead"
+304 => 304 | no-cache
+true
+304
+304
+200
+200
+true
+true
+true
+"30-811c9dc500001505"
+200
+405
+GET, HEAD
+405
+-- directories
+dir with index => 200 text/html; charset=utf-8 | no-cache | <h1>sub</h1>
+dir without slash => 301 -> /assets/sub/
+dir without slash, query => 301 -> /assets/sub/?a=1
+dir without index => 404 text/plain; charset=utf-8 | 404 Not Found
+
+dir without index, no slash => 301 -> /assets/bare/
+file with a slash => 404 text/plain; charset=utf-8 | 404 Not Found
+
+index that is a link out of the root => 404 text/plain; charset=utf-8 | 404 Not Found
+
+-- traversal: nothing outside the root is served
+/assets/sub/../plain.js => 404
+/assets/sub/..%2fplain.js => 404
+/assets/sub/%2e%2e/plain.js => 404
+/assets/sub/%2e%2e%2fplain.js => 404
+/assets/sub/%2E%2e%5Cplain.js => 404
+/assets/sub//plain.js => 404
+/assets/sub/./page.txt => 404
+/assets/%2fplain.js => 404
+/assets/../secret.txt => 404
+/assets/..%2fsecret.txt => 404
+/assets/..%2Fsecret.txt => 404
+/assets/%2e%2e/secret.txt => 404
+/assets/%2E%2E/secret.txt => 404
+/assets/.%2e/secret.txt => 404
+/assets/%2e./secret.txt => 404
+/assets/..%5csecret.txt => 404
+/assets/..\secret.txt => 404
+/assets/sub/../../secret.txt => 404
+/assets/sub/%2e%2e/%2e%2e/secret.txt => 404
+/assets/sub/..%2f..%2fsecret.txt => 404
+/assets/....//secret.txt => 404
+/assets/..;/secret.txt => 404
+/assets/%2e%2e%2fsecret.txt => 404
+/assets/%2e%2e%2f%2e%2e%2fsecret.txt => 404
+/assets/%c0%ae%c0%ae/secret.txt => 404
+/assets/%c0%ae%c0%ae%c0%afsecret.txt => 404
+/assets/%e0%80%ae%e0%80%ae/secret.txt => 404
+/assets/%252e%252e/secret.txt => 404
+/assets/%252e%252e%252fsecret.txt => 404
+/assets//secret.txt => 404
+/assets//etc/passwd => 404
+/assets/%2fetc%2fpasswd => 404
+/assets/%2Fetc/passwd => 404
+/assets/%2f%2fetc%2fpasswd => 404
+/assets/.. => 404
+/assets/../ => 404
+/assets/sub/.. => 404
+/assets/. => 404
+/assets/./plain.js => 404
+/assets/sub/./page.txt => 404
+/assets/sub//page.txt => 404
+/assets/sub/page.txt/.. => 404
+/assets/plain.js%00.png => 404
+/assets/plain.js%00 => 404
+/assets/%00 => 404
+/assets/%00/../../secret.txt => 404
+/assets/sub/page.txt%0a => 404
+/assets/sub%0d%0aX-Evil:1/ => 404
+/assets/plain.js%20 => 404
+/assets/%ff => 404
+/assets/%80 => 404
+/assets/%c3 => 404
+/assets/%01x => 404
+/assets/%1fx => 404
+/assets/%7f => 404
+/assets/x%5cy => 404
+/assets/C:%5cwindows%5cwin.ini => 404
+/assets/link-out.txt => 404
+/assets/sneak.txt => 404
+/assets/linkdir/secret.txt => 404
+/assets/linkdir => 404
+/assets/linkdir/ => 404
+/assets/sub/up/secret.txt => 404
+/assets/abs.txt => 404
+/assets/dangling => 404
+/assets/.env => 404
+/assets/.git/config => 404
+/assets/.git/ => 404
+/assets/.git => 404
+/assets/sub/.hidden => 404
+/assets/.well-known/security.txt => 404
+/assets/%2eenv => 404
+/assets/%2Eenv => 404
+/assets/.ENV => 404
+/assets/sub/%2ehidden => 404
+/assets/empty/.keep => 404
+0
+0
+404
+404
+404
+redirect keeps the path => 301 -> /sub/?x=1
+404
+-- clean_path
+ ok 0
+a ok 1
+a/b ok 2
+a/ ok 1
+/a refused
+a//b refused
+a/./b refused
+a/../b refused
+.. refused
+. refused
+a/.b refused
+.b refused
+a\b refused
+a b ok 1
+é ok 1
+a/b/ ok 2
+// refused
+/ refused
+.well-known/x refused
+a/.well-known/x refused
+true
+false
+false
+false
+false
+false
+-- options
+well-known allowed => 200 text/plain; charset=utf-8 | no-cache | Contact: x
+other dot files still not => 404 text/plain; charset=utf-8 | 404 Not Found
+
+spa route => 200 text/html; charset=utf-8 | no-cache | <h1>home</h1>
+spa root => 200 text/html; charset=utf-8 | no-cache | <h1>home</h1>
+missing asset is still 404 => 404 text/plain; charset=utf-8 | 404 Not Found
+
+traversal is still 404 => 404 text/plain; charset=utf-8 | 404 Not Found
+
+dot file is not the fallback's business => 404 text/plain; charset=utf-8 | 404 Not Found
+
+over max_size => 404 text/plain; charset=utf-8 | 404 Not Found
+
+under max_size => 200 text/plain; charset=utf-8 | no-cache | 0123456789
+custom cache, hashed => 200 text/javascript; charset=utf-8 | max-age=1 | console.log(1)
+custom cache, other => 200 text/javascript; charset=utf-8 | max-age=2 | console.log(2)
+missing root refused
+static: the root is not a directory
+static: the index is a file name
+static: bad SPA fallback
+root through a link => 200 text/plain; charset=utf-8 | no-cache | page
+sibling prefix through it => 404 text/plain; charset=utf-8 | 404 Not Found
+

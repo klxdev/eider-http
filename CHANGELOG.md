@@ -53,6 +53,18 @@ For Eider 0.7 (`eider = "0.7"`).
   few lines. `service.run`'s signal path (`std/service.cancel_on_term`) has no test of its own;
   `serve` with a token is tested.
 
+- **`http/static`** (eider-http#7): `static.mount(inout router, "/assets", "web/dist", static.options())`
+  or `static.dir(root, opts).handler("path")` for a `/*path` route. Media types by extension
+  (`application/wasm` included), a strong `ETag` and `If-None-Match` (304), `Cache-Control`
+  `immutable` for content-hashed file names and `no-cache` for the rest, `index.html` for directories
+  (never a listing; `/dir` redirects to `/dir/`), an optional SPA fallback (`with_spa`), dot files
+  never served (`with_well_known` for `.well-known`), and path checks after decoding: no empty, `.`,
+  `..`, dot, control, `\\`, NUL or non-UTF-8 segments, and the canonical path must be inside the
+  canonical root (symlinks out are 404). The only module here that uses `fs` besides profiling.
+  Not done (eider-http#7): `Last-Modified` and `Range` (std/fs has no file times, sizes or partial
+  reads), streaming large files (files are read whole, 16 MiB by default), precompressed
+  (`.gz`/`.br`) variants.
+
 ## 0.7.0
 
 For Eider 0.7 (`eider = "0.7"`). Requires eider-json 0.7.0. Nothing else changed.
