@@ -3,6 +3,10 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+- **Logging is eider-logging, not `std/log`** (eider-lang#216, for Eider 0.7.3): `Config.log`, `Options.with_logger`, `middleware.access_log_with`, `middleware.recover`, `trace.log_sink` take a `logging.Logger`; `import logging` replaces `import std.log`. eider.toml has a `[deps.logging]` table (granted `io` and `clock`), so a package that builds a `Logger` for http depends on eider-logging too. The access record carries the logger's context fields (`Logger.with_context`) as well as its base fields.
+
 ## 0.7.1
 
 For Eider 0.7 (`eider = "0.7"`).

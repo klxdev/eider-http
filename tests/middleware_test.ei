@@ -8,7 +8,7 @@ import core.sys
 import std.bytes
 import std.encoding
 import std.io
-import std.log
+import logging
 import std.stream
 import std.sync
 import std.task
@@ -117,8 +117,8 @@ fn main() uses io, clock, threads {
     io.outln(middleware.rfc3339(1793434502250000000))
     io.outln(middleware.rfc3339(951782400999999999))
 
-    print("-- access log through std/log")
-    let lg = log.new(log.Info).with(log.fields().text("service", String.from("shop")).text("version", String.from("1.2")))
+    print("-- access log through logging")
+    let lg = logging.new(logging.Info).with(logging.fields().text("service", String.from("shop")).text("version", String.from("1.2")))
     let mut q2 = get("/todos?done=true")
     q2.peer = lit("127.0.0.1:4000")
     q2.set_ctx("request_id", lit("req-7"))
@@ -127,7 +127,7 @@ fn main() uses io, clock, threads {
     ok.set_ctx("principal", lit("ada"))
     io.outln(middleware.access_line(lg, 1793434502250, q2, ok, 1500000))
     io.outln(middleware.access_line(lg, 1793434502251, get("/boom"), http.error_response(503), 20000))
-    let via = middleware.access_log_with(lg.at(log.Error), hello())
+    let via = middleware.access_log_with(lg.at(logging.Error), hello())
     show(via(q2))
 
     print("-- errors and problems")
@@ -345,7 +345,7 @@ fn main() uses io, clock, threads {
         io.outln(l)
     }
     let fixed = trace.span_fields(trace.Span(lit("0af7651916cd43dd8448eb211c80319c"), lit("50f5647d2380309d"), lit("b7ad6b7169203331"), lit("GET /todos/:id"), 0, 1500000, 200, true, List.new()))
-    io.outln(log.format(1793434502250, log.Info, String.from("span"), lg.base, fixed))
+    io.outln(logging.format(1793434502250, logging.Info, String.from("span"), lg.base, fixed))
     let mut tq = get("/x")
     tq.set_ctx("trace_id", lit("abc"))
     io.outln(middleware.access_line(lg, 1793434502250, tq, http.response(200), 1000))

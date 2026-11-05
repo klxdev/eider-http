@@ -55,7 +55,7 @@ import std.time
 import std.task
 import std.chan
 import std.sync
-import std.log
+import logging
 import std.utf8
 import http
 import http.parse
@@ -73,7 +73,7 @@ pub type Config = {
     limits: http.Limits,
     date: bool,
     plan: http.Planner,
-    log: Option[log.Logger],
+    log: Option[logging.Logger],
 }
 
 /// 10,000 connections served at once, a queue of 64, 5 s idle, 10 s to read a request, 10 s to write a
@@ -82,7 +82,7 @@ pub type Config = {
 /// before the body is read, and streamed request bodies: `http.Plan`), and traps in handlers logged
 /// at error level to stderr (`None` turns that off; the 500 and `Stats.traps` stay).
 pub fn config() -> Config {
-    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan, Some(log.new(log.Error)))
+    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan, Some(logging.new(logging.Error)))
 }
 
 fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) }

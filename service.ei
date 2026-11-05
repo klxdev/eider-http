@@ -30,7 +30,7 @@
 
 import core.sys
 import std.bytes
-import std.log
+import logging
 import std.net
 import std.service
 import std.task
@@ -49,7 +49,7 @@ import http.profiling
 pub type Options = {
     health: health.Health,
     metrics: metrics.Metrics,
-    logger: Option[log.Logger],
+    logger: Option[logging.Logger],
     trust: proxy.Trust,
     limit: Option[ratelimit.Limiter],
     profiling: profiling.Options,
@@ -61,7 +61,7 @@ pub type Options = {
 /// trusted, 1000 requests a second per address, profiling off, `server.config()` with its trap log
 /// on this logger, a 5 s drain delay.
 pub fn options() -> Options {
-    let lg = log.new(log.Info)
+    let lg = logging.new(logging.Info)
     let mut cfg = server.config()
     cfg.log = Some(lg)
     Options(health.new(), metrics.by_route(metrics.new()), Some(lg), proxy.trust_none(), Some(ratelimit.new(1000, time.seconds(1), 2000)), profiling.options(), cfg, time.seconds(5))
@@ -85,7 +85,7 @@ impl Options {
     }
 
     /// Logs access records and traps to `lg`.
-    fn with_logger(self, lg: log.Logger) -> Options {
+    fn with_logger(self, lg: logging.Logger) -> Options {
         let mut c = self.server.copy()
         c.log = Some(lg)
         Options(self.health, self.metrics, Some(lg), self.trust, self.limit, self.profiling, c, self.drain_delay)

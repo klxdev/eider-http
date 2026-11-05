@@ -9,3 +9,9 @@ description = "HTTP/1.1: a strict incremental parser, a server with deadlines an
 [deps.json]
 git = "https://github.com/klxdev/eider-json.git"
 version = "0.7.0"
+
+# the server's and the middleware's log records (server.ei, middleware.ei, trace.ei, service.ei); it writes with io and clock
+[deps.logging]
+git = "https://github.com/klxdev/eider-logging.git"
+version = "0.7.0"
+uses = ["io", "clock"]

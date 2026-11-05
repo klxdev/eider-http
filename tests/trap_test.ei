@@ -8,7 +8,7 @@ import core.sys
 import std.bytes
 import std.fd
 import std.io
-import std.log
+import logging
 import std.net
 import std.stream
 import std.sync
@@ -227,7 +227,7 @@ fn main() uses io, net, clock, threads {
     var weird = lit("/a\"b\nc")
     weird.push(255)
     let f = middleware.trap_fields(lit("GET"), weird, String.from("boom (x.ei:1)"))
-    print(utf8.lossy(log.format(0, log.Error, String.from("handler trapped"), log.fields(), f)))
+    print(utf8.lossy(logging.format(0, logging.Error, String.from("handler trapped"), logging.fields(), f)))
 }
 
 fn read_one(a: net.Addr, dl: time.Deadline) -> (List[u8], bool) uses io, net, clock {

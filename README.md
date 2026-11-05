@@ -30,7 +30,7 @@ fn main() uses io, net, clock, threads {
 | `http/server` | `listen`, `Server.serve(handler, token)`: a task per connection, deadlines, graceful shutdown |
 | `http/client` | `connect`, `Conn.request`, `fetch`, `get`, `post` |
 | `http/router` | method and path patterns with parameters, 404 and 405 |
-| `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `recover`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` |
+| `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `logging` Logger), `errors`, `problems`, `recover`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` |
 | `http/static` | static files from a directory (`static.mount`): media types, ETag, cache rules, index, SPA fallback, path-traversal checks |
 | `http/health` | liveness and readiness endpoints, the drain flag |
 | `http/service` | production defaults in one call (probes, `/metrics`, request ids, rate limit, trusted proxies, traps as 500s) and a serve loop that drains on SIGTERM |

@@ -14,7 +14,7 @@
 //! - `request_id`: an id per request (the client's `X-Request-Id` when it is a short token,
 //!   else `<prefix>-<n>`), in `req.get_ctx("request_id")` and the response's `X-Request-Id`.
 //! - `access_log`: one JSON line per request to a `stream.Writer` held in a `sync.Lock`;
-//!   `access_log_with`: the same record through a `std/log` Logger (one level filter, one
+//!   `access_log_with`: the same record through a `logging` Logger (one level filter, one
 //!   destination and one set of base fields with the service's own log lines).
 //! - `errors`: a handler that returns `Result[http.Response, problem.ApiError]` as an ordinary
 //!   handler (an Err is its problem+json response): errors are values, never panics.
@@ -40,7 +40,7 @@ import std.bytes
 import std.atomic
 import std.encoding
 import std.utf8
-import std.log
+import logging
 import std.random
 import std.stream
 import std.sync
@@ -64,15 +64,15 @@ pub fn chain(h: http.Handler, layers: List[http.Middleware]) -> http.Handler {
 
 // ---- containing a trap
 
-fn bfield(key: str, v: List[u8], max: usize) -> log.Field {
+fn bfield(key: str, v: List[u8], max: usize) -> logging.Field {
     let cut = if v.len() > max { bytes.slice(v, 0, max) } else { v }
-    log.text(key, utf8.lossy(cut))
+    logging.text(key, utf8.lossy(cut))
 }
 
 /// The log record of a contained trap (a handler's panic: `recover` and http/server): the method, the path (cut at 200 bytes, made valid
 /// UTF-8; the logger escapes it) and the trap's text. Nothing of it goes to the client.
-pub fn trap_fields(method: List[u8], path: List[u8], why: String) -> log.Fields {
-    log.fields().add(bfield("method", method, 32)).add(bfield("path", path, 200)).text("trap", why)
+pub fn trap_fields(method: List[u8], path: List[u8], why: String) -> logging.Fields {
+    logging.fields().add(bfield("method", method, 32)).add(bfield("path", path, 200)).text("trap", why)
 }
 
 /// Contains a trap in `h` (a panic, an overflow, an index out of bounds, a failed assert, ...,
@@ -89,7 +89,7 @@ pub fn trap_fields(method: List[u8], path: List[u8], why: String) -> log.Fields 
 /// leaks (no drops run) and a `sync.Lock` it held in `modify` stays empty, so a handler that
 /// traps inside a lock shared with other requests takes that lock's value with it; put such
 /// state behind a lock the handler cannot trap in, or validate before computing.
-pub fn recover(lg: Option[log.Logger], h: http.Handler) -> http.Handler uses io, clock {
+pub fn recover(lg: Option[logging.Logger], h: http.Handler) -> http.Handler uses io, clock {
     |req: http.Request| -> http.Response {
         let method = req.method.copy()
         let path = req.path.copy()
@@ -274,12 +274,12 @@ pub fn access_log[W: stream.Writer + Copy](out: sync.Lock[W], h: http.Handler) -
 /// The typed fields of a request's access record: id (the request id), peer, method, path,
 /// query (when there is one), status, bytes (of the body), duration_us and principal (when an
 /// authentication layer found one).
-pub fn access_fields(req: http.Request, resp: http.Response, dur_ns: i64) -> log.Fields {
+pub fn access_fields(req: http.Request, resp: http.Response, dur_ns: i64) -> logging.Fields {
     let id = match req.get_ctx("request_id") {
         Some(v) => v
         None => resp.header("x-request-id").unwrap_or(List.new())
     }
-    let mut f = log.fields()
+    let mut f = logging.fields()
     f = f.text("id", sys.to_string(id))
     f = f.text("peer", sys.to_string(req.peer))
     match req.get_ctx("trace_id") {
@@ -303,20 +303,20 @@ pub fn access_fields(req: http.Request, resp: http.Response, dur_ns: i64) -> log
     f
 }
 
-/// The access record as a `std/log` line for a logger `lg` at `time_ms` (milliseconds since
+/// The access record as a `logging` line for a logger `lg` at `time_ms` (milliseconds since
 /// the epoch): `{"time", "level", "msg":"request", <lg's base fields>, <access_fields>}`; the
 /// level is `Error` for a 5xx answer and `Info` otherwise. For tests with a fixed clock.
-pub fn access_line(lg: log.Logger, time_ms: i64, req: http.Request, resp: http.Response, dur_ns: i64) -> List[u8] {
-    let level = if resp.status >= 500 { log.Error } else { log.Info }
-    log.format(time_ms, level, String.from("request"), lg.base, access_fields(req, resp, dur_ns))
+pub fn access_line(lg: logging.Logger, time_ms: i64, req: http.Request, resp: http.Response, dur_ns: i64) -> List[u8] {
+    let level = if resp.status >= 500 { logging.Error } else { logging.Info }
+    logging.format(time_ms, level, String.from("request"), lg.carried(), access_fields(req, resp, dur_ns))
 }
 
-/// `access_log` through a `std/log` Logger: the request record has the shape of the service's
+/// `access_log` through a `logging` Logger: the request record has the shape of the service's
 /// own log lines (`time`, `level`, `msg`, the logger's base fields such as `service` and
 /// `version`) with the typed fields of `access_fields`, goes where the logger goes
 /// (stderr or stdout) and obeys its minimum level (a 5xx is logged at `Error`, the rest at
 /// `Info`). Put it inside `request_id` to log the id.
-pub fn access_log_with(lg: log.Logger, h: http.Handler) -> http.Handler uses io, clock {
+pub fn access_log_with(lg: logging.Logger, h: http.Handler) -> http.Handler uses io, clock {
     |req: http.Request| -> http.Response {
         let t0 = time.mono_ns()
         let resp = h(req)

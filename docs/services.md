@@ -45,7 +45,7 @@ the step-by-step guide to both ("Building services").
 | `http/client` | `connect`, `Conn.request`, `fetch`, `get`, `post` | `net, io, clock` |
 | `http/router` | method + path patterns with parameters, 404/405 | none |
 | `http/problem` | `ApiError`: errors as values, written as RFC 9457 problem+json | none |
-| `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `recover`, `chain` | none; `io, clock` for `access_log`, `timeout` and `recover`, `io` for `random_ids` |
+| `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `logging` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `recover`, `chain` | none; `io, clock` for `access_log`, `timeout` and `recover`, `io` for `random_ids` |
 | `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format; `by_route` labels both with the route (or operation id) | `clock` for `wrap` |
 | `http/trace` | W3C Trace Context: `traceparent` in, a span per request to a sink (`log_sink`, `collect`), `inject` for outgoing calls | `io, clock` for `wrap` and `inject` |
 | `http/static` | serves a directory for a rest route: media types, ETag/`If-None-Match`, cache rules for hashed names, index files, SPA fallback, strict path checks | `fs` |
@@ -431,7 +431,7 @@ name the failed checks and never their error text.
 starts one, gives the request a span id, and puts `trace_id`, `span_id`, `traceparent` and
 `tracestate` in the request's context like the request id; the response carries `traceresponse`.
 When `h` returns, the span (name `METHOD route`, start, duration, status, parent) goes to the
-sink if the trace is sampled: `trace.log_sink(logger)` writes it as a `std/log` record,
+sink if the trace is sampled: `trace.log_sink(logger)` writes it as a `logging` record,
 `trace.collect(lock)` collects them. `tracer.inject(req, out)` puts a `traceparent` for a new child
 span on a request this service sends, so the trace continues downstream. The access record
 (`middleware.access_fields`) carries `trace_id`, which ties a log line to its span.

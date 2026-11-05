@@ -2,7 +2,7 @@
 //! https://www.w3.org/TR/trace-context/): a request joins the trace its caller sent or starts
 //! one, handlers and outgoing calls carry it, and each request ends as a span handed to a sink.
 //!
-//!     let tr = trace.tracer(trace.log_sink(lg))                  // spans as std/log records
+//!     let tr = trace.tracer(trace.log_sink(lg))                  // spans as logging records
 //!     let app = middleware.request_id(ids, trace.wrap(tr, router.handler(r)))
 //!     // in a handler: calling another service as part of the same trace
 //!     let out = tr.inject(req, http.request("GET", target))      // sets `traceparent`
@@ -26,7 +26,7 @@ import core.sys
 import std.bytes
 import std.atomic
 import std.encoding
-import std.log
+import logging
 import std.random
 import std.sync
 import std.time
@@ -255,18 +255,18 @@ pub fn wrap(t: Tracer, h: http.Handler) -> http.Handler uses io, clock {
     }
 }
 
-/// A sink that writes each span as a `std/log` record (`msg` "span", level info): trace_id,
+/// A sink that writes each span as a `logging` record (`msg` "span", level info): trace_id,
 /// span_id, parent_id (when there is one), name, status, duration_us and start (RFC 3339 is
 /// the record's own `time`, the span's end).
-pub fn log_sink(lg: log.Logger) -> Sink uses io, clock {
+pub fn log_sink(lg: logging.Logger) -> Sink uses io, clock {
     |s: Span| -> () {
         lg.info("span", span_fields(s))
     }
 }
 
 /// The typed fields of a span's log record.
-pub fn span_fields(s: Span) -> log.Fields {
-    let mut f = log.fields()
+pub fn span_fields(s: Span) -> logging.Fields {
+    let mut f = logging.fields()
     f = f.text("trace_id", sys.to_string(s.trace_id))
     f = f.text("span_id", sys.to_string(s.span_id))
     if s.parent_id.len() > 0 { f = f.text("parent_id", sys.to_string(s.parent_id)) }
