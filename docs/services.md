@@ -116,7 +116,12 @@ a scheduler thread.
 
 **Client** (`client.ei`). One connection at a time to one address, kept alive while the
 server allows it and opened again by the next request when it was closed. Every call takes
-a deadline for the whole exchange (non-blocking connect, send, response). It skips 1xx
+a deadline for the whole exchange (non-blocking connect, send, response). `connect_host`, `get_host`, `post_host`
+and `fetch_host` take a host name (eider-lang#59): it is resolved with `net.lookup_by` before the
+deadline, an address literal skips the resolver, the addresses are tried in turn with an equal share of
+the time left, a `Conn` made from a name resolves again when it reconnects, and a name that could not
+be a host (control bytes, spaces, `/`, `@`, `#`, `?`, `%`, non-ASCII) is refused before anything is
+resolved or sent. It skips 1xx
 interim responses, knows that a response to HEAD has no body, and reads bodies by length,
 chunked or until close, with the same parser and limits.
 
@@ -314,6 +319,10 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   (list, `*`, weak), HEAD and method checks, the directory rules and redirect (with a hostile
   `//host` path), the SPA fallback (which does not mask a missing asset or a refused path), size
   limit, options and root errors, a root reached through a symlink.
+- `client_host_test`: a client that connects by name (`localhost`, an IPv4 literal, an IPv6
+  literal with nothing listening), the `Host` header, a name's `Conn` reconnecting on a new connection,
+  16 invalid host names (CR/LF, spaces, `/`, `@`, `#`, `?`, `%`, brackets, non-ASCII...) refused before
+  resolution, bad ports, and deadlines on a name that does not resolve.
 - `proxy_test`: the default trusts nothing; spoofed `X-Forwarded-For`/`Forwarded` from untrusted
   peers (also just outside a range, or from garbage peers); the walk from the right (forged left
   sides, trusted hops, every hop trusted); about 30 malformed addresses (octal, short, long, ports,
@@ -369,7 +378,7 @@ Recorded rather than worked around; none blocks the design.
 | N8 | Comptime reflection and derive (P0.9, P0.10) | typed JSON-RPC parameters and results | decoder and encoder functions per type (`add_typed`) |
 | ~~N9~~ | Iterating a Map's keys | kvstore's `kv.keys` | done (eider-lang's docs/compiler.md "C8.20"): http/metrics and eider-openapi's examples/todo iterate their Maps; eider-rpc's kvstore keeps its key list, since `kv.keys` promises insertion order (C102) |
 | ~~N10~~ | Calling a function stored in a field (`(self.h)(x)`) | router | done: `self.h(x)`; a method of the same name wins (eider-lang's docs/compiler.md "C8.19") |
-| N11 | Name resolution with a deadline | the client takes an `net.Addr` | `net.lookup` blocks; resolve first |
+| ~~N11~~ | Name resolution with a deadline | the client takes an `net.Addr` | done: `net.lookup_by` (Eider 0.7.1); `client.connect_host`, `get_host`, ... |
 | N12 | Connection information in the handler (peer address, TLS later) | logging, rate limiting | done: `Request.peer` (TLS information later) |
 | N13 | A method chain continued on the next line (a line starting with `.field(...)`, or ending with `.`; the first is done: eider-lang's docs/compiler.md "C8.25") | schema and operation builders | reassignments: `s = s.field(...)` |
 | N14 | Grants checked per imported module, not against everything the program loads of a package | eider-openapi is pure but programs load http/server | openapi grants http `net, io, clock, threads` |

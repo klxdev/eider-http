@@ -1,0 +1,130 @@
+// http/client with host names (eider-lang#59): names resolved with net.lookup_by before the
+// deadline, literals never asking the resolver, a refused address followed by the next one,
+// re-resolving when a Conn reconnects, the Host header, and host names that must be refused
+// before anything is resolved or sent. Loopback only ("localhost" is read from /etc/hosts).
+
+import core.sys
+import std.bytes
+import std.io
+import std.net
+import std.task
+import std.time
+import http
+import http.client
+import http.server
+import http.router
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn main() uses io, net, clock, threads {
+    var r = router.new()
+    r.get("/host", |q: http.Request| -> http.Response { http.respond(200, "text/plain", q.header("host").unwrap_or(lit("-"))) })
+    var cfg = server.config()
+    cfg.log = None
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let h = router.handler(r)
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+    let port = srv.port()
+    let dl = time.after_ms(20000)
+    let shown = |label: str, x: Result[http.Response, String]| -> () {
+        match x {
+            Ok(resp) => {
+                var l = lit(label)
+                bytes.append(inout l, lit(": "))
+                bytes.append(inout l, bytes.from_i64(resp.status as i64))
+                io.outln(l)
+            }
+            Err(e) => {
+                var l = lit(label)
+                bytes.append(inout l, lit(": error: "))
+                bytes.append(inout l, e.bytes())
+                io.outln(l)
+            }
+        }
+    }
+
+    print("-- literals and names")
+    shown("ipv4 literal", client.get_host("127.0.0.1", port, "/host", dl))
+    let a = client.get_host("127.0.0.1", port, "/host", dl).unwrap()
+    print(bytes.eq(a.body, bytes.concat(lit("127.0.0.1:"), bytes.from_i64(port as i64))))
+    let b = client.get_host("localhost", port, "/host", dl).unwrap()
+    print(b.status)
+    print(bytes.eq(b.body, bytes.concat(lit("localhost:"), bytes.from_i64(port as i64))))
+    // the server listens on 127.0.0.1 only: "localhost" may list ::1 first and it is refused
+    let addrs = client.resolve(lit("localhost"), port, dl).unwrap()
+    print(addrs.len() >= 1)
+    var has4 = false
+    for x in addrs { if x.family == net.IPV4 { has4 = true } }
+    print(has4)
+    let lit6 = client.resolve(lit("::1"), 80, dl).unwrap()
+    print(lit6.len())
+    print(lit6[0].family == net.IPV6)
+    let lit4 = client.resolve(lit("10.1.2.3"), 80, dl).unwrap()
+    print(lit4.len())
+    shown("ipv6 literal, nothing listens", client.get_host("::1", port, "/host", time.after_ms(2000)))
+    let post = client.post_host("localhost", port, "/nope", "text/plain", lit("x"), dl)
+    shown("post", post)
+
+    print("-- a connection made from a name reconnects")
+    var c = client.connect_host("localhost", port, dl).unwrap()
+    var one = http.request("GET", lit("/host"))
+    one.keep_alive = false
+    shown("first", c.request(one, dl))
+    print(c.open)
+    shown("second, on a new connection", c.request(http.request("GET", lit("/host")), dl))
+    print(c.open)
+    shown("third, same connection", c.request(http.request("GET", lit("/host")), dl))
+    c.close()
+    var cl = client.connect_host("127.0.0.1", port, dl).unwrap()
+    shown("literal conn", cl.request(http.request("GET", lit("/host")), dl))
+    cl.close()
+
+    print("-- refused before anything is resolved or sent")
+    var long: List[u8] = List.new()
+    for i in 0..300 { long.push(97) }
+    for (label, name) in [("empty", ""), ("space", "a b"), ("slash", "a/b"), ("at", "user@host"), ("hash", "a#b"), ("query", "a?b"), ("brackets", "[::1]"), ("zone", "fe80::1%lo"), ("tab", "a\tb"), ("crlf", "evil.example\r\nX-Injected: 1"), ("lf", "a\nb"), ("non-ascii", "h\u{e9}llo"), ("backslash", "a\\b"), ("port in name", "localhost:80:80x"), ("percent", "a%41"), ("colon-space", ":: 1")] {
+        match client.get_host(name, port, "/host", dl) {
+            Ok(x) => {
+                var l = lit(label)
+                bytes.append(inout l, lit(" accepted?"))
+                io.outln(l)
+            }
+            Err(e) => {
+                var l = lit(label)
+                bytes.append(inout l, lit(": "))
+                bytes.append(inout l, e.bytes())
+                io.outln(l)
+            }
+        }
+    }
+    print(client.valid_host(long))
+    print(client.valid_host(lit("a.b-c_d.example")))
+    print(client.valid_host(lit("2001:db8::1")))
+    print(client.valid_host(lit("::ffff:1.2.3.4")))
+    print(client.valid_host(List.new()))
+    shown("port 0", client.get_host("localhost", 0, "/host", dl))
+    shown("port 65536", client.get_host("localhost", 65536, "/host", dl))
+    shown("port -1", client.get_host("localhost", 0 - 1, "/host", dl))
+
+    print("-- deadlines")
+    // a deadline that has passed: a literal needs no resolver, a name that is not known fails at once
+    let t0 = time.mono_ns()
+    let gone = client.get_host("no-such-host.invalid", 80, "/", time.after_ms(300))
+    print(gone.is_err())
+    print(time.mono_ns() - t0 < 5000000000)
+    let t1 = time.mono_ns()
+    let late = client.resolve(lit("no-such-host.invalid"), 80, time.after_ms(0))
+    print(late.is_err())
+    print(time.mono_ns() - t1 < 5000000000)
+    // connecting to a port nothing listens on is refused promptly, for every address
+    let t2 = time.mono_ns()
+    let nothing = client.get_host("localhost", 1, "/", dl)
+    print(nothing.is_err())
+    print(time.mono_ns() - t2 < 5000000000)
+
+    tok.cancel()
+    let st = th.join()
+    print(st.requests >= 5)
+}

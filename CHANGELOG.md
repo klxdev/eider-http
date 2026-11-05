@@ -65,6 +65,15 @@ For Eider 0.7 (`eider = "0.7"`).
   reads), streaming large files (files are read whole, 16 MiB by default), precompressed
   (`.gz`/`.br`) variants.
 
+- **The client takes a host name with a deadline** (eider-lang#59, with Eider 0.7.1's
+  `net.lookup_by`): `client.connect_host(name, port, dl)`, `connect_host_with`, `fetch_host`, `get_host`,
+  `post_host`, `client.resolve`, `client.valid_host`. Names are resolved before the deadline, address literals
+  never reach the resolver, the addresses are tried in turn (each with an equal share of the
+  remaining time), a `Conn` made from a name resolves again to reconnect, `Host` is the name, and
+  names that could not be hosts are refused before any lookup. **Breaking for code that builds a `Conn`
+  by position:** it has two new last fields (`name`, `port`). `ws.dial` still takes an address.
+  Not done: happy-eyeballs (parallel attempts), a resolver cache, `ws.dial` by name.
+
 ## 0.7.0
 
 For Eider 0.7 (`eider = "0.7"`). Requires eider-json 0.7.0. Nothing else changed.

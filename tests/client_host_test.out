@@ -1,0 +1,52 @@
+-- literals and names
+ipv4 literal: 200
+true
+200
+true
+true
+true
+1
+true
+1
+ipv6 literal, nothing listens: error: connect: Connection refused
+post: 404
+-- a connection made from a name reconnects
+first: 200
+false
+second, on a new connection: 200
+true
+third, same connection: 200
+literal conn: 200
+-- refused before anything is resolved or sent
+empty: not a valid host name
+space: not a valid host name
+slash: not a valid host name
+at: not a valid host name
+hash: not a valid host name
+query: not a valid host name
+brackets: not a valid host name
+zone: not a valid host name
+tab: not a valid host name
+crlf: not a valid host name
+lf: not a valid host name
+non-ascii: not a valid host name
+backslash: not a valid host name
+port in name: not a valid host name
+percent: not a valid host name
+colon-space: not a valid host name
+false
+true
+true
+true
+false
+port 0: error: not a valid port
+port 65536: error: not a valid port
+port -1: error: not a valid port
+-- deadlines
+true
+true
+true
+true
+true
+true
+true

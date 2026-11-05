@@ -4,10 +4,21 @@
 //! next request connects again. Every call takes a time.Deadline that bounds the whole
 //! exchange (connecting, sending, reading the response).
 //!
+//! Host names (eider-lang#59): `connect_host(name, port, dl)`, `fetch_host`, `get_host`, `post_host`
+//! take a host name, an IPv4 address or an IPv6 address (without brackets). A name is resolved
+//! with `net.lookup_by` before the deadline (the resolver runs on a thread of its own and
+//! the caller waits only until `dl`); the addresses are tried in the resolver's order, each
+//! attempt getting an equal share of the time left, so one that black-holes does not use it
+//! all. An address literal never asks the resolver. A `Conn` made from a name resolves it
+//! again when it must reconnect, so a long-lived `Conn` follows DNS changes. The `Host`
+//! header is the name (and the port unless it is 80); a name that could not be a host name
+//! (control bytes, spaces, `/`, `@`, `#`, `?`, non-ASCII, over 253 bytes) is refused before
+//! anything is sent or resolved.
+//!
 //! Not here yet (docs/services.md "Next steps"): TLS (C3: use a proxy), connection pools,
 //! redirects, automatic retries (a request on a reused connection that the server had
 //! already closed fails with Err; send it again on a new Conn if it is idempotent), streaming
-//! bodies, and name resolution with deadlines (std/net.lookup blocks; pass an Addr).
+//! bodies, and happy-eyeballs (addresses are tried one after the other).
 
 import core.sys
 import std.bytes
@@ -20,7 +31,7 @@ import http.sock
 
 /// A connection to `addr`. `host` is what goes in the Host header ("127.0.0.1:8080");
 /// `open` says whether a connection is up now.
-pub type Conn = { fd: i32, addr: net.Addr, host: List[u8], lim: http.Limits, parser: parse.Parser, open: bool }
+pub type Conn = { fd: i32, addr: net.Addr, host: List[u8], lim: http.Limits, parser: parse.Parser, open: bool, name: List[u8], port: i32 }
 
 /// Connects to `a` before `dl` (non-blocking connect, then a wait for it).
 pub fn connect(a: net.Addr, dl: time.Deadline) -> Result[Conn, String] uses net, io, clock {
@@ -30,7 +41,7 @@ pub fn connect(a: net.Addr, dl: time.Deadline) -> Result[Conn, String] uses net,
 /// `connect`, with limits on the responses it will read.
 pub fn connect_with(a: net.Addr, lim: http.Limits, dl: time.Deadline) -> Result[Conn, String] uses net, io, clock {
     let s = dial(a, dl)?
-    Ok(Conn(s, a, net.text(a), lim, parse.responses(lim), true))
+    Ok(Conn(s, a, net.text(a), lim, parse.responses(lim), true, List.new(), 0))
 }
 
 fn dial(a: net.Addr, dl: time.Deadline) -> Result[i32, String] uses net, io, clock {
@@ -58,7 +69,14 @@ impl Conn {
     /// asked for it. On Err the connection is closed too (its state is unknown).
     fn request(inout self, req: http.Request, dl: time.Deadline) -> Result[http.Response, String] uses net, io, clock {
         if !self.open {
-            self.fd = dial(self.addr, dl)?
+            if self.name.len() > 0 {
+                // made from a name: ask again, the address may have changed
+                let s = connect_name(self.name, self.port, dl)?
+                self.fd = s.fd
+                self.addr = s.addr
+            } else {
+                self.fd = dial(self.addr, dl)?
+            }
             self.parser = parse.responses(self.lim)
             self.open = true
         }
@@ -146,4 +164,110 @@ pub fn post(a: net.Addr, target: str, content_type: str, body: List[u8], dl: tim
     r.set_header("Content-Type", sys.lit(content_type))
     r.body = body
     fetch(a, r, dl)
+}
+
+// ---- host names
+
+/// Whether `h` can be a host: 1 to 253 bytes of letters, digits, `-`, `_`, `.`, or an IPv6
+/// address (hex digits and colons, with dots for an IPv4 tail). Nothing else: not a space, a
+/// control byte, `/`, `@`, `#`, `?`, `[`, `]`, `%` (a zone id), or a non-ASCII byte.
+pub fn valid_host(h: List[u8]) -> bool {
+    if h.len() == 0 || h.len() > 253 { return false }
+    for c in h {
+        let ok = bytes.is_alpha(c) || bytes.is_digit(c) || c == 45 || c == 95 || c == 46 || c == 58
+        if !ok { return false }
+    }
+    true
+}
+
+type Dialed = { fd: i32, addr: net.Addr }
+
+/// The host as the Host header writes it: `name`, `name:port`, `[v6]:port`.
+fn host_header(name: List[u8], port: i32) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let v6 = bytes.find_byte(name, 58, 0).is_some()
+    if v6 { out.push(91) }
+    bytes.append(inout out, name)
+    if v6 { out.push(93) }
+    if port != 80 {
+        out.push(58)
+        bytes.append(inout out, bytes.from_u64(port as u64))
+    }
+    out
+}
+
+/// The addresses of `name` (a literal is itself; a name is looked up before `dl`).
+pub fn resolve(name: List[u8], port: i32, dl: time.Deadline) -> Result[List[net.Addr], String] uses net, io, clock {
+    if !valid_host(name) { return Err(String.from("not a valid host name")) }
+    if port < 1 || port > 65535 { return Err(String.from("not a valid port")) }
+    match net.parse(name, port) {
+        Ok(a) => {
+            let mut one: List[net.Addr] = List.new()
+            one.push(a)
+            return Ok(one)
+        }
+        Err(e) => {}
+    }
+    // a colon means an IPv6 literal, and it did not parse
+    if bytes.find_byte(name, 58, 0).is_some() { return Err(String.from("not a valid host name")) }
+    let found = net.lookup_by(name, bytes.from_u64(port as u64), 0, net.STREAM, dl)?
+    if found.len() == 0 { return Err(String.from("no address for the host name")) }
+    Ok(found)
+}
+
+/// Resolves `name` and connects to the first address that accepts before `dl`: each attempt
+/// may use an equal share of the time left.
+fn connect_name(name: List[u8], port: i32, dl: time.Deadline) -> Result[Dialed, String] uses net, io, clock {
+    let addrs = resolve(name, port, dl)?
+    let mut last = String.from("no address")
+    let mut i: usize = 0
+    for a in addrs {
+        let left = addrs.len() - i
+        i += 1
+        let share = time.after(time.nanos(dl.remaining().as_ns() / (left as i64)))
+        let attempt = if left == 1 { dl } else { share.earlier(dl) }
+        match dial(a, attempt) {
+            Ok(s) => { return Ok(Dialed(s, a)) }
+            Err(e) => { last = e }
+        }
+    }
+    Err(last)
+}
+
+/// Connects to `name:port` (a host name, or an IPv4/IPv6 address) before `dl`; see the module
+/// comment.
+pub fn connect_host(name: str, port: i32, dl: time.Deadline) -> Result[Conn, String] uses net, io, clock {
+    connect_host_with(name, port, http.limits(), dl)
+}
+
+/// `connect_host`, with limits on the responses it will read.
+pub fn connect_host_with(name: str, port: i32, lim: http.Limits, dl: time.Deadline) -> Result[Conn, String] uses net, io, clock {
+    let n = sys.lit(name)
+    let d = connect_name(n, port, dl)?
+    // an address literal is reconnected without the resolver; a name is resolved again
+    let literal = net.parse(n, port).is_ok()
+    Ok(Conn(d.fd, d.addr, host_header(n, port), lim, parse.responses(lim), true, if literal { List.new() } else { n }, port))
+}
+
+/// One request to `name:port` on a new connection, closed afterwards.
+pub fn fetch_host(name: str, port: i32, req: http.Request, dl: time.Deadline) -> Result[http.Response, String] uses net, io, clock {
+    let mut c = connect_host(name, port, dl)?
+    let mut r = req.copy()
+    r.keep_alive = false
+    let resp = c.request(r, dl)
+    c.close()
+    resp
+}
+
+/// GET `target` from `name:port` (one-shot).
+pub fn get_host(name: str, port: i32, target: str, dl: time.Deadline) -> Result[http.Response, String] uses net, io, clock {
+    fetch_host(name, port, http.request("GET", sys.lit(target)), dl)
+}
+
+/// POST `body` with `content_type` to `target` on `name:port` (one-shot).
+pub fn post_host(name: str, port: i32, target: str, content_type: str, body: List[u8], dl: time.Deadline) -> Result[http.Response, String] uses net, io, clock {
+    let mut r = http.request("POST", sys.lit(target))
+    r.set_header("Content-Type", sys.lit(content_type))
+    r.body = body
+    fetch_host(name, port, r, dl)
 }
