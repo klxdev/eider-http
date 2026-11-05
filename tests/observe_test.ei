@@ -34,7 +34,7 @@ fn main() uses io, net, clock, threads, fs {
 
     print("-- the server's counters")
     let mm = metrics.by_route(metrics.new())
-    let lim = ratelimit.new(100, time.seconds(1), 4).except(|q: http.Request| -> bool { bytes.eq(q.path, lit("/metrics")) })
+    let lim = ratelimit.new(1, time.seconds(3600), 4).except(|q: http.Request| -> bool { bytes.eq(q.path, lit("/metrics")) })
     lim.expose(mm)
     let mut r = router.new()
     r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello") })
