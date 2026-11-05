@@ -48,6 +48,8 @@ the step-by-step guide to both ("Building services").
 | `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `recover`, `chain` | none; `io, clock` for `access_log`, `timeout` and `recover`, `io` for `random_ids` |
 | `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format; `by_route` labels both with the route (or operation id) | `clock` for `wrap` |
 | `http/trace` | W3C Trace Context: `traceparent` in, a span per request to a sink (`log_sink`, `collect`), `inject` for outgoing calls | `io, clock` for `wrap` and `inject` |
+| `http/health` | `/healthz` (liveness), `/readyz` (readiness with checks, 503 while draining), the drain flag | none |
+| `http/service` | production defaults: `handler(router, options)` stacks request ids, trusted-proxy peer, access log, metrics, rate limit, trap containment, problem+json and mounts the probes and `/metrics`; `serve`/`run` drain on SIGTERM | `net, io, clock, threads, fs` |
 | `http/proxy` | the client address behind trusted proxies: `trust_none().allow("10.0.0.0/8")`, `.use_forwarded()`, `middleware(trust, h)`, strict IP and CIDR parsing | none |
 | `http/ratelimit` | GCRA rate limiting per client address (or any key), a bounded table, 429 + `Retry-After` | `clock` for `middleware` |
 | `http/sse` | server-sent events over a chunked response: `response(run)`, `Stream.event/data/comment/retry`, `format_event` | none |
@@ -302,6 +304,12 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   that stays at `max_keys` under 10,000 distinct keys, 8 threads on one key getting exactly the
   burst, the middleware (429, `Retry-After`, `except`, `by`), and the pair with `proxy`: forged
   headers from a direct client or forged left sides behind a proxy buy no extra bucket.
+- `service_test`: liveness and readiness (checks that fail or trap are named, error text is
+  not sent, `no-store`, draining flips readiness only), the default stack (request ids,
+  problem+json 404, metrics by route, profiler endpoints absent), forwarded headers ignored from
+  untrusted peers and honoured from a trusted one, the limiter exempting the probes, a real server
+  whose readiness turns 503 on the stop token while `/hello` and `/healthz` still answer through
+  the delay, then refuses connections.
 - `observe_test`: `add_source`, the server's and the rate limiter's series on a live `/metrics`
   next to per-route series with a contained trap (500), a 404 and rate-limited 429s; the profiling
   endpoints in a build without `--profile` (404 when not mounted, 501) and `is_local` (including
@@ -368,6 +376,22 @@ Recorded rather than worked around; none blocks the design.
    away (N4).
 6. **TLS 1.3 in Eider** (P1.4), then HTTP/2 (P1.7) for gRPC.
 
+
+## Production defaults (`http/health`, `http/service`)
+
+`service.handler(router, options())` is the stack a service would write by hand, in the order that
+makes the numbers right (module comment of service.ei): request id, trusted-proxy peer, access log,
+metrics, problem+json, rate limit, trap containment, router; and it mounts `/healthz`, `/readyz`,
+`/metrics` and (opt-in) the profiler's endpoints. `service.run(addr, router, options)` also binds,
+installs the SIGTERM/SIGINT watcher (std/service) and drains: readiness turns 503 at once, the
+server keeps serving for `drain_delay` (5 s: time for a load balancer to notice), then shuts down
+gracefully with the server's per-connection deadlines as the bound.
+
+Defaults that matter: nothing is trusted in forwarded headers; rate limiting is **on**, 1000
+requests a second per address with bursts of 2000, and exempts the probes and `/metrics` (so
+a balancer's health checks are never limited); behind a load balancer all clients share one
+bucket until `with_trust` names the balancer; profiling endpoints are off; readiness failures
+name the failed checks and never their error text.
 
 ## Tracing and per-route metrics
 

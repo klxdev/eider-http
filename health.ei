@@ -1,0 +1,110 @@
+//! http/health: liveness and readiness endpoints, and the drain flag a shutdown sets.
+//!
+//!     let hl = health.new().check("db", || -> Result[(), String] { db_ping() })
+//!     hl.mount(inout r)                  // GET /healthz and GET /readyz
+//!     ...
+//!     hl.drain()                         // on SIGTERM: readiness turns 503, liveness stays 200
+//!
+//! - `/healthz` (liveness): 200 `{"status":"ok"}` whenever the process can answer. It runs no
+//!   checks and does not change while draining: a failing liveness probe gets the process
+//!   killed and restarted.
+//! - `/readyz` (readiness): 200 when not draining and every check passes, else 503 so a load
+//!   balancer stops sending traffic: `{"status":"draining"}`, or `{"status":"failing","failed":
+//!   ["db"]}`. Only the names of the failed checks are sent, never the error text, which can
+//!   hold hostnames or credentials; a check that returns Err (or traps) is a failed check. Checks
+//!   run on every probe, on the worker that serves it: keep them quick (a ping with a deadline).
+//! - `drain()` is one-way and shared by every copy (`http/service` calls it on SIGTERM).
+//! Responses are `no-store`.
+
+import core.sys
+import std.bytes
+import std.atomic
+import std.task
+import http
+import http.router
+
+pub type Check = { name: List[u8], run: fn() -> Result[(), String] }
+
+/// The checks and the drain flag (shared by copies).
+pub type Health = { draining: atomic.Atomic, checks: List[Check] }
+
+pub fn new() -> Health { Health(atomic.new(0), List.new()) }
+
+impl Health {
+    /// Adds a readiness check called `name` (letters, digits and `-_.` are sent as they are;
+    /// anything else is replaced by `_` in the answer).
+    fn check(self, name: str, f: fn() -> Result[(), String]) -> Health {
+        let mut cs = self.checks.copy()
+        cs.push(Check(clean(sys.lit(name)), f))
+        Health(self.draining, cs)
+    }
+
+    /// Readiness turns 503 from now on.
+    fn drain(self) { self.draining.store(1, atomic.SeqCst) }
+
+    fn draining(self) -> bool { self.draining.load(atomic.SeqCst) != 0 }
+
+    /// The names of the checks that fail now.
+    fn failing(self) -> List[List[u8]] {
+        let mut out: List[List[u8]] = List.new()
+        for c in self.checks {
+            let run = c.run
+            match task.catch(|| -> Result[(), String] { run() }) {
+                Ok(r) => {
+                    match r {
+                        Ok(z) => {}
+                        Err(e) => { out.push(c.name) }
+                    }
+                }
+                Err(why) => { out.push(c.name) }
+            }
+        }
+        out
+    }
+
+    /// The liveness handler.
+    fn live(self) -> http.Handler {
+        |q: http.Request| -> http.Response { reply(200, sys.lit("{{\"status\":\"ok\"}}")) }
+    }
+
+    /// The readiness handler.
+    fn ready(self) -> http.Handler {
+        let hl = self
+        |q: http.Request| -> http.Response {
+            if hl.draining() { return reply(503, sys.lit("{{\"status\":\"draining\"}}")) }
+            let bad = hl.failing()
+            if bad.len() == 0 { return reply(200, sys.lit("{{\"status\":\"ok\"}}")) }
+            let mut b = sys.lit("{{\"status\":\"failing\",\"failed\":[")
+            let mut first = true
+            for n in bad {
+                if !first { b.push(44) }
+                first = false
+                b.push(34)
+                bytes.append(inout b, n)
+                b.push(34)
+            }
+            bytes.append(inout b, sys.lit("]}}"))
+            reply(503, b)
+        }
+    }
+
+    /// Adds GET /healthz and GET /readyz to `r`.
+    fn mount(self, inout r: router.Router) {
+        r.get("/healthz", self.live())
+        r.get("/readyz", self.ready())
+    }
+}
+
+fn clean(n: List[u8]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    for c in n {
+        if bytes.is_alpha(c) || bytes.is_digit(c) || c == 45 || c == 95 || c == 46 { o.push(c) } else { o.push(95) }
+    }
+    o
+}
+
+fn reply(status: i32, body: List[u8]) -> http.Response {
+    let mut r = http.json_response(status, body)
+    r.set_header("Cache-Control", sys.lit("no-store"))
+    r
+}

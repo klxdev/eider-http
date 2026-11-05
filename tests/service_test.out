@@ -1,0 +1,41 @@
+-- probes
+200 application/json {"status":"ok"}
+503 application/json {"status":"failing","failed":["cache","odd_name_"]}
+200 application/json {"status":"ok"}
+no-store
+true
+503 application/json {"status":"draining"}
+200 application/json {"status":"ok"}
+false
+-- the default layers
+200 text/plain; charset=utf-8 hello
+true
+404 application/problem+json {"type":"about:blank","title":"Not Found","status":404}
+200 application/json {"status":"ok"}
+200 application/json {"status":"ok"}
+true
+true
+true
+abc-1
+true
+404 application/problem+json {"type":"about:blank","title":"Not Found","status":404}
+-- forwarded headers are not trusted by default
+203.0.113.9:1000
+198.51.100.7:0
+203.0.113.9:1000
+-- rate limiting, probes exempt
+[200, 200, 200, 429, 429, 429]
+200
+200
+200
+429 application/problem+json {"type":"about:blank","title":"Too Many Requests","status":429}
+true
+0
+-- draining a real server
+200
+200
+true
+200
+200
+true
+true

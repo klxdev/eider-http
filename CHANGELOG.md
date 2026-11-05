@@ -41,6 +41,18 @@ For Eider 0.7 (`eider = "0.7"`).
   `http/profiling` (eider-profiler reads its files), now tested in both a plain and a `--profile`
   build. `profiling.is_local` accepts IP literals only (it took any text starting with `127.`).
 
+- **Production defaults** (eider-http#6): `http/health` (`/healthz`, `/readyz` with named checks,
+  `drain()`), `http/service`: `service.options()`, `service.handler(router, o)` (request ids,
+  trusted-proxy peer, access log, metrics, problem+json, rate limit, trap containment, probes,
+  `/metrics`, opt-in profiling) and `service.serve` / `service.run` (drain on SIGTERM: readiness
+  503, `drain_delay`, graceful stop). Rate limiting is on by default (1000/s, burst 2000 per
+  address); nothing is trusted in forwarded headers until `with_trust`.
+  Not done (eider-http#6): the pprof-compatible profile export. It needs a converter from the
+  profile file (JSON lines, docs/runtime.md "Profile format") to pprof's `profile.proto`; that
+  belongs in eider-profiler (`eider-profiler pprof`), after which `/debug/pprof/profile` here is a
+  few lines. `service.run`'s signal path (`std/service.cancel_on_term`) has no test of its own;
+  `serve` with a token is tested.
+
 ## 0.7.0
 
 For Eider 0.7 (`eider = "0.7"`). Requires eider-json 0.7.0. Nothing else changed.

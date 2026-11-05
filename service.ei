@@ -1,0 +1,180 @@
+//! http/service: the production defaults around a router, and a serve loop that drains on
+//! SIGTERM.
+//!
+//!     let mut r = router.new()
+//!     r.get("/users/:id", get_user)
+//!     let o = service.options().with_trust(proxy.trust_none().allow("10.0.0.0/8").unwrap())
+//!     let stats = service.run(net.ipv4(0, 0, 0, 0, 8080), r, o).unwrap()
+//!
+//! What `handler(r, o)` builds, outermost first:
+//!   request ids (`X-Request-Id`)  >  client address behind trusted proxies (`http/proxy`, nothing
+//!   trusted unless `with_trust`)  >  one access-log record per request (`o.logger`)  >  metrics
+//!   (`http_requests_total`... with the route, the server's and the rate limiter's counters)  >
+//!   errors as problem+json (`middleware.problems`: 404, 405, 429, 500...)  >  rate limiting per client
+//!   address (`o.limit`; `/healthz`, `/readyz` and `/metrics` are exempt)  >  trap -> 500
+//!   (`middleware.recover`)  >  the router.
+//! It also mounts `GET /healthz`, `GET /readyz` (`http/health`, with `o.health`'s checks), `GET
+//! /metrics`, and, only when `o.profiling.enabled`, the profiler's endpoints (`http/profiling`);
+//! with `--profile` the routes are labelled for `eider-profiler report --by route`.
+//!
+//! **Rate limiting is on by default**: 1000 requests a second with bursts of 2000 per client
+//! address (`ratelimit`), generous against abuse, not against traffic. Behind a load balancer the
+//! address is the balancer's unless you say which proxies to trust (`with_trust`): until then every
+//! client shares one bucket. `no_rate_limit()` turns it off, `with_limit` sets another limiter.
+//!
+//! **Draining** (`serve`, `run`): when the stop token is cancelled (`run`: SIGTERM or SIGINT,
+//! std/service), readiness turns 503 at once (the balancer stops sending), the server goes on
+//! serving for `o.drain_delay` (default 5 s: the balancer needs a moment to notice), and then
+//! shuts down gracefully (http/server: in-flight requests finish, idle connections close).
+//! Each connection is bounded by the server's own deadlines, so the drain ends by then.
+
+import core.sys
+import std.bytes
+import std.log
+import std.net
+import std.service
+import std.task
+import std.time
+import http
+import http.server
+import http.router
+import http.middleware
+import http.metrics
+import http.health
+import http.proxy
+import http.ratelimit
+import http.profiling
+
+/// The settings. All have defaults (`options()`); `with_...` returns a changed copy.
+pub type Options = {
+    health: health.Health,
+    metrics: metrics.Metrics,
+    logger: Option[log.Logger],
+    trust: proxy.Trust,
+    limit: Option[ratelimit.Limiter],
+    profiling: profiling.Options,
+    server: server.Config,
+    drain_delay: time.Duration,
+}
+
+/// The defaults of the module comment: info-level access logs and trap logs to stderr, metrics by route, nothing
+/// trusted, 1000 requests a second per address, profiling off, `server.config()` with its trap log
+/// on this logger, a 5 s drain delay.
+pub fn options() -> Options {
+    let lg = log.new(log.Info)
+    let mut cfg = server.config()
+    cfg.log = Some(lg)
+    Options(health.new(), metrics.by_route(metrics.new()), Some(lg), proxy.trust_none(), Some(ratelimit.new(1000, time.seconds(1), 2000)), profiling.options(), cfg, time.seconds(5))
+}
+
+impl Options {
+    fn with_trust(self, t: proxy.Trust) -> Options {
+        Options(self.health, self.metrics, self.logger, t, self.limit, self.profiling, self.server, self.drain_delay)
+    }
+
+    fn with_limit(self, l: ratelimit.Limiter) -> Options {
+        Options(self.health, self.metrics, self.logger, self.trust, Some(l), self.profiling, self.server, self.drain_delay)
+    }
+
+    fn no_rate_limit(self) -> Options {
+        Options(self.health, self.metrics, self.logger, self.trust, None, self.profiling, self.server, self.drain_delay)
+    }
+
+    fn with_health(self, h: health.Health) -> Options {
+        Options(h, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, self.drain_delay)
+    }
+
+    /// Logs access records and traps to `lg`.
+    fn with_logger(self, lg: log.Logger) -> Options {
+        let mut c = self.server.copy()
+        c.log = Some(lg)
+        Options(self.health, self.metrics, Some(lg), self.trust, self.limit, self.profiling, c, self.drain_delay)
+    }
+
+    /// No access log and no trap log (the metrics still count everything).
+    fn without_logs(self) -> Options {
+        let mut c = self.server.copy()
+        c.log = None
+        Options(self.health, self.metrics, None, self.trust, self.limit, self.profiling, c, self.drain_delay)
+    }
+
+    fn with_drain_delay(self, d: time.Duration) -> Options {
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, d)
+    }
+
+    fn with_server(self, c: server.Config) -> Options {
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, c, self.drain_delay)
+    }
+
+    fn with_profiling(self, p: profiling.Options) -> Options {
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, p, self.server, self.drain_delay)
+    }
+}
+
+fn exempt(q: http.Request) -> bool {
+    bytes.eq(q.path, sys.lit("/healthz")) || bytes.eq(q.path, sys.lit("/readyz")) || bytes.eq(q.path, sys.lit("/metrics"))
+}
+
+/// The router with the endpoints mounted, wrapped in the layers of the module comment.
+pub fn handler(r: router.Router, o: Options) -> http.Handler uses io, clock, fs {
+    let mut rt = r.copy()
+    rt.get("/metrics", o.metrics.handler())
+    o.health.mount(inout rt)
+    profiling.label_routes(inout rt)
+    profiling.mount(inout rt, o.profiling)
+    var h = middleware.recover(o.logger, router.handler(rt))
+    match o.limit {
+        Some(l) => {
+            let lim = l.except(exempt)
+            lim.expose(o.metrics)
+            h = ratelimit.middleware(lim, h)
+        }
+        None => {}
+    }
+    h = middleware.problems(h)
+    h = o.metrics.wrap(h)
+    match o.logger {
+        Some(lg) => { h = middleware.access_log_with(lg, h) }
+        None => {}
+    }
+    h = proxy.middleware(o.trust, h)
+    match middleware.random_ids() {
+        Ok(ids) => { h = middleware.request_id(ids, h) }
+        Err(e) => { h = middleware.request_id(middleware.ids("req"), h) }
+    }
+    h
+}
+
+/// Serves `h` on `srv` until `stop` is cancelled, then drains (module comment) and returns the
+/// counts. Adds the server's counters to `o.metrics`. `h` is what `handler` built.
+pub fn serve(srv: server.Server, h: http.Handler, o: Options, stop: task.Token) -> Result[server.Stats, String] uses net, io, clock, threads {
+    srv.expose(o.metrics)
+    // not a child of `stop`: cancelling that must not stop the server before the delay
+    let serving = task.root()
+    let hl = o.health
+    let delay = o.drain_delay
+    let watcher = spawn(|| -> i32 {
+        // readiness goes first; the server stops accepting only after the delay
+        let cancelled = stop.wait(time.never())
+        hl.drain()
+        if delay.as_ns() > 0 { time.sleep(delay) }
+        serving.cancel()
+        0
+    })
+    let res = srv.serve(h, serving)
+    // serve returned: either the drain finished, or it could not start; make the watcher end
+    stop.cancel()
+    let z = watcher.join()
+    res
+}
+
+/// Binds `addr` and serves `r` with the defaults and `o`, draining on SIGTERM or SIGINT:
+/// returns the counts after the drain.
+pub fn run(addr: net.Addr, r: router.Router, o: Options) -> Result[server.Stats, String] uses net, io, clock, threads, fs {
+    let srv = server.listen(addr, o.server)?
+    let stop = task.root()
+    let sig = service.cancel_on_term(stop)?
+    let res = serve(srv, handler(r, o), o, stop)
+    let z = sig.join()
+    res
+}
