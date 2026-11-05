@@ -1,0 +1,152 @@
+//! http/ratelimit: rate limiting by client address (or any key), the generic cell rate
+//! algorithm (GCRA) with one number per key.
+//!
+//!     let lim = ratelimit.new(100, time.seconds(1), 20)       // 100 requests a second, bursts of 20
+//!     let app = ratelimit.middleware(lim, router.handler(r))   // 429 + Retry-After over it
+//!
+//! A request is allowed when its client's "theoretical arrival time" is at most `burst - 1`
+//! intervals ahead of now; each allowed request moves it one interval (`per / requests`) on.
+//! A refused request changes nothing. The key defaults to the client's address
+//! (`Request.peer` without its port; put `proxy.middleware` outside to have the real client
+//! behind a trusted proxy; without it every client of a proxy is the proxy). IPv6 clients are keyed by their /64
+//! (a single subscriber has at least that), IPv4-mapped IPv6 as the IPv4 address, so spelling
+//! an address differently doesn't give another bucket.
+//!
+//! Memory is bounded: at most `max_keys` entries (10,000, the shared `overflow` bucket included) are kept. When the table is
+//! full, clients that have been quiet long enough to have a full allowance again are dropped
+//! (at most one sweep a second, so a flood can't make every request scan the table), and if it is
+//! still full new clients share one bucket (`overflow`): an attacker who varies its address
+//! throttles itself and other newcomers, not the clients already known and not the process.
+//! Nothing here sleeps or reads the clock but `middleware`/`allow`: `allow_at` takes the time, for tests.
+
+import core.sys
+import std.bytes
+import std.sync
+import std.time
+import http
+import http.proxy
+
+/// What `allow` says: whether the request may go on, and when to try again if not (ns).
+pub type Decision = { allowed: bool, retry_ns: i64 }
+
+type State = { tat: Map[List[u8], i64], swept_at: i64, allowed: i64, limited: i64 }
+
+/// A limiter shared by its copies (one Lock). `interval_ns`: time between two allowed requests
+/// at the sustained rate; `burst`: requests allowed at once from a fresh client.
+pub type Limiter = {
+    st: sync.Lock[State],
+    interval_ns: i64,
+    burst: i64,
+    max_keys: usize,
+    key: fn(http.Request) -> List[u8],
+    skip: fn(http.Request) -> bool,
+}
+
+/// `requests` per `per`, bursts of up to `burst` (at least 1), clients keyed by address.
+pub fn new(requests: i64, per: time.Duration, burst: i64) -> Limiter {
+    let n: i64 = if requests < 1 { 1 as i64 } else { requests }
+    let mut iv = per.as_ns() / n
+    if iv < 1 { iv = 1 }
+    let b: i64 = if burst < 1 { 1 as i64 } else { burst }
+    Limiter(sync.lock(State(Map.new(), 0, 0, 0)), iv, b, 10000, address_key, never_skip)
+}
+
+fn never_skip(q: http.Request) -> bool { false }
+
+/// The rate-limiting key of an address: "1.2.3.4" for IPv4 (and IPv4-mapped IPv6), the /64
+/// prefix for IPv6 ("[2001:db8:0:1::]"), and the text itself for what is not an IP address
+/// (a unix peer, or a test's name). The port never counts.
+pub fn address_key(q: http.Request) -> List[u8] {
+    match proxy.peer_ip(q.peer) {
+        Some(ip) => {
+            if ip.len() == 4 { return proxy.ip_text(ip) }
+            let mut p: List[u8] = List.new()
+            for i in 0..8 { p.push(ip[i as usize]) }
+            for i in 0..8 { p.push(0) }
+            proxy.ip_text(p)
+        }
+        None => q.peer
+    }
+}
+
+impl Limiter {
+    /// The same limiter keyed by `f(request)` (a principal, an API key, ...). A key longer than
+    /// 128 bytes is cut so a client can't make big keys.
+    fn by(self, f: fn(http.Request) -> List[u8]) -> Limiter {
+        Limiter(self.st, self.interval_ns, self.burst, self.max_keys, f, self.skip)
+    }
+
+    /// The same limiter not applied to requests `f` is true for (health checks, `/metrics`).
+    fn except(self, f: fn(http.Request) -> bool) -> Limiter {
+        Limiter(self.st, self.interval_ns, self.burst, self.max_keys, self.key, f)
+    }
+
+    /// The same limiter remembering at most `n` clients (at least 2).
+    fn with_max_keys(self, n: usize) -> Limiter {
+        Limiter(self.st, self.interval_ns, self.burst, if n < 2 { 2 } else { n }, self.key, self.skip)
+    }
+
+    /// Counts a request of `key` at `now_ns` (any monotonic clock): see the module comment.
+    fn allow_at(self, key: List[u8], now_ns: i64) -> Decision {
+        let iv = self.interval_ns
+        let tol = (self.burst - 1) * iv
+        let cap = self.max_keys
+        self.st.modify(|inout s: State| -> Decision {
+            let mut k = if key.len() > 128 { bytes.slice(key, 0, 128) } else { key }
+            if !s.tat.contains(k) && s.tat.len() + 1 >= cap {
+                // full: forget clients with a full allowance again (once a second at most)
+                if now_ns - s.swept_at >= 1000000000 || s.swept_at > now_ns {
+                    s.swept_at = now_ns
+                    for (c, t) in s.tat.entries() {
+                        if t - now_ns <= 0 { let gone = s.tat.remove(c) }
+                    }
+                }
+                if s.tat.len() + 1 >= cap { k = overflow_key() }
+            }
+            let t0 = match s.tat.get(k) {
+                Some(t) => t
+                None => now_ns
+            }
+            let t = if t0 > now_ns { t0 } else { now_ns }
+            if t - now_ns > tol {
+                s.limited += 1
+                return Decision(false, t - now_ns - tol)
+            }
+            s.tat.insert(k, t + iv)
+            s.allowed += 1
+            Decision(true, 0)
+        })
+    }
+
+    /// `allow_at` now.
+    fn allow(self, key: List[u8]) -> Decision uses clock { self.allow_at(key, time.mono_ns()) }
+
+    /// Requests allowed and refused so far.
+    fn counts(self) -> (i64, i64) { self.st.modify(|inout s: State| -> (i64, i64) { (s.allowed, s.limited) }) }
+
+    /// Clients remembered now.
+    fn tracked(self) -> usize { self.st.modify(|inout s: State| -> usize { s.tat.len() }) }
+}
+
+/// The key the clients beyond `max_keys` share (starts with a byte no address text does).
+pub fn overflow_key() -> List[u8] { sys.lit("*overflow*") }
+
+/// 429 with `Retry-After` (whole seconds, rounded up, at least 1) for requests over the limit;
+/// the others go to `h`. Allowed responses carry nothing extra.
+pub fn middleware(lim: Limiter, h: http.Handler) -> http.Handler uses clock {
+    |req: http.Request| -> http.Response {
+        if lim.skip(req) { return h(req) }
+        let d = lim.allow(lim.key(req))
+        if d.allowed { return h(req) }
+        refuse(d)
+    }
+}
+
+/// The 429 response for a refusal.
+pub fn refuse(d: Decision) -> http.Response {
+    let mut secs = (d.retry_ns + 999999999) / 1000000000
+    if secs < 1 { secs = 1 }
+    let mut r = http.error_response(429)
+    r.set_header("Retry-After", bytes.from_i64(secs))
+    r
+}

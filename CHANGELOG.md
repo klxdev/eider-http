@@ -16,6 +16,21 @@ For Eider 0.7 (`eider = "0.7"`).
   trapped handler 500 at once (it was 503 at the deadline). **Breaking for code that builds the
   records by position:** `Config` has a new last field (`log`) and `Stats` has `traps`.
 
+- **`http/proxy`: the client address behind a proxy, with nothing trusted by default** (eider-http#3).
+  `proxy.trust_none().allow("10.0.0.0/8")` lists the proxies (CIDR ranges; `/0` is refused;
+  `allow_unix()` for unix-socket proxies); `proxy.middleware(trust, h)` then sets `Request.peer`
+  to the client from `X-Forwarded-For` (or `Forwarded` after `use_forwarded()`; only the one
+  header named is read) when the connection is from such a proxy, and puts the proxy in the
+  request context as `proxy_peer`. The list is walked from the right, skipping trusted proxies; it
+  is bounded (2 KiB, 16 elements) and strict (anything but an IP literal that the walk reads makes
+  the header ignored); addresses are canonical.
+- **`http/ratelimit`** (eider-http#3): `ratelimit.new(requests, per, burst)`, `middleware(lim, h)`
+  (429 with `Retry-After`), keyed by client address (IPv6 by /64) or `by(f)`, `except(f)`, a table
+  bounded by `with_max_keys`, `allow_at` for tests.
+  Not done (eider-http#3): `X-Forwarded-Proto` / `-Host` (the scheme and host of the original
+  request), the PROXY protocol, a rate limit shared between processes. Per-route limits: wrap
+  that route's handler in its own limiter.
+
 ## 0.7.0
 
 For Eider 0.7 (`eider = "0.7"`). Requires eider-json 0.7.0. Nothing else changed.

@@ -1,0 +1,219 @@
+// http/ratelimit: the algorithm on a fixed clock (allow_at), the keys, the bounded table, the
+// middleware, and the pair with http/proxy (a spoofed X-Forwarded-For doesn't buy a new bucket).
+
+import core.sys
+import std.bytes
+import std.io
+import std.task
+import std.time
+import http
+import http.proxy
+import http.ratelimit
+import http.testing
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn ms(n: i64) -> i64 { n * 1000000 }
+
+fn say(label: str, d: ratelimit.Decision) uses io {
+    var l = lit(label)
+    l.push(32)
+    if d.allowed { bytes.append(inout l, lit("allowed")) } else {
+        bytes.append(inout l, lit("limited, retry in "))
+        bytes.append(inout l, bytes.from_i64(d.retry_ns / 1000000))
+        bytes.append(inout l, lit(" ms"))
+    }
+    io.outln(l)
+}
+
+fn key_of(peer: str) -> List[u8] {
+    let mut q = http.request("GET", lit("/"))
+    q.peer = lit(peer)
+    ratelimit.address_key(q)
+}
+
+fn main() uses io, clock, threads {
+    print("-- the algorithm: 10 a second, bursts of 3")
+    let lim = ratelimit.new(10, time.seconds(1), 3)
+    let a = lit("a")
+    let b = lit("b")
+    say("t=0 #1", lim.allow_at(a, 0))
+    say("t=0 #2", lim.allow_at(a, 0))
+    say("t=0 #3", lim.allow_at(a, 0))
+    say("t=0 #4", lim.allow_at(a, 0))
+    say("t=0 #5 (a refusal costs nothing)", lim.allow_at(a, 0))
+    say("t=0 other client", lim.allow_at(b, 0))
+    say("t=50", lim.allow_at(a, ms(50)))
+    say("t=100", lim.allow_at(a, ms(100)))
+    say("t=100 again", lim.allow_at(a, ms(100)))
+    say("t=200", lim.allow_at(a, ms(200)))
+    say("t=200 again", lim.allow_at(a, ms(200)))
+    // a long quiet time refills to the burst, not beyond
+    say("t=10s #1", lim.allow_at(a, ms(10000)))
+    say("t=10s #2", lim.allow_at(a, ms(10000)))
+    say("t=10s #3", lim.allow_at(a, ms(10000)))
+    say("t=10s #4", lim.allow_at(a, ms(10000)))
+    // the sustained rate: one request every 100 ms is always allowed
+    var steady = 0
+    for i in 0..100 {
+        if lim.allow_at(lit("steady"), ms(20000 + (i as i64) * 100)).allowed { steady += 1 }
+    }
+    print(steady)
+    // a clock that goes backwards doesn't give credit
+    say("t=back", lim.allow_at(lit("c"), ms(5000)))
+    say("t=back", lim.allow_at(lit("c"), ms(1000)))
+    say("t=back", lim.allow_at(lit("c"), ms(1000)))
+    say("t=back", lim.allow_at(lit("c"), ms(1000)))
+    let one = ratelimit.new(1, time.seconds(1), 1)
+    say("burst 1 #1", one.allow_at(a, 0))
+    say("burst 1 #2", one.allow_at(a, 0))
+    say("burst 1 after 1s", one.allow_at(a, ms(1000)))
+    let degenerate = ratelimit.new(0, time.seconds(0), 0)
+    say("degenerate #1", degenerate.allow_at(a, 0))
+    say("degenerate #2", degenerate.allow_at(a, 0))
+    let (ok, no) = lim.counts()
+    print(ok)
+    print(no)
+
+    print("-- keys")
+    io.outln(key_of("1.2.3.4:5000"))
+    io.outln(key_of("1.2.3.4:5001"))
+    io.outln(key_of("[0:0:0:0:0:ffff:102:304]:5000"))
+    io.outln(key_of("[2001:db8:1:2:3:4:5:6]:80"))
+    io.outln(key_of("[2001:db8:1:2:ffff:ffff:ffff:ffff]:81"))
+    io.outln(key_of("[2001:db8:1:3:0:0:0:1]:80"))
+    io.outln(key_of("unix:/run/x.sock"))
+    io.outln(key_of(""))
+    var long: List[u8] = List.new()
+    for i in 0..5000 { long.push(120) }
+    let tiny = ratelimit.new(1, time.seconds(1), 1)
+    say("long key", tiny.allow_at(long, 0))
+    say("long key again", tiny.allow_at(long, 0))
+    print(tiny.tracked())
+
+    print("-- memory is bounded")
+    let small = ratelimit.new(1, time.seconds(1), 2).with_max_keys(100)
+    var admitted = 0
+    for i in 0..10000 {
+        if small.allow_at(bytes.from_i64(i as i64), 0).allowed { admitted += 1 }
+    }
+    // 99 clients of their own, then the rest share one bucket of 2
+    print(admitted)
+    print(small.tracked())
+    say("a known client has its own bucket left", small.allow_at(bytes.from_i64(5), ms(100)))
+    say("a known client is out of it now", small.allow_at(bytes.from_i64(5), ms(100)))
+    say("a newcomer shares the exhausted bucket", small.allow_at(lit("newcomer"), ms(100)))
+    // quiet clients are forgotten (one sweep a second at most), then newcomers get their own
+    say("later, after a sweep", small.allow_at(lit("newcomer"), ms(5000)))
+    print(small.tracked())
+    print(small.tracked() <= 100)
+
+    print("-- concurrently, exactly the burst gets through")
+    let cl = ratelimit.new(1, time.seconds(1), 50)
+    let mut ts: List[Task[i64]] = List.new()
+    for w in 0..8 {
+        let l = cl
+        ts.push(spawn(|| -> i64 {
+            var n: i64 = 0
+            for i in 0..500 { if l.allow_at(lit("same"), 0).allowed { n += 1 } }
+            n
+        }))
+    }
+    var total: i64 = 0
+    for t in ts { total += t.join() }
+    print(total)
+
+    print("-- the middleware")
+    let hits = ratelimit.new(100, time.seconds(1), 2).except(|q: http.Request| -> bool { bytes.eq(q.path, lit("/health")) })
+    let echo = |q: http.Request| -> http.Response { http.text(200, "ok") }
+    let app = ratelimit.middleware(hits, echo)
+    let c = testing.client(app).from_peer("203.0.113.9:4000")
+    for i in 0..4 {
+        let r = c.get("/")
+        var l = bytes.from_i64(r.status as i64)
+        match r.header("retry-after") {
+            Some(v) => {
+                bytes.append(inout l, lit(" retry-after="))
+                bytes.append(inout l, v)
+            }
+            None => {}
+        }
+        io.outln(l)
+    }
+    print(c.get("/health").status)
+    // another address has its own allowance
+    print(testing.client(app).from_peer("203.0.113.10:4000").get("/").status)
+    // the same address from another port does not
+    print(testing.client(app).from_peer("203.0.113.9:4001").get("/").status)
+    io.outln(ratelimit.refuse(ratelimit.Decision(false, 1)).header("retry-after").unwrap())
+    io.outln(ratelimit.refuse(ratelimit.Decision(false, 1000000000)).header("retry-after").unwrap())
+    io.outln(ratelimit.refuse(ratelimit.Decision(false, 1000000001)).header("retry-after").unwrap())
+    io.outln(ratelimit.refuse(ratelimit.Decision(false, 61500000000)).header("retry-after").unwrap())
+    print(ratelimit.refuse(ratelimit.Decision(false, 5)).status)
+    // keyed by something else: an API key header
+    let by_key = ratelimit.new(100, time.seconds(1), 1).by(|q: http.Request| -> List[u8] { q.header("x-api-key").unwrap_or(lit("-")) })
+    let kapp = ratelimit.middleware(by_key, echo)
+    let k1 = testing.client(kapp).from_peer("203.0.113.9:4000").with_header("X-Api-Key", "k1")
+    let k2 = testing.client(kapp).from_peer("203.0.113.9:4000").with_header("X-Api-Key", "k2")
+    print(k1.get("/").status)
+    print(k2.get("/").status)
+    print(k1.get("/").status)
+
+    print("-- spoofed forwarding headers do not buy a bucket")
+    let strict = ratelimit.new(100, time.seconds(1), 5)
+    let trust = proxy.trust_none().allow("10.0.0.0/8").unwrap()
+    let behind = proxy.middleware(trust, ratelimit.middleware(strict, echo))
+    // a client reaching the service directly, a different forged address on every request
+    var passed = 0
+    for i in 0..50 {
+        let sp = testing.client(behind).from_peer("203.0.113.9:4000").with_header("X-Forwarded-For", "198.51.100.7")
+        let sp2 = testing.client(behind).from_peer("203.0.113.9:4000").with_header("Forwarded", "for=192.0.2.1")
+        if sp.get("/").status == 200 { passed += 1 }
+        if sp2.get("/").status == 200 { passed += 1 }
+    }
+    print(passed)
+    // through the trusted proxy, a client's own forged left side doesn't help either ...
+    let strict2 = ratelimit.new(100, time.seconds(1), 5)
+    let behind2 = proxy.middleware(trust, ratelimit.middleware(strict2, echo))
+    var passed2 = 0
+    for i in 0..50 {
+        let forged = bytes.concat(lit("6.6.6."), bytes.from_i64(i as i64))
+        var q = http.request("GET", lit("/"))
+        q.peer = lit("10.1.2.3:4000")
+        q.headers.push(http.Header(lit("X-Forwarded-For"), bytes.concat(forged, lit(", 198.51.100.7"))))
+        if behind2(q).status == 200 { passed2 += 1 }
+    }
+    print(passed2)
+    // ... while two real clients behind it have a bucket each
+    let strict3 = ratelimit.new(100, time.seconds(1), 5)
+    let behind3 = proxy.middleware(trust, ratelimit.middleware(strict3, echo))
+    var each = 0
+    for who in ["198.51.100.7", "198.51.100.8"] {
+        for i in 0..20 {
+            var q = http.request("GET", lit("/"))
+            q.peer = lit("10.1.2.3:4000")
+            q.headers.push(http.Header(lit("X-Forwarded-For"), lit(who)))
+            if behind3(q).status == 200 { each += 1 }
+        }
+    }
+    print(each)
+    // without the proxy layer every client of the proxy is the proxy
+    let flat = ratelimit.middleware(ratelimit.new(100, time.seconds(1), 5), echo)
+    var shared = 0
+    for who in ["198.51.100.7", "198.51.100.8"] {
+        for i in 0..20 {
+            var q = http.request("GET", lit("/"))
+            q.peer = lit("10.1.2.3:4000")
+            q.headers.push(http.Header(lit("X-Forwarded-For"), lit(who)))
+            if flat(q).status == 200 { shared += 1 }
+        }
+    }
+    print(shared)
+    // the same IPv6 host spelled differently is one bucket
+    let v6 = ratelimit.middleware(ratelimit.new(100, time.seconds(1), 2), echo)
+    var v6ok = 0
+    for p in ["[2001:db8:0:1:0:0:0:1]:1", "[2001:db8:0:1:0:0:0:2]:2", "[2001:db8:0:1:ffff:0:0:3]:3", "[2001:db8:0:1:0:0:0:4]:4"] {
+        if testing.client(v6).from_peer(p).get("/").status == 200 { v6ok += 1 }
+    }
+    print(v6ok)
+}

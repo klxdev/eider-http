@@ -2,7 +2,7 @@
 
 HTTP/1.1 for [Eider](https://github.com/klxdev/eider-lang): a strict incremental parser, a
 server with deadlines, back-pressure and graceful shutdown, a blocking client, a router,
-middleware (request ids, access logs, errors as problem+json, body limits and timeouts per
+middleware (request ids, access logs, errors as problem+json, traps as 500s, rate limiting, forwarded client addresses, body limits and timeouts per
 route, CORS, bearer and Basic authentication), Prometheus metrics, and the profiler's
 labels and debugging endpoints.
 
@@ -31,6 +31,8 @@ fn main() uses io, net, clock, threads {
 | `http/client` | `connect`, `Conn.request`, `fetch`, `get`, `post` |
 | `http/router` | method and path patterns with parameters, 404 and 405 |
 | `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `recover`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` |
+| `http/proxy` | the client address behind trusted proxies (`X-Forwarded-For`, `Forwarded`): an allow-list of proxy ranges, nothing trusted by default |
+| `http/ratelimit` | rate limiting per client address (GCRA), 429 with `Retry-After`, bounded memory |
 | `http/metrics` | counters, an in-flight gauge and a latency histogram (Prometheus text), optionally per route |
 | `http/sse` | server-sent events |
 | `http/ws` | WebSockets (RFC 6455) with limits, a codec and a test client |

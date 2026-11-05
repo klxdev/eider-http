@@ -1,0 +1,73 @@
+-- the algorithm: 10 a second, bursts of 3
+t=0 #1 allowed
+t=0 #2 allowed
+t=0 #3 allowed
+t=0 #4 limited, retry in 100 ms
+t=0 #5 (a refusal costs nothing) limited, retry in 100 ms
+t=0 other client allowed
+t=50 limited, retry in 50 ms
+t=100 allowed
+t=100 again limited, retry in 100 ms
+t=200 allowed
+t=200 again limited, retry in 100 ms
+t=10s #1 allowed
+t=10s #2 allowed
+t=10s #3 allowed
+t=10s #4 limited, retry in 100 ms
+100
+t=back allowed
+t=back limited, retry in 3900 ms
+t=back limited, retry in 3900 ms
+t=back limited, retry in 3900 ms
+burst 1 #1 allowed
+burst 1 #2 limited, retry in 1000 ms
+burst 1 after 1s allowed
+degenerate #1 allowed
+degenerate #2 limited, retry in 0 ms
+110
+9
+-- keys
+1.2.3.4
+1.2.3.4
+1.2.3.4
+[2001:db8:1:2:0:0:0:0]
+[2001:db8:1:2:0:0:0:0]
+[2001:db8:1:3:0:0:0:0]
+unix:/run/x.sock
+
+long key allowed
+long key again limited, retry in 1000 ms
+1
+-- memory is bounded
+101
+100
+a known client has its own bucket left allowed
+a known client is out of it now limited, retry in 900 ms
+a newcomer shares the exhausted bucket limited, retry in 900 ms
+later, after a sweep allowed
+1
+true
+-- concurrently, exactly the burst gets through
+50
+-- the middleware
+200
+200
+429 retry-after=1
+429 retry-after=1
+200
+200
+429
+1
+1
+2
+62
+429
+200
+200
+429
+-- spoofed forwarding headers do not buy a bucket
+5
+5
+10
+5
+2

@@ -1,0 +1,505 @@
+//! http/proxy: the client's address behind a reverse proxy, from `X-Forwarded-For` or `Forwarded`
+//! (RFC 7239), trusted only from proxies the service names.
+//!
+//!     let trust = proxy.trust_none().allow("10.0.0.0/8").unwrap()      // the load balancers
+//!     let app = proxy.middleware(trust, router.handler(r))
+//!
+//! Behind a proxy `Request.peer` is the proxy. These headers are written by whoever sends the
+//! request, so they mean something only when the connection comes from a proxy that sets
+//! (appends to) them: **nothing is trusted by default** (`trust_none()` leaves `peer` alone and
+//! ignores both headers). The rules:
+//!
+//! - The connection's address must be inside a CIDR range that was allowed (`allow`); otherwise
+//!   the headers are ignored whatever they say (a client can't spoof its address by sending them).
+//! - One header is read, the one the operator says the proxy sets (`X-Forwarded-For` by default,
+//!   `.use_forwarded()` for `Forwarded`), never the other: a client that sends the unused one
+//!   through a proxy that doesn't strip it gets nothing. Several header lines are read as one
+//!   list, in order.
+//! - The list is read **from the right**: each element is the address the proxy before it
+//!   connected from; elements that are allowed proxies are skipped; the first one that is not is
+//!   the client. Elements further left are never looked at (a client's own `X-Forwarded-For:
+//!   1.2.3.4` is to the left of what the proxy appended). If every element is an allowed proxy the
+//!   leftmost is the client.
+//! - Parsing is strict and bounded: the header text over `max_len` bytes (2 KiB), a list over
+//!   `max_hops` (16) elements, an element that is not an IP address (`unknown`, `_hidden`, a name,
+//!   a zone id, an octal-looking `010.0.0.1`, a port over 65535, an unterminated quote) that the walk
+//!   has to read, makes the header ignored as a whole: `peer` stays the proxy's address.
+//! - Addresses are canonical: IPv4-mapped IPv6 is the IPv4 address, IPv6 is written as net.text
+//!   writes it, so the same host has one spelling (rate limiting keys on it).
+//!
+//! The result replaces `Request.peer` (as "ip:port", the port from the header or 0) and the
+//! proxy's own address goes to the request's context as `proxy_peer`. A unix-socket peer is
+//! trusted only after `allow_unix()`. `0.0.0.0/0` and `::/0` are refused: trusting every address
+//! is the same as trusting the client.
+
+import core.sys
+import std.bytes
+import std.net
+import http
+
+/// An address range: `ip` is 4 or 16 bytes, the first `bits` bits of which count.
+pub type Cidr = { ip: List[u8], bits: usize }
+
+/// Which header the proxies set.
+pub type Source = | XForwardedFor | Forwarded
+
+/// The proxies to believe and how much of their header to read.
+pub type Trust = { nets: List[Cidr], unix: bool, source: Source, max_len: usize, max_hops: usize }
+
+/// Trusts nothing: `middleware` leaves requests alone.
+pub fn trust_none() -> Trust { Trust(List.new(), false, XForwardedFor, 2048, 16) }
+
+fn digit(c: u8) -> bool { c >= 48 && c <= 57 }
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 && c <= 57 { return (c - 48) as i32 }
+    if c >= 97 && c <= 102 { return (c - 97) as i32 + 10 }
+    if c >= 65 && c <= 70 { return (c - 65) as i32 + 10 }
+    -1
+}
+
+/// A decimal number of 1 to `maxd` digits without a leading zero (unless it is 0), at most `max`.
+fn dec(s: List[u8], maxd: usize, max: i64) -> Option[i64] {
+    if s.len() == 0 || s.len() > maxd { return None }
+    if s.len() > 1 && s[0] == 48 { return None }
+    let mut v: i64 = 0
+    for c in s {
+        if !digit(c) { return None }
+        v = v * 10 + (c - 48) as i64
+    }
+    if v > max { return None }
+    Some(v)
+}
+
+fn v4(s: List[u8]) -> Option[List[u8]] {
+    let parts = bytes.split(s, 46)
+    if parts.len() != 4 { return None }
+    let mut out: List[u8] = List.new()
+    for p in parts {
+        match dec(p, 3, 255) {
+            Some(v) => { out.push(v as u8) }
+            None => { return None }
+        }
+    }
+    Some(out)
+}
+
+/// Colon-separated groups (the last may be a dotted IPv4) as bytes; the empty text is no groups.
+fn groups(s: List[u8], last_may_be_v4: bool) -> Option[List[u8]] {
+    let mut out: List[u8] = List.new()
+    if s.len() == 0 { return Some(out) }
+    let parts = bytes.split(s, 58)
+    let mut i: usize = 0
+    for p in parts {
+        i += 1
+        if p.len() == 0 { return None }
+        if bytes.find_byte(p, 46, 0).is_some() {
+            if !(last_may_be_v4 && i == parts.len()) { return None }
+            match v4(p) {
+                Some(a) => { bytes.append(inout out, a) }
+                None => { return None }
+            }
+        } else {
+            if p.len() > 4 { return None }
+            let mut v: i32 = 0
+            for c in p {
+                let h = hexval(c)
+                if h < 0 { return None }
+                v = v * 16 + h
+            }
+            out.push((v / 256) as u8)
+            out.push((v % 256) as u8)
+        }
+    }
+    Some(out)
+}
+
+/// An IP address literal as 4 bytes (IPv4, and IPv4-mapped IPv6) or 16 bytes (IPv6): dotted
+/// decimal without leading zeros, or IPv6 text (`::` once, an IPv4 tail allowed). No zone ids,
+/// brackets, ports or spaces.
+pub fn parse_ip(s: List[u8]) -> Option[List[u8]] {
+    if s.len() == 0 || s.len() > 45 { return None }
+    if bytes.find_byte(s, 58, 0).is_none() { return v4(s) }
+    // IPv6
+    let mut head: List[u8] = List.new()
+    let mut tail: List[u8] = List.new()
+    match bytes.find(s, sys.lit("::"), 0) {
+        Some(at) => {
+            let rest = bytes.slice(s, at + 2, s.len())
+            if bytes.find(rest, sys.lit("::"), 0).is_some() { return None }
+            // ":::" is not "::" followed by a colon
+            if rest.len() > 0 && rest[0] == 58 { return None }
+            match groups(bytes.slice(s, 0, at), false) {
+                Some(g) => { head = g }
+                None => { return None }
+            }
+            match groups(rest, true) {
+                Some(g) => { tail = g }
+                None => { return None }
+            }
+            if head.len() + tail.len() > 14 { return None }
+            let mut out = head
+            let mut z = 16 - out.len() - tail.len()
+            while z > 0 {
+                out.push(0)
+                z -= 1
+            }
+            bytes.append(inout out, tail)
+            return Some(mapped(out))
+        }
+        None => {
+            match groups(s, true) {
+                Some(g) => {
+                    if g.len() != 16 { return None }
+                    return Some(mapped(g))
+                }
+                None => { return None }
+            }
+        }
+    }
+    None
+}
+
+/// An IPv4-mapped IPv6 address (::ffff:a.b.c.d) as the 4-byte IPv4 address.
+fn mapped(ip: List[u8]) -> List[u8] {
+    if ip.len() != 16 { return ip }
+    for i in 0..10 {
+        if ip[i as usize] != 0 { return ip }
+    }
+    if ip[10] == 255 && ip[11] == 255 { return bytes.slice(ip, 12, 16) }
+    ip
+}
+
+/// "10.0.0.0/8", "fd00::/8", or one host ("192.168.1.5", "::1"). A range of every address
+/// (/0) is refused.
+pub fn parse_cidr(s: str) -> Result[Cidr, String] {
+    let t = sys.lit(s)
+    let mut addr = t.copy()
+    let mut bits: Option[i64] = None
+    match bytes.find_byte(t, 47, 0) {
+        Some(at) => {
+            addr = bytes.slice(t, 0, at)
+            match dec(bytes.slice(t, at + 1, t.len()), 3, 128) {
+                Some(b) => { bits = Some(b) }
+                None => { return Err(String.from("proxy: bad prefix length in a CIDR range")) }
+            }
+        }
+        None => {}
+    }
+    let ip = match parse_ip(addr) {
+        Some(ip) => ip
+        None => { return Err(String.from("proxy: not an IP address in a CIDR range")) }
+    }
+    let max = ip.len() * 8
+    // a range written in IPv6 form for an IPv4-mapped address counts bits from the v6 start
+    let n = match bits {
+        Some(b) => {
+            if b as usize > max { return Err(String.from("proxy: prefix length too long for the address")) }
+            b as usize
+        }
+        None => max
+    }
+    if n == 0 { return Err(String.from("proxy: a /0 range would trust every address")) }
+    Ok(Cidr(ip, n))
+}
+
+/// Whether `ip` (4 or 16 bytes) is inside `c`.
+pub fn contains(c: Cidr, ip: List[u8]) -> bool {
+    if ip.len() != c.ip.len() { return false }
+    let mut left = c.bits.copy()
+    let mut i: usize = 0
+    while left > 0 {
+        if left >= 8 {
+            if ip[i] != c.ip[i] { return false }
+            left -= 8
+        } else {
+            let mask = (255 - ((1 << (8 - left)) - 1)) as u8
+            if (ip[i] & mask) != (c.ip[i] & mask) { return false }
+            left = 0
+        }
+        i += 1
+    }
+    true
+}
+
+impl Trust {
+    /// Also trusts the proxies in `cidr`. Err for a malformed range or one of every address.
+    fn allow(self, cidr: str) -> Result[Trust, String] {
+        let c = parse_cidr(cidr)?
+        let mut t = self.copy()
+        t.nets.push(c)
+        Ok(t)
+    }
+
+    /// Also trusts a peer on a unix socket (a proxy on this host).
+    fn allow_unix(self) -> Trust {
+        let mut t = self.copy()
+        t.unix = true
+        t
+    }
+
+    /// Reads `Forwarded` (RFC 7239) instead of `X-Forwarded-For`.
+    fn use_forwarded(self) -> Trust {
+        let mut t = self.copy()
+        t.source = Forwarded
+        t
+    }
+
+    /// Reads at most `n` bytes of header and `hops` list elements (the defaults are 2048 and 16).
+    fn with_limits(self, n: usize, hops: usize) -> Trust {
+        let mut t = self.copy()
+        t.max_len = n
+        t.max_hops = hops
+        t
+    }
+
+    /// Whether a connection from `ip` is a trusted proxy.
+    fn trusts(self, ip: List[u8]) -> bool {
+        for c in self.nets {
+            if contains(c, ip) { return true }
+        }
+        false
+    }
+}
+
+/// An address and port as text, as `Request.peer` holds it.
+pub fn addr_text(ip: List[u8], port: i32) -> List[u8] {
+    if ip.len() == 4 { return net.text(net.ipv4(ip[0], ip[1], ip[2], ip[3], port)) }
+    net.text(net.ipv6(ip, port))
+}
+
+/// An address without a port: "1.2.3.4", "[2001:db8:0:0:0:0:0:1]" (net.text's spelling).
+pub fn ip_text(ip: List[u8]) -> List[u8] {
+    let t = addr_text(ip, 0)
+    match bytes.rfind_byte(t, 58) {
+        Some(i) => bytes.slice(t, 0, i)
+        None => t
+    }
+}
+
+/// An address with an optional port: "1.2.3.4", "1.2.3.4:80", "::1", "[::1]", "[::1]:80".
+/// None for anything else.
+pub fn parse_node(s: List[u8]) -> Option[(List[u8], i32)] {
+    if s.len() == 0 || s.len() > 64 { return None }
+    if s[0] == 91 {
+        let close = match bytes.find_byte(s, 93, 0) {
+            Some(i) => i
+            None => { return None }
+        }
+        let ip = match parse_ip(bytes.slice(s, 1, close)) {
+            Some(ip) => ip
+            None => { return None }
+        }
+        if close + 1 == s.len() { return Some((ip, 0)) }
+        if s[close + 1] != 58 { return None }
+        return match dec(bytes.slice(s, close + 2, s.len()), 5, 65535) {
+            Some(p) => Some((ip, p as i32))
+            None => None
+        }
+    }
+    let mut colons: usize = 0
+    for c in s {
+        if c == 58 { colons += 1 }
+    }
+    if colons >= 2 {
+        return match parse_ip(s) {
+            Some(ip) => Some((ip, 0))
+            None => None
+        }
+    }
+    if colons == 1 {
+        let at = bytes.find_byte(s, 58, 0).unwrap()
+        let ip = match v4(bytes.slice(s, 0, at)) {
+            Some(ip) => ip
+            None => { return None }
+        }
+        return match dec(bytes.slice(s, at + 1, s.len()), 5, 65535) {
+            Some(p) => Some((ip, p as i32))
+            None => None
+        }
+    }
+    match v4(s) {
+        Some(ip) => Some((ip, 0))
+        None => None
+    }
+}
+
+/// The IP of a `Request.peer` ("1.2.3.4:5", "[::1]:5") as bytes; None for a unix peer or text
+/// that is not an address.
+pub fn peer_ip(peer: List[u8]) -> Option[List[u8]] {
+    match parse_node(peer) {
+        Some((ip, port)) => Some(ip)
+        None => None
+    }
+}
+
+/// All the header lines called `name` as one comma-separated value, in order; None when there
+/// is none or the whole is longer than `max`.
+fn joined(hs: List[http.Header], name: str, max: usize) -> Option[List[u8]] {
+    let want = sys.lit(name)
+    let mut out: List[u8] = List.new()
+    let mut any = false
+    for h in hs {
+        if http.eq_ci(h.name, want) {
+            if any { out.push(44) }
+            any = true
+            if out.len() + h.value.len() > max { return None }
+            bytes.append(inout out, h.value)
+        }
+    }
+    if !any { return None }
+    Some(out)
+}
+
+/// The elements of a `Forwarded` value (`for=...;proto=...`, comma separated), quotes
+/// respected: None on an unterminated quote.
+fn split_quoted(v: List[u8], sep: u8) -> Option[List[List[u8]]] {
+    let mut out: List[List[u8]] = List.new()
+    let mut cur: List[u8] = List.new()
+    let mut quoted = false
+    let mut esc = false
+    for c in v {
+        if quoted {
+            cur.push(c)
+            if esc { esc = false } else if c == 92 { esc = true } else if c == 34 { quoted = false }
+        } else if c == 34 {
+            quoted = true
+            cur.push(c)
+        } else if c == sep {
+            out.push(cur)
+            cur = List.new()
+        } else {
+            cur.push(c)
+        }
+    }
+    if quoted { return None }
+    out.push(cur)
+    Some(out)
+}
+
+/// The `for` value of one `Forwarded` element: unquoted, None when absent, repeated or malformed.
+fn for_value(elem: List[u8]) -> Option[List[u8]] {
+    let pairs = match split_quoted(elem, 59) {
+        Some(p) => p
+        None => { return None }
+    }
+    let mut found: Option[List[u8]] = None
+    for p in pairs {
+        let t = http.trim_ows(p)
+        if t.len() == 0 { continue }
+        let eq = match bytes.find_byte(t, 61, 0) {
+            Some(i) => i
+            None => { return None }
+        }
+        let name = http.lower(bytes.slice(t, 0, eq))
+        if !bytes.eq(name, sys.lit("for")) { continue }
+        if found.is_some() { return None }
+        let v = bytes.slice(t, eq + 1, t.len())
+        if v.len() >= 2 && v[0] == 34 {
+            if v[v.len() - 1] != 34 { return None }
+            let inner = bytes.slice(v, 1, v.len() - 1)
+            let mut un: List[u8] = List.new()
+            let mut esc = false
+            for c in inner {
+                if esc {
+                    un.push(c)
+                    esc = false
+                } else if c == 92 {
+                    esc = true
+                } else if c == 34 {
+                    return None
+                } else {
+                    un.push(c)
+                }
+            }
+            if esc { return None }
+            found = Some(un)
+        } else {
+            found = Some(v)
+        }
+    }
+    found
+}
+
+/// The client behind the proxies of `peer` according to the header, or None to leave `peer`
+/// alone (untrusted peer, no header, or a header that is too long, too many hops or malformed
+/// where the walk reads it). See the module comment for the walk.
+pub fn client_of(trust: Trust, hs: List[http.Header], peer: List[u8]) -> Option[(List[u8], i32)] {
+    if trust.nets.len() == 0 && !trust.unix { return None }
+    let from = match parse_node(peer) {
+        Some((ip, port)) => ip
+        None => {
+            // not an address: a unix-socket peer
+            if !(trust.unix && bytes.starts_with(peer, sys.lit("unix:"))) { return None }
+            List.new()
+        }
+    }
+    if from.len() > 0 && !trust.trusts(from) { return None }
+    let hdr = match trust.source {
+        XForwardedFor => "x-forwarded-for"
+        Forwarded => "forwarded"
+    }
+    let v = match joined(hs, hdr, trust.max_len) {
+        Some(v) => v
+        None => { return None }
+    }
+    let mut elems: List[List[u8]] = List.new()
+    match trust.source {
+        XForwardedFor => {
+            for e in bytes.split(v, 44) {
+                let t = http.trim_ows(e)
+                if t.len() > 0 { elems.push(t) }
+            }
+        }
+        Forwarded => {
+            let parts = match split_quoted(v, 44) {
+                Some(p) => p
+                None => { return None }
+            }
+            for e in parts {
+                let t = http.trim_ows(e)
+                if t.len() > 0 { elems.push(t) }
+            }
+        }
+    }
+    if elems.len() == 0 || elems.len() > trust.max_hops { return None }
+    let mut i = elems.len()
+    while i > 0 {
+        i -= 1
+        let text = match trust.source {
+            XForwardedFor => elems[i]
+            Forwarded => {
+                match for_value(elems[i]) {
+                    Some(x) => x
+                    None => { return None }
+                }
+            }
+        }
+        match parse_node(text) {
+            Some((ip, port)) => {
+                if i == 0 || !trust.trusts(ip) { return Some((ip, port)) }
+            }
+            None => { return None }
+        }
+    }
+    None
+}
+
+/// `req` with the client behind `trust`'s proxies as its `peer` (see the module comment); the
+/// connection's own address goes to the context as `proxy_peer`. Other requests are unchanged.
+pub fn resolve(trust: Trust, req: http.Request) -> http.Request {
+    match client_of(trust, req.headers, req.peer) {
+        Some((ip, port)) => {
+            let mut r = req.copy()
+            r.set_ctx("proxy_peer", req.peer)
+            r.peer = addr_text(ip, port)
+            r
+        }
+        None => req
+    }
+}
+
+/// Gives the handler the real client address (see the module comment).
+pub fn middleware(trust: Trust, h: http.Handler) -> http.Handler {
+    |req: http.Request| -> http.Response { h(resolve(trust, req)) }
+}

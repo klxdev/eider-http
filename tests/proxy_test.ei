@@ -1,0 +1,236 @@
+// http/proxy: the client address behind trusted proxies, and what must NOT change it. Pure
+// (no sockets): requests are built by hand, so the adversarial headers can hold bytes the
+// parser would never pass on.
+
+import core.sys
+import std.bytes
+import std.io
+import http
+import http.proxy
+import http.testing
+import http.router
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn req(peer: str, hs: List[(str, str)]) -> http.Request {
+    let mut r = http.request("GET", lit("/"))
+    r.peer = lit(peer)
+    for (n, v) in hs { r.set_header(n, lit(v)) }
+    r
+}
+
+fn xff(peer: str, v: str) -> http.Request {
+    let mut hs: List[(str, str)] = List.new()
+    hs.push(("X-Forwarded-For", v))
+    req(peer, hs)
+}
+
+fn fwd(peer: str, v: str) -> http.Request {
+    let mut hs: List[(str, str)] = List.new()
+    hs.push(("Forwarded", v))
+    req(peer, hs)
+}
+
+fn trusted() -> proxy.Trust { proxy.trust_none().allow("10.0.0.0/8").unwrap().allow("fd00::/8").unwrap() }
+
+fn show(label: str, t: proxy.Trust, r: http.Request) uses io {
+    let o = proxy.resolve(t, r)
+    var l = lit(label)
+    bytes.append(inout l, lit(" => "))
+    bytes.append(inout l, o.peer)
+    match o.get_ctx("proxy_peer") {
+        Some(p) => {
+            bytes.append(inout l, lit("  (via "))
+            bytes.append(inout l, p)
+            l.push(41)
+        }
+        None => {}
+    }
+    io.outln(l)
+}
+
+fn main() uses io {
+    let t = trusted()
+
+    print("-- nothing is trusted by default")
+    let none = proxy.trust_none()
+    show("default, spoofed xff", none, xff("203.0.113.9:5000", "198.51.100.7"))
+    show("default, spoofed forwarded", none, fwd("10.1.2.3:5000", "for=198.51.100.7"))
+    show("default, from a would-be proxy", none, xff("10.1.2.3:5000", "198.51.100.7"))
+    show("untrusted peer, spoofed xff", t, xff("203.0.113.9:5000", "198.51.100.7"))
+    show("untrusted peer, spoofed list", t, xff("203.0.113.9:5000", "10.0.0.1, 198.51.100.7"))
+    show("peer just outside the range", t, xff("11.0.0.1:5000", "198.51.100.7"))
+    show("peer that is not an address", t, xff("garbage", "198.51.100.7"))
+    show("empty peer", t, xff("", "198.51.100.7"))
+
+    print("-- from a trusted proxy")
+    show("one client", t, xff("10.1.2.3:5000", "198.51.100.7"))
+    show("with port", t, xff("10.1.2.3:5000", "198.51.100.7:4711"))
+    show("v6 client", t, xff("10.1.2.3:5000", "2001:DB8::1"))
+    show("v6 client, brackets and port", t, xff("10.1.2.3:5000", "[2001:db8::1]:4711"))
+    show("v6 trusted proxy", t, xff("[fd00:0:0:0:0:0:0:5]:5000", "198.51.100.7"))
+    show("no header", t, req("10.1.2.3:5000", List.new()))
+
+    print("-- the walk is from the right")
+    show("client forged the left", t, xff("10.1.2.3:5000", "6.6.6.6, 198.51.100.7"))
+    show("forged left, trusted hop", t, xff("10.1.2.3:5000", "6.6.6.6, 198.51.100.7, 10.9.9.9"))
+    show("two real hops", t, xff("10.1.2.3:5000", "198.51.100.7, 203.0.113.50, 10.9.9.9"))
+    show("forged trusted address left", t, xff("10.1.2.3:5000", "10.0.0.1, 198.51.100.7"))
+    show("every hop trusted: leftmost", t, xff("10.1.2.3:5000", "10.7.7.7, 10.8.8.8"))
+    show("garbage left of the client", t, xff("10.1.2.3:5000", "unknown, <script>, 198.51.100.7"))
+    show("empty elements", t, xff("10.1.2.3:5000", ",, 198.51.100.7 ,,"))
+    show("whitespace", t, xff("10.1.2.3:5000", "  \t198.51.100.7 \t"))
+    var two: List[(str, str)] = List.new()
+    two.push(("x-forwarded-for", "6.6.6.6"))
+    two.push(("X-FORWARDED-FOR", "198.51.100.7"))
+    show("two header lines are one list", t, req("10.1.2.3:5000", two))
+
+    print("-- malformed where the walk reads it: ignored as a whole")
+    for bad in ["unknown", "_hidden", "198.51.100.7, unknown", "010.0.0.1", "1.2.3", "1.2.3.4.5", "256.1.1.1", "1.2.3.4:99999", "1.2.3.4:", "1.2.3.4:-1", "1.2.3.4:0x50", "1.2.3.4 5", "fe80::1%eth0", ":::1", "1::2::3", "[::1", "[::1]x", "[::1]:", "1:2:3:4:5:6:7:8:9", "g::1", "12345::1", "1.2.3.4/8", "localhost", "0x7f.1", "1.2.3.4, 2.3.4.5:70000", "\"1.2.3.4\"", "[1.2.3.4]:80x"] {
+        let o = proxy.resolve(t, xff("10.1.2.3:5000", bad))
+        var l = lit(bad)
+        l.push(32)
+        bytes.append(inout l, o.peer)
+        io.outln(l)
+    }
+
+    print("-- header injection and control bytes")
+    for bad in ["1.2.3.4\r\nX-Evil: 1", "1.2.3.4\nSet-Cookie: a=b", "198.51.100.7, 1.2.3.4\r", "\t\u{7}1.2.3.4", "1.2.3.4\u{7f}", "1.2.3.4\u{e9}"] {
+        let o = proxy.resolve(t, xff("10.1.2.3:5000", bad))
+        print(o.peer.len() > 0 && o.peer[0] == 49 && bytes.find_byte(o.peer, 13, 0).is_none() && bytes.find_byte(o.peer, 10, 0).is_none())
+        io.outln(o.peer)
+    }
+    var nul = lit("1.2.3.4")
+    nul.push(0)
+    let mut rn = req("10.1.2.3:5000", List.new())
+    rn.headers.push(http.Header(lit("X-Forwarded-For"), nul))
+    io.outln(proxy.resolve(t, rn).peer)
+    // whatever the header says, the peer is rebuilt from the parsed address bytes
+    let inj = proxy.resolve(t, xff("10.1.2.3:5000", "198.51.100.7:80"))
+    io.outln(inj.peer)
+
+    print("-- sizes")
+    // 16 elements are read, 17 are not
+    var hops16 = lit("")
+    for i in 0..14 { bytes.append(inout hops16, lit("10.0.0.1, ")) }
+    bytes.append(inout hops16, lit("10.0.0.2"))
+    let mut r16 = req("10.1.2.3:5000", List.new())
+    r16.headers.push(http.Header(lit("X-Forwarded-For"), bytes.concat(lit("198.51.100.7, "), hops16)))
+    io.outln(proxy.resolve(t, r16).peer)
+    let mut r17 = req("10.1.2.3:5000", List.new())
+    r17.headers.push(http.Header(lit("X-Forwarded-For"), bytes.concat(lit("198.51.100.7, 10.0.0.9, "), hops16)))
+    io.outln(proxy.resolve(t, r17).peer)
+    // a header over max_len (2048) is ignored, one of exactly that length is read
+    var pad: List[u8] = List.new()
+    for i in 0..2000 { pad.push(32) }
+    let mut rbig = req("10.1.2.3:5000", List.new())
+    rbig.headers.push(http.Header(lit("X-Forwarded-For"), bytes.concat(lit("198.51.100.7"), pad)))
+    io.outln(proxy.resolve(t, rbig).peer)
+    var pad2: List[u8] = List.new()
+    for i in 0..2100 { pad2.push(32) }
+    let mut rbig2 = req("10.1.2.3:5000", List.new())
+    rbig2.headers.push(http.Header(lit("X-Forwarded-For"), bytes.concat(lit("198.51.100.7"), pad2)))
+    io.outln(proxy.resolve(t, rbig2).peer)
+    // a megabyte of commas, of addresses, of header lines
+    var mega: List[u8] = List.new()
+    for i in 0..1000000 { mega.push(44) }
+    let mut rm = req("10.1.2.3:5000", List.new())
+    rm.headers.push(http.Header(lit("X-Forwarded-For"), mega))
+    io.outln(proxy.resolve(t, rm).peer)
+    let mut rl = req("10.1.2.3:5000", List.new())
+    for i in 0..5000 { rl.headers.push(http.Header(lit("X-Forwarded-For"), lit("1.1.1.1"))) }
+    io.outln(proxy.resolve(t, rl).peer)
+    var long_ip: List[u8] = List.new()
+    for i in 0..200 { long_ip.push(49) }
+    let mut rli = req("10.1.2.3:5000", List.new())
+    rli.headers.push(http.Header(lit("X-Forwarded-For"), long_ip))
+    io.outln(proxy.resolve(t, rli).peer)
+    let tiny = t.with_limits(10, 2)
+    show("tiny limits, short", tiny, xff("10.1.2.3:5000", "1.2.3.4"))
+    show("tiny limits, too long", tiny, xff("10.1.2.3:5000", "1.2.3.4, 5.6.7.8"))
+    show("tiny limits, 3 hops", tiny.with_limits(100, 2), xff("10.1.2.3:5000", "1.1.1.1, 2.2.2.2, 3.3.3.3"))
+
+    print("-- canonical spelling")
+    show("v4-mapped", t, xff("10.1.2.3:5000", "::ffff:198.51.100.7"))
+    show("v4-mapped hex", t, xff("10.1.2.3:5000", "::FFFF:c633:6407"))
+    show("v4-mapped trusted proxy is skipped", t, xff("10.1.2.3:5000", "198.51.100.7, ::ffff:10.2.2.2"))
+    show("v6 spellings", t, xff("10.1.2.3:5000", "2001:0db8:0000:0000:0000:0000:0000:0001"))
+    show("v6 loopback", t, xff("10.1.2.3:5000", "::1"))
+    show("v6 unspecified", t, xff("10.1.2.3:5000", "::"))
+    show("v6 with v4 tail", t, xff("10.1.2.3:5000", "64:ff9b::198.51.100.7"))
+    show("mapped peer is a v4 proxy", t, xff("[0:0:0:0:0:ffff:a01:203]:5000", "198.51.100.7"))
+
+    print("-- Forwarded (RFC 7239)")
+    let tf = t.use_forwarded()
+    show("simple", tf, fwd("10.1.2.3:5000", "for=198.51.100.7"))
+    show("params", tf, fwd("10.1.2.3:5000", "for=198.51.100.7;proto=https;by=10.0.0.1"))
+    show("case and spaces", tf, fwd("10.1.2.3:5000", "By=10.0.0.1 ; FOR=198.51.100.7"))
+    show("quoted v6 with port", tf, fwd("10.1.2.3:5000", "for=\"[2001:db8::1]:4711\""))
+    show("chain", tf, fwd("10.1.2.3:5000", "for=6.6.6.6, for=198.51.100.7, for=10.9.9.9"))
+    show("quoted comma stays in the element", tf, fwd("10.1.2.3:5000", "for=\"1.2.3.4,5.6.7.8\", for=198.51.100.7"))
+    show("quoted semicolon", tf, fwd("10.1.2.3:5000", "by=\"a;for=6.6.6.6\";for=198.51.100.7"))
+    show("obfuscated identifier", tf, fwd("10.1.2.3:5000", "for=_hidden"))
+    show("unknown", tf, fwd("10.1.2.3:5000", "for=unknown"))
+    show("no for", tf, fwd("10.1.2.3:5000", "by=10.0.0.1"))
+    show("two for", tf, fwd("10.1.2.3:5000", "for=1.1.1.1;for=2.2.2.2"))
+    show("unterminated quote", tf, fwd("10.1.2.3:5000", "for=\"198.51.100.7"))
+    show("quote closing too early", tf, fwd("10.1.2.3:5000", "for=\"198.51.100.7\"x"))
+    show("pair without equals", tf, fwd("10.1.2.3:5000", "for"))
+    show("empty value", tf, fwd("10.1.2.3:5000", "for="))
+    show("escaped quote", tf, fwd("10.1.2.3:5000", "for=\"1.2.3.4\\\"\""))
+    show("untrusted peer", tf, fwd("203.0.113.9:5000", "for=198.51.100.7"))
+    // the header the operator did not choose is never read
+    show("forwarded mode ignores xff", tf, xff("10.1.2.3:5000", "198.51.100.7"))
+    show("xff mode ignores forwarded", t, fwd("10.1.2.3:5000", "for=198.51.100.7"))
+    var both: List[(str, str)] = List.new()
+    both.push(("Forwarded", "for=6.6.6.6"))
+    both.push(("X-Forwarded-For", "198.51.100.7"))
+    show("both sent, xff mode", t, req("10.1.2.3:5000", both))
+    show("both sent, forwarded mode", tf, req("10.1.2.3:5000", both))
+
+    print("-- unix peers")
+    show("unix, not allowed", t, xff("unix:/run/proxy.sock", "198.51.100.7"))
+    show("unix, allowed", t.allow_unix(), xff("unix:/run/proxy.sock", "198.51.100.7"))
+    show("unix-looking text that is not unix", t.allow_unix(), xff("unixish", "198.51.100.7"))
+    show("unix only", proxy.trust_none().allow_unix(), xff("unix:/run/proxy.sock", "198.51.100.7"))
+    show("unix only, a tcp peer", proxy.trust_none().allow_unix(), xff("10.1.2.3:5", "198.51.100.7"))
+
+    print("-- ranges")
+    for c in ["10.0.0.0/8", "10.0.0.1", "192.168.0.0/16", "172.16.0.0/12", "fd00::/8", "::1", "::1/128", "2001:db8::/32", "10.0.0.0/33", "fd00::/129", "0.0.0.0/0", "::/0", "10.0.0.0/", "10.0.0.0/-1", "10.0.0.0/08", "10.0.0.0/8/8", "10.0.0.0/8 ", "nonsense", "", "/8", "10.0.0/8", "::ffff:10.0.0.0/104"] {
+        match proxy.parse_cidr(c) {
+            Ok(r) => {
+                var l = lit(c)
+                bytes.append(inout l, lit(" ok bits="))
+                bytes.append(inout l, bytes.from_u64(r.bits as u64))
+                io.outln(l)
+            }
+            Err(e) => {
+                var l = lit(c)
+                bytes.append(inout l, lit(" refused: "))
+                bytes.append(inout l, e.bytes())
+                io.outln(l)
+            }
+        }
+    }
+    let r12 = proxy.parse_cidr("172.16.0.0/12").unwrap()
+    for a in ["172.15.255.255", "172.16.0.0", "172.31.255.255", "172.32.0.0"] {
+        io.outln(bytes.concat(lit(a), if proxy.contains(r12, proxy.parse_ip(lit(a)).unwrap()) { lit(" in") } else { lit(" out") }))
+    }
+    let r20 = proxy.parse_cidr("192.0.2.64/26").unwrap()
+    for a in ["192.0.2.63", "192.0.2.64", "192.0.2.127", "192.0.2.128"] {
+        io.outln(bytes.concat(lit(a), if proxy.contains(r20, proxy.parse_ip(lit(a)).unwrap()) { lit(" in") } else { lit(" out") }))
+    }
+    // a v4 range never matches a v6 address and the other way round
+    let v6 = proxy.parse_cidr("::/1").unwrap()
+    print(proxy.contains(v6, proxy.parse_ip(lit("1.2.3.4")).unwrap()))
+
+    print("-- as middleware")
+    let echo = |q: http.Request| -> http.Response { http.respond(200, "text/plain", q.peer) }
+    let app = proxy.middleware(t, echo)
+    let c1 = testing.client(app).from_peer("10.1.2.3:5000").with_header("X-Forwarded-For", "198.51.100.7, 10.0.0.9")
+    io.outln(c1.get("/").body)
+    let c2 = testing.client(app).from_peer("203.0.113.9:5000").with_header("X-Forwarded-For", "198.51.100.7")
+    io.outln(c2.get("/").body)
+    let c3 = testing.client(proxy.middleware(proxy.trust_none(), echo)).from_peer("10.1.2.3:5000").with_header("X-Forwarded-For", "198.51.100.7")
+    io.outln(c3.get("/").body)
+}

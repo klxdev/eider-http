@@ -48,6 +48,8 @@ the step-by-step guide to both ("Building services").
 | `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `recover`, `chain` | none; `io, clock` for `access_log`, `timeout` and `recover`, `io` for `random_ids` |
 | `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format; `by_route` labels both with the route (or operation id) | `clock` for `wrap` |
 | `http/trace` | W3C Trace Context: `traceparent` in, a span per request to a sink (`log_sink`, `collect`), `inject` for outgoing calls | `io, clock` for `wrap` and `inject` |
+| `http/proxy` | the client address behind trusted proxies: `trust_none().allow("10.0.0.0/8")`, `.use_forwarded()`, `middleware(trust, h)`, strict IP and CIDR parsing | none |
+| `http/ratelimit` | GCRA rate limiting per client address (or any key), a bounded table, 429 + `Retry-After` | `clock` for `middleware` |
 | `http/sse` | server-sent events over a chunked response: `response(run)`, `Stream.event/data/comment/retry`, `format_event` | none |
 | `http/ws` | WebSockets (RFC 6455): `accept` (the handshake and the upgrade), `Conn.recv/send_text/send_binary/ping/close`, the frame codec, SHA-1, a test client (`dial`) | `clock` for `recv`, `dial` needs `net, io, clock` |
 | `http/sock` | sending before a deadline, lingering close | `net, io, clock` |
@@ -215,8 +217,9 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
 - **TLS: run behind a TLS-terminating proxy** (decision C3). The server speaks plain HTTP;
   bind it to loopback or a private interface and let the proxy (nginx, HAProxy, Envoy, a
   cloud load balancer) terminate TLS. TLS 1.3 written in Eider over the libcrypto backend is
-  roadmap P1.4. The server does not interpret `Forwarded` / `X-Forwarded-*`: a handler that
-  trusts them must know its proxy sets them.
+  roadmap P1.4. The server does not interpret `Forwarded` / `X-Forwarded-*` by itself:
+  `Request.peer` is the connection's address. `http/proxy` (below) replaces it with the client's
+  from those headers, only for connections from proxies the service lists.
 - **Request smuggling** (C42). The parser refuses, with 400: Content-Length together with
   Transfer-Encoding; two Content-Length fields (even equal), or one that isn't only digits;
   two Transfer-Encoding fields; Transfer-Encoding in HTTP/1.0; a final coding other than
@@ -230,6 +233,26 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   dropped. Header names must be tokens and values may not contain CR, LF, NUL or other
   controls; a response that breaks this is replaced by 500, a client request is refused
   with Err.
+- **Forwarded headers** (eider-http#3). *Nothing is trusted by default*: a service that does
+  nothing keeps the connection's address and ignores `X-Forwarded-For`, `Forwarded` and
+  every `X-Forwarded-*`. `proxy.middleware(trust, h)` believes a header only when the connection
+  comes from an address in a CIDR range given to `allow` (a `/0` range is refused; unix-socket
+  proxies need `allow_unix()`), reads only the one header the operator names (`X-Forwarded-For`, or
+  `Forwarded` after `use_forwarded()`: a client's copy of the other one, passed through by a
+  proxy that doesn't strip it, is not read), and walks the list from the right, skipping trusted
+  proxies, so what a client put at the left of the list never counts. The input is bounded
+  (2 KiB of header text in all lines, 16 elements) and strict: an element the walk reads that is
+  not an IP address literal (names, `unknown`, `_hidden`, octal-looking `010.0.0.1`, zone ids, a
+  port over 65535, an unterminated quote, control bytes) makes the whole header ignored, and
+  the peer stays the proxy. The new `peer` is rebuilt from the parsed address bytes, so nothing the
+  header held can reach logs or other headers, and addresses are canonical (IPv4-mapped IPv6 is
+  IPv4). The proxy must set or append to the header; one that passes a client's header
+  through unchanged makes the *rightmost* element, the proxy's own appended one, the client.
+- **Rate limiting** (eider-http#3). `ratelimit.middleware` limits per client address (IPv6 per
+  /64) with the generic cell rate algorithm; put `proxy.middleware` outside it behind a proxy, or
+  all clients share the proxy's bucket. The table is bounded (`max_keys`, 10,000; beyond that new
+  clients share one bucket, so spraying addresses throttles the sprayer) and a key is cut at 128
+  bytes. 429 carries `Retry-After`. `except` skips health checks.
 - **Resource limits.** Every wait has a deadline; heads, bodies and batches have limits;
   threads and queued connections are bounded (503 beyond). A slow client can hold a worker
   for at most `read_timeout` (plus 1 s of lingering close).
@@ -244,7 +267,7 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   (`middleware.timeout` bounds the answer, not the thread). A trap in a handler (panic,
   overflow, out-of-bounds) is contained at the handler call: 500, logged, connection closed; the
   leak of what it was building is bounded by one request (see "Traps become 500s"), but a stack
-  overflow still ends the process. There is no rate limiting yet.
+  overflow still ends the process.
 
 ## Testing
 
@@ -266,6 +289,19 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   while a streamed request body is half read and in a streamed response's producer do not leak the
   connection, 40 traps mixed with good requests leave the counts right (`Stats.traps`), and
   `recover` under `metrics.wrap` shows the 500 and an in-flight gauge of 0.
+- `proxy_test`: the default trusts nothing; spoofed `X-Forwarded-For`/`Forwarded` from untrusted
+  peers (also just outside a range, or from garbage peers); the walk from the right (forged left
+  sides, trusted hops, every hop trusted); about 30 malformed addresses (octal, short, long, ports,
+  zone ids, brackets, names, `unknown`, `_hidden`); header injection (CR, LF, NUL, DEL, controls,
+  non-ASCII) with the new peer shown to be rebuilt from bytes; sizes (16 and 17 elements, 2 KiB and
+  over, a megabyte of commas, 5000 header lines, a 200-digit address); canonical spellings
+  (IPv4-mapped IPv6 as IPv4, one spelling per IPv6 host); `Forwarded` quoting; the header the
+  operator did not choose is never read; unix peers; CIDR parsing and range boundaries.
+- `ratelimit_test`: the algorithm on a fixed clock (burst, refill, refusals cost nothing, a clock
+  going backwards, a long quiet time), the keys (ports, mapped IPv6, /64, long keys), a table
+  that stays at `max_keys` under 10,000 distinct keys, 8 threads on one key getting exactly the
+  burst, the middleware (429, `Retry-After`, `except`, `by`), and the pair with `proxy`: forged
+  headers from a direct client or forged left sides behind a proxy buy no extra bucket.
 - `server_test`: a server on 127.0.0.1 on an ephemeral port: routing, keep-alive,
   pipelining, chunked bodies, `Expect: 100-continue`, refused smuggling, the read and idle
   deadlines, `max_requests`, back-pressure (503 and keep-alive given up), graceful shutdown
@@ -307,9 +343,9 @@ Recorded rather than worked around; none blocks the design.
 ## Next steps toward OpenAPI
 
 1. **Middleware and observability:** done in a first form (above). Panics turned into 500: done
-   (`recover`, and the server's last resort). Still to do: a `Forwarded`-aware peer address behind
-   a configured proxy; rate limiting;
-   tracing (W3C `traceparent`, carried like the request id).
+   (`recover`, and the server's last resort). A `Forwarded`-aware peer address behind
+   configured proxies (`http/proxy`) and rate limiting (`http/ratelimit`): done. Tracing (W3C
+   `traceparent`, carried like the request id): done (below).
 2. **Streaming:** done: request bodies as readers, chunked responses from a producer, per-route
    limits before the body (see "Streaming bodies"); not done: streaming *client* bodies.
 3. **Typed services (P1.1, eider-rpc):** with JSON derive (P0.10) and `dyn Trait` (P0.7), a service is a
