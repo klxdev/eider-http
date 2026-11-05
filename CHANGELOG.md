@@ -3,6 +3,10 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+- `service.ei` and the tests use `let mut` instead of the removed `var` (eider-lang#2, Eider 0.7.5; `let mut` is valid in 0.7 too). No change in behaviour.
+
 ## 0.7.2
 
 - **`Content-Encoding` with eider-compression** (eider-lang#37; for Eider 0.7.3). `[deps.compression]` (eider-compression 0.7.0, granted `io` and `clock`: its `streams` module names them, see docs/services.md N20) and a new module `http/compress`:

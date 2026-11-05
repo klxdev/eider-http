@@ -43,7 +43,7 @@ fn main() uses io, net, clock, threads, fs {
         http.text(200, "unreachable")
     })
     r.get("/metrics", mm.handler())
-    var cfg = server.config()
+    let mut cfg = server.config()
     cfg.log = None
     let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
     srv.expose(mm)
@@ -53,7 +53,7 @@ fn main() uses io, net, clock, threads, fs {
     let th = spawn(|| -> server.Stats { srv.serve(app, t).unwrap() })
     let a = srv.addr()
     let dl = time.after_ms(20000)
-    var codes: List[i32] = List.new()
+    let mut codes: List[i32] = List.new()
     for path in ["/hello", "/hello", "/boom", "/nope", "/hello", "/hello"] {
         match client.get(a, path, dl) {
             Ok(x) => { codes.push(x.status) }
@@ -81,12 +81,12 @@ fn main() uses io, net, clock, threads, fs {
     print(srv.stats().requests)
 
     print("-- profiling endpoints (a build without --profile)")
-    var opts = profiling.options()
-    var off = router.new()
+    let mut opts = profiling.options()
+    let mut off = router.new()
     profiling.mount(inout off, opts)
     print(testing.client(router.handler(off)).get("/debug/heap").status)
     opts.enabled = true
-    var on = router.new()
+    let mut on = router.new()
     profiling.mount(inout on, opts)
     let c = testing.client(router.handler(on))
     print(c.get("/debug/heap").status)

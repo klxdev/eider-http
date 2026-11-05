@@ -35,7 +35,7 @@ fn trusted() -> proxy.Trust { proxy.trust_none().allow("10.0.0.0/8").unwrap().al
 
 fn show(label: str, t: proxy.Trust, r: http.Request) uses io {
     let o = proxy.resolve(t, r)
-    var l = lit(label)
+    let mut l = lit(label)
     bytes.append(inout l, lit(" => "))
     bytes.append(inout l, o.peer)
     match o.get_ctx("proxy_peer") {
@@ -80,7 +80,7 @@ fn main() uses io {
     show("garbage left of the client", t, xff("10.1.2.3:5000", "unknown, <script>, 198.51.100.7"))
     show("empty elements", t, xff("10.1.2.3:5000", ",, 198.51.100.7 ,,"))
     show("whitespace", t, xff("10.1.2.3:5000", "  \t198.51.100.7 \t"))
-    var two: List[(str, str)] = List.new()
+    let mut two: List[(str, str)] = List.new()
     two.push(("x-forwarded-for", "6.6.6.6"))
     two.push(("X-FORWARDED-FOR", "198.51.100.7"))
     show("two header lines are one list", t, req("10.1.2.3:5000", two))
@@ -88,7 +88,7 @@ fn main() uses io {
     print("-- malformed where the walk reads it: ignored as a whole")
     for bad in ["unknown", "_hidden", "198.51.100.7, unknown", "010.0.0.1", "1.2.3", "1.2.3.4.5", "256.1.1.1", "1.2.3.4:99999", "1.2.3.4:", "1.2.3.4:-1", "1.2.3.4:0x50", "1.2.3.4 5", "fe80::1%eth0", ":::1", "1::2::3", "[::1", "[::1]x", "[::1]:", "1:2:3:4:5:6:7:8:9", "g::1", "12345::1", "1.2.3.4/8", "localhost", "0x7f.1", "1.2.3.4, 2.3.4.5:70000", "\"1.2.3.4\"", "[1.2.3.4]:80x"] {
         let o = proxy.resolve(t, xff("10.1.2.3:5000", bad))
-        var l = lit(bad)
+        let mut l = lit(bad)
         l.push(32)
         bytes.append(inout l, o.peer)
         io.outln(l)
@@ -100,7 +100,7 @@ fn main() uses io {
         print(o.peer.len() > 0 && o.peer[0] == 49 && bytes.find_byte(o.peer, 13, 0).is_none() && bytes.find_byte(o.peer, 10, 0).is_none())
         io.outln(o.peer)
     }
-    var nul = lit("1.2.3.4")
+    let mut nul = lit("1.2.3.4")
     nul.push(0)
     let mut rn = req("10.1.2.3:5000", List.new())
     rn.headers.push(http.Header(lit("X-Forwarded-For"), nul))
@@ -111,7 +111,7 @@ fn main() uses io {
 
     print("-- sizes")
     // 16 elements are read, 17 are not
-    var hops16 = lit("")
+    let mut hops16 = lit("")
     for i in 0..14 { bytes.append(inout hops16, lit("10.0.0.1, ")) }
     bytes.append(inout hops16, lit("10.0.0.2"))
     let mut r16 = req("10.1.2.3:5000", List.new())
@@ -121,18 +121,18 @@ fn main() uses io {
     r17.headers.push(http.Header(lit("X-Forwarded-For"), bytes.concat(lit("198.51.100.7, 10.0.0.9, "), hops16)))
     io.outln(proxy.resolve(t, r17).peer)
     // a header over max_len (2048) is ignored, one of exactly that length is read
-    var pad: List[u8] = List.new()
+    let mut pad: List[u8] = List.new()
     for i in 0..2000 { pad.push(32) }
     let mut rbig = req("10.1.2.3:5000", List.new())
     rbig.headers.push(http.Header(lit("X-Forwarded-For"), bytes.concat(lit("198.51.100.7"), pad)))
     io.outln(proxy.resolve(t, rbig).peer)
-    var pad2: List[u8] = List.new()
+    let mut pad2: List[u8] = List.new()
     for i in 0..2100 { pad2.push(32) }
     let mut rbig2 = req("10.1.2.3:5000", List.new())
     rbig2.headers.push(http.Header(lit("X-Forwarded-For"), bytes.concat(lit("198.51.100.7"), pad2)))
     io.outln(proxy.resolve(t, rbig2).peer)
     // a megabyte of commas, of addresses, of header lines
-    var mega: List[u8] = List.new()
+    let mut mega: List[u8] = List.new()
     for i in 0..1000000 { mega.push(44) }
     let mut rm = req("10.1.2.3:5000", List.new())
     rm.headers.push(http.Header(lit("X-Forwarded-For"), mega))
@@ -140,7 +140,7 @@ fn main() uses io {
     let mut rl = req("10.1.2.3:5000", List.new())
     for i in 0..5000 { rl.headers.push(http.Header(lit("X-Forwarded-For"), lit("1.1.1.1"))) }
     io.outln(proxy.resolve(t, rl).peer)
-    var long_ip: List[u8] = List.new()
+    let mut long_ip: List[u8] = List.new()
     for i in 0..200 { long_ip.push(49) }
     let mut rli = req("10.1.2.3:5000", List.new())
     rli.headers.push(http.Header(lit("X-Forwarded-For"), long_ip))
@@ -182,7 +182,7 @@ fn main() uses io {
     // the header the operator did not choose is never read
     show("forwarded mode ignores xff", tf, xff("10.1.2.3:5000", "198.51.100.7"))
     show("xff mode ignores forwarded", t, fwd("10.1.2.3:5000", "for=198.51.100.7"))
-    var both: List[(str, str)] = List.new()
+    let mut both: List[(str, str)] = List.new()
     both.push(("Forwarded", "for=6.6.6.6"))
     both.push(("X-Forwarded-For", "198.51.100.7"))
     show("both sent, xff mode", t, req("10.1.2.3:5000", both))
@@ -199,13 +199,13 @@ fn main() uses io {
     for c in ["10.0.0.0/8", "10.0.0.1", "192.168.0.0/16", "172.16.0.0/12", "fd00::/8", "::1", "::1/128", "2001:db8::/32", "10.0.0.0/33", "fd00::/129", "0.0.0.0/0", "::/0", "10.0.0.0/", "10.0.0.0/-1", "10.0.0.0/08", "10.0.0.0/8/8", "10.0.0.0/8 ", "nonsense", "", "/8", "10.0.0/8", "::ffff:10.0.0.0/104"] {
         match proxy.parse_cidr(c) {
             Ok(r) => {
-                var l = lit(c)
+                let mut l = lit(c)
                 bytes.append(inout l, lit(" ok bits="))
                 bytes.append(inout l, bytes.from_u64(r.bits as u64))
                 io.outln(l)
             }
             Err(e) => {
-                var l = lit(c)
+                let mut l = lit(c)
                 bytes.append(inout l, lit(" refused: "))
                 bytes.append(inout l, e.bytes())
                 io.outln(l)

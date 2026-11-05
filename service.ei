@@ -162,7 +162,7 @@ pub fn handler(r: router.Router, o: Options) -> http.Handler uses io, clock, fs 
     o.health.mount(inout rt)
     profiling.label_routes(inout rt)
     profiling.mount(inout rt, o.profiling)
-    var inner = router.handler(rt)
+    let mut inner = router.handler(rt)
     match o.decode {
         Some(n) => {
             let cap = if n == 0 { o.server.limits.max_body } else { n }
@@ -170,7 +170,7 @@ pub fn handler(r: router.Router, o: Options) -> http.Handler uses io, clock, fs 
         }
         None => {}
     }
-    var h = middleware.recover(o.logger, inner)
+    let mut h = middleware.recover(o.logger, inner)
     match o.limit {
         Some(l) => {
             let lim = l.except(exempt)

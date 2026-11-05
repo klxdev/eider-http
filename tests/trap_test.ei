@@ -190,8 +190,8 @@ fn main() uses io, net, clock, threads {
     fd.close(se).unwrap()
 
     print("-- the same many times, mixed with good requests")
-    var bad_ok = 0
-    var good_ok = 0
+    let mut bad_ok = 0
+    let mut good_ok = 0
     for i in 0..40 {
         match client.get(a, "/panic", dl) {
             Ok(r) => { if r.status == 500 { bad_ok += 1 } }
@@ -224,7 +224,7 @@ fn main() uses io, net, clock, threads {
     print(has(text, lit("http_requests_in_flight 0")))
 
     print("-- the log record")
-    var weird = lit("/a\"b\nc")
+    let mut weird = lit("/a\"b\nc")
     weird.push(255)
     let f = middleware.trap_fields(lit("GET"), weird, String.from("boom (x.ei:1)"))
     print(utf8.lossy(logging.format(0, logging.Error, String.from("handler trapped"), logging.fields(), f)))

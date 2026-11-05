@@ -59,7 +59,7 @@ fn build() uses fs {
 }
 
 fn say(label: str, r: http.Response) uses io {
-    var l = lit(label)
+    let mut l = lit(label)
     bytes.append(inout l, lit(" => "))
     bytes.append(inout l, bytes.from_i64(r.status as i64))
     match r.header("content-type") {
@@ -91,7 +91,7 @@ fn say(label: str, r: http.Response) uses io {
 }
 
 fn inm(c: testing.Client, value: List[u8]) -> http.Response uses io {
-    var hs: List[http.Header] = List.new()
+    let mut hs: List[http.Header] = List.new()
     hs.push(http.Header(lit("If-None-Match"), value))
     c.send("GET", "/assets/plain.js", hs, List.new())
 }
@@ -101,7 +101,7 @@ fn leaked(r: http.Response) -> bool { bytes.find(r.body, lit("SECRET"), 0).is_so
 
 fn main() uses io, fs {
     build()
-    var r = router.new()
+    let mut r = router.new()
     static.mount(inout r, "/assets", "target/static-fixture/www", static.options()).unwrap()
     let c = testing.client(router.handler(r))
 
@@ -158,11 +158,11 @@ fn main() uses io, fs {
     say("index that is a link out of the root", c.get("/assets/empty/"))
 
     print("-- traversal: nothing outside the root is served")
-    var evil = 0
-    var served = 0
+    let mut evil = 0
+    let mut served = 0
     for p in ["/assets/sub/../plain.js", "/assets/sub/..%2fplain.js", "/assets/sub/%2e%2e/plain.js", "/assets/sub/%2e%2e%2fplain.js", "/assets/sub/%2E%2e%5Cplain.js", "/assets/sub//plain.js", "/assets/sub/./page.txt", "/assets/%2fplain.js", "/assets/../secret.txt", "/assets/..%2fsecret.txt", "/assets/..%2Fsecret.txt", "/assets/%2e%2e/secret.txt", "/assets/%2E%2E/secret.txt", "/assets/.%2e/secret.txt", "/assets/%2e./secret.txt", "/assets/..%5csecret.txt", "/assets/..\\secret.txt", "/assets/sub/../../secret.txt", "/assets/sub/%2e%2e/%2e%2e/secret.txt", "/assets/sub/..%2f..%2fsecret.txt", "/assets/....//secret.txt", "/assets/..;/secret.txt", "/assets/%2e%2e%2fsecret.txt", "/assets/%2e%2e%2f%2e%2e%2fsecret.txt", "/assets/%c0%ae%c0%ae/secret.txt", "/assets/%c0%ae%c0%ae%c0%afsecret.txt", "/assets/%e0%80%ae%e0%80%ae/secret.txt", "/assets/%252e%252e/secret.txt", "/assets/%252e%252e%252fsecret.txt", "/assets//secret.txt", "/assets//etc/passwd", "/assets/%2fetc%2fpasswd", "/assets/%2Fetc/passwd", "/assets/%2f%2fetc%2fpasswd", "/assets/..", "/assets/../", "/assets/sub/..", "/assets/.", "/assets/./plain.js", "/assets/sub/./page.txt", "/assets/sub//page.txt", "/assets/sub/page.txt/..", "/assets/plain.js%00.png", "/assets/plain.js%00", "/assets/%00", "/assets/%00/../../secret.txt", "/assets/sub/page.txt%0a", "/assets/sub%0d%0aX-Evil:1/", "/assets/plain.js%20", "/assets/%ff", "/assets/%80", "/assets/%c3", "/assets/%01x", "/assets/%1fx", "/assets/%7f", "/assets/x%5cy", "/assets/C:%5cwindows%5cwin.ini", "/assets/link-out.txt", "/assets/sneak.txt", "/assets/linkdir/secret.txt", "/assets/linkdir", "/assets/linkdir/", "/assets/sub/up/secret.txt", "/assets/abs.txt", "/assets/dangling", "/assets/.env", "/assets/.git/config", "/assets/.git/", "/assets/.git", "/assets/sub/.hidden", "/assets/.well-known/security.txt", "/assets/%2eenv", "/assets/%2Eenv", "/assets/.ENV", "/assets/sub/%2ehidden", "/assets/empty/.keep"] {
         let resp = c.get(p)
-        var l = lit(p)
+        let mut l = lit(p)
         bytes.append(inout l, lit(" => "))
         bytes.append(inout l, bytes.from_i64(resp.status as i64))
         io.outln(l)
@@ -172,25 +172,25 @@ fn main() uses io, fs {
     print(evil)
     print(served)
     // a client may also send what the testing client's validator refuses; the router and the handler see paths directly
-    var direct = router.new()
+    let mut direct = router.new()
     static.mount(inout direct, "", "target/static-fixture/www", static.options()).unwrap()
     let dh = router.handler(direct)
-    var nul = lit("/")
+    let mut nul = lit("/")
     nul.push(0)
-    var d1 = http.request("GET", lit("/"))
+    let mut d1 = http.request("GET", lit("/"))
     d1.path = bytes.concat(lit("/sub/page.txt"), nul)
     print(dh(d1).status)
-    var d2 = http.request("GET", lit("/"))
+    let mut d2 = http.request("GET", lit("/"))
     d2.path = lit("//etc/passwd")
     print(dh(d2).status)
-    var d3 = http.request("GET", lit("/"))
+    let mut d3 = http.request("GET", lit("/"))
     d3.path = lit("//evil.example/")
     print(dh(d3).status)
-    var d4 = http.request("GET", lit("/"))
+    let mut d4 = http.request("GET", lit("/"))
     d4.path = lit("/sub")
     d4.query = lit("x=1")
     say("redirect keeps the path", dh(d4))
-    var d5 = http.request("GET", lit("/"))
+    let mut d5 = http.request("GET", lit("/"))
     d5.path = lit("//sub")
     print(dh(d5).status)
 
@@ -198,13 +198,13 @@ fn main() uses io, fs {
     for p in ["", "a", "a/b", "a/", "/a", "a//b", "a/./b", "a/../b", "..", ".", "a/.b", ".b", "a\\b", "a b", "\u{e9}", "a/b/", "//", "/", ".well-known/x", "a/.well-known/x"] {
         match static.clean_path(lit(p), false) {
             Some(s) => {
-                var l = lit(p)
+                let mut l = lit(p)
                 bytes.append(inout l, lit(" ok "))
                 bytes.append(inout l, bytes.from_u64(s.len() as u64))
                 io.outln(l)
             }
             None => {
-                var l = lit(p)
+                let mut l = lit(p)
                 bytes.append(inout l, lit(" refused"))
                 io.outln(l)
             }
@@ -213,23 +213,23 @@ fn main() uses io, fs {
     print(static.clean_path(lit(".well-known/x"), true).is_some())
     print(static.clean_path(lit("a/.well-known/x"), true).is_some())
     print(static.clean_path(lit(".well-known/.x"), true).is_some())
-    var ctl = lit("a")
+    let mut ctl = lit("a")
     ctl.push(0)
     print(static.clean_path(ctl, false).is_some())
-    var bad8 = lit("a")
+    let mut bad8 = lit("a")
     bad8.push(255)
     print(static.clean_path(bad8, false).is_some())
-    var longp: List[u8] = List.new()
+    let mut longp: List[u8] = List.new()
     for i in 0..5000 { longp.push(97) }
     print(static.clean_path(longp, false).is_some())
 
     print("-- options")
-    var wk = router.new()
+    let mut wk = router.new()
     static.mount(inout wk, "", "target/static-fixture/www", static.options().with_well_known()).unwrap()
     let wc = testing.client(router.handler(wk))
     say("well-known allowed", wc.get("/.well-known/security.txt"))
     say("other dot files still not", wc.get("/.env"))
-    var spa = router.new()
+    let mut spa = router.new()
     static.mount(inout spa, "", "target/static-fixture/www", static.options().with_spa("index.html")).unwrap()
     let sc = testing.client(router.handler(spa))
     say("spa route", sc.get("/users/42"))
@@ -237,12 +237,12 @@ fn main() uses io, fs {
     say("missing asset is still 404", sc.get("/missing.js"))
     say("traversal is still 404", sc.get("/..%2fsecret.txt"))
     say("dot file is not the fallback's business", sc.get("/.env"))
-    var cfg_small = router.new()
+    let mut cfg_small = router.new()
     static.mount(inout cfg_small, "/s", "target/static-fixture/www", static.options().with_max_size(11)).unwrap()
     let smc = testing.client(router.handler(cfg_small))
     say("over max_size", smc.get("/s/noext"))
     say("under max_size", smc.get("/s/big.txt"))
-    var cache = router.new()
+    let mut cache = router.new()
     static.mount(inout cache, "/c", "target/static-fixture/www", static.options().with_cache("max-age=1", "max-age=2")).unwrap()
     let cc = testing.client(router.handler(cache))
     say("custom cache, hashed", cc.get("/c/app.3f2a9c1b.js"))
@@ -265,7 +265,7 @@ fn main() uses io, fs {
     }
     // a root reached through a symlink works, and the sibling check uses the canonical root
     fs.symlink(lit("www"), lit("target/static-fixture/rootlink")).unwrap()
-    var viaroot = router.new()
+    let mut viaroot = router.new()
     static.mount(inout viaroot, "", "target/static-fixture/rootlink", static.options()).unwrap()
     let vc = testing.client(router.handler(viaroot))
     say("root through a link", vc.get("/sub/page.txt"))

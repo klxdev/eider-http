@@ -26,14 +26,14 @@ fn has(s: List[u8], n: str) -> bool { bytes.find(s, lit(n), 0).is_some() }
 fn quiet() -> service.Options { service.options().without_logs() }
 
 fn app() -> router.Router {
-    var r = router.new()
+    let mut r = router.new()
     r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello") })
     r.get("/who", |q: http.Request| -> http.Response { http.respond(200, "text/plain", q.peer) })
     r
 }
 
 fn show(r: http.Response) uses io {
-    var l = bytes.from_i64(r.status as i64)
+    let mut l = bytes.from_i64(r.status as i64)
     l.push(32)
     bytes.append(inout l, r.header("content-type").unwrap_or(lit("-")))
     l.push(32)
@@ -47,13 +47,13 @@ fn main() uses io, net, clock, threads, fs {
         panic("check trapped")
         Ok(())
     })
-    var r = router.new()
+    let mut r = router.new()
     hl.mount(inout r)
     let c = testing.client(router.handler(r))
     show(c.get("/healthz"))
     show(c.get("/readyz"))
     let ok = health.new().check("db", || -> Result[(), String] { Ok(()) })
-    var r2 = router.new()
+    let mut r2 = router.new()
     ok.mount(inout r2)
     let c2 = testing.client(router.handler(r2))
     show(c2.get("/readyz"))
@@ -96,7 +96,7 @@ fn main() uses io, net, clock, threads, fs {
     print("-- rate limiting, probes exempt")
     let lo = quiet().with_limit(ratelimit.new(1, time.seconds(1), 3))
     let lc = testing.client(service.handler(app(), lo)).from_peer("203.0.113.9:1000")
-    var codes: List[i32] = List.new()
+    let mut codes: List[i32] = List.new()
     for i in 0..6 { codes.push(lc.get("/hello").status) }
     print(codes)
     print(lc.get("/healthz").status)
@@ -107,7 +107,7 @@ fn main() uses io, net, clock, threads, fs {
     print(limited.header("retry-after").is_some())
     let off = quiet().no_rate_limit()
     let oc = testing.client(service.handler(app(), off)).from_peer("203.0.113.9:1000")
-    var n429 = 0
+    let mut n429 = 0
     for i in 0..3000 { if oc.get("/hello").status == 429 { n429 += 1 } }
     print(n429)
 
@@ -125,7 +125,7 @@ fn main() uses io, net, clock, threads, fs {
     print(client.get(a, "/hello", dl).unwrap().status)
     stop.cancel()
     // readiness turns 503 first ...
-    var flipped = false
+    let mut flipped = false
     while !flipped && !dl.expired() {
         if client.get(a, "/readyz", dl).unwrap().status == 503 { flipped = true }
     }

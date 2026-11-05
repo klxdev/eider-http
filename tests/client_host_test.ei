@@ -17,9 +17,9 @@ import http.router
 fn lit(s: str) -> List[u8] { sys.lit(s) }
 
 fn main() uses io, net, clock, threads {
-    var r = router.new()
+    let mut r = router.new()
     r.get("/host", |q: http.Request| -> http.Response { http.respond(200, "text/plain", q.header("host").unwrap_or(lit("-"))) })
-    var cfg = server.config()
+    let mut cfg = server.config()
     cfg.log = None
     let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
     let h = router.handler(r)
@@ -31,13 +31,13 @@ fn main() uses io, net, clock, threads {
     let shown = |label: str, x: Result[http.Response, String]| -> () {
         match x {
             Ok(resp) => {
-                var l = lit(label)
+                let mut l = lit(label)
                 bytes.append(inout l, lit(": "))
                 bytes.append(inout l, bytes.from_i64(resp.status as i64))
                 io.outln(l)
             }
             Err(e) => {
-                var l = lit(label)
+                let mut l = lit(label)
                 bytes.append(inout l, lit(": error: "))
                 bytes.append(inout l, e.bytes())
                 io.outln(l)
@@ -55,7 +55,7 @@ fn main() uses io, net, clock, threads {
     // the server listens on 127.0.0.1 only: "localhost" may list ::1 first and it is refused
     let addrs = client.resolve(lit("localhost"), port, dl).unwrap()
     print(addrs.len() >= 1)
-    var has4 = false
+    let mut has4 = false
     for x in addrs { if x.family == net.IPV4 { has4 = true } }
     print(has4)
     let lit6 = client.resolve(lit("::1"), 80, dl).unwrap()
@@ -68,8 +68,8 @@ fn main() uses io, net, clock, threads {
     shown("post", post)
 
     print("-- a connection made from a name reconnects")
-    var c = client.connect_host("localhost", port, dl).unwrap()
-    var one = http.request("GET", lit("/host"))
+    let mut c = client.connect_host("localhost", port, dl).unwrap()
+    let mut one = http.request("GET", lit("/host"))
     one.keep_alive = false
     shown("first", c.request(one, dl))
     print(c.open)
@@ -77,22 +77,22 @@ fn main() uses io, net, clock, threads {
     print(c.open)
     shown("third, same connection", c.request(http.request("GET", lit("/host")), dl))
     c.close()
-    var cl = client.connect_host("127.0.0.1", port, dl).unwrap()
+    let mut cl = client.connect_host("127.0.0.1", port, dl).unwrap()
     shown("literal conn", cl.request(http.request("GET", lit("/host")), dl))
     cl.close()
 
     print("-- refused before anything is resolved or sent")
-    var long: List[u8] = List.new()
+    let mut long: List[u8] = List.new()
     for i in 0..300 { long.push(97) }
     for (label, name) in [("empty", ""), ("space", "a b"), ("slash", "a/b"), ("at", "user@host"), ("hash", "a#b"), ("query", "a?b"), ("brackets", "[::1]"), ("zone", "fe80::1%lo"), ("tab", "a\tb"), ("crlf", "evil.example\r\nX-Injected: 1"), ("lf", "a\nb"), ("non-ascii", "h\u{e9}llo"), ("backslash", "a\\b"), ("port in name", "localhost:80:80x"), ("percent", "a%41"), ("colon-space", ":: 1")] {
         match client.get_host(name, port, "/host", dl) {
             Ok(x) => {
-                var l = lit(label)
+                let mut l = lit(label)
                 bytes.append(inout l, lit(" accepted?"))
                 io.outln(l)
             }
             Err(e) => {
-                var l = lit(label)
+                let mut l = lit(label)
                 bytes.append(inout l, lit(": "))
                 bytes.append(inout l, e.bytes())
                 io.outln(l)

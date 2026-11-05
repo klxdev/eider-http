@@ -721,7 +721,7 @@ fn sockets_part() uses io, net, clock, threads {
 
 fn service_part() uses io, clock, fs {
     print("-- http/service")
-    var rt = router.new()
+    let mut rt = router.new()
     let doc = text_body(4000)
     rt.get("/doc", |q: http.Request| -> http.Response { http.respond(200, "text/html", doc) })
     rt.get("/img", |q: http.Request| -> http.Response { http.respond(200, "image/png", doc) })
@@ -785,7 +785,7 @@ fn static_part() uses io, fs, clock {
     put("target/compress-fixture/outside.js.gz", lit("TOP SECRET"))
     put("target/compress-fixture/www/leak.js", lit("console.log(1)"))
     fs.symlink(lit("../outside.js.gz"), lit("target/compress-fixture/www/leak.js.gz")).unwrap()
-    var rt = router.new()
+    let mut rt = router.new()
     static.mount(inout rt, "", "target/compress-fixture/www", static.options().with_precompressed()).unwrap()
     let c = testing.client(router.handler(rt))
     let g = c.with_header("Accept-Encoding", "gzip")
@@ -809,18 +809,18 @@ fn static_part() uses io, fs, clock {
     print(r304.status)
     print(field(r304, "vary"))
     // without the option nothing changes
-    var rt2 = router.new()
+    let mut rt2 = router.new()
     static.mount(inout rt2, "", "target/compress-fixture/www", static.options()).unwrap()
     let c2 = testing.client(router.handler(rt2)).with_header("Accept-Encoding", "gzip")
     show("option off", c2.get("/app.js"), js)
     // with the middleware on top, an uncompressed file is compressed on the fly, weak ETag
-    var rt3 = router.new()
+    let mut rt3 = router.new()
     static.mount(inout rt3, "", "target/compress-fixture/www", static.options()).unwrap()
     let dyn = testing.client(compress.responses(compress.options(), router.handler(rt3))).with_header("Accept-Encoding", "gzip")
     let rd = dyn.get("/app.js")
     show("on the fly", rd, js)
     // and a precompressed one is not compressed twice
-    var rt4 = router.new()
+    let mut rt4 = router.new()
     static.mount(inout rt4, "", "target/compress-fixture/www", static.options().with_precompressed()).unwrap()
     let both = testing.client(compress.responses(compress.options(), router.handler(rt4))).with_header("Accept-Encoding", "gzip")
     show("precompressed under the middleware", both.get("/app.js"), js)

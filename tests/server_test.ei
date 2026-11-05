@@ -286,13 +286,13 @@ fn main() uses io, net, clock, threads {
     // a task per connection: a thousand open at once, none of them waiting for a worker
     let tok5 = task.root()
     let (m5, th5) = start(server.config(), tok5)
-    var socks: List[i32] = List.new()
+    let mut socks: List[i32] = List.new()
     for i in 0..1000 {
         let s = raw(m5)
         net.send_all(s, wire("GET /hello HTTP/1.1\nHost: x\n\n")).unwrap()
         socks.push(s)
     }
-    var answered = 0
+    let mut answered = 0
     for s in socks {
         match fd.read_by(s, 65536, dl) {
             Ok(Some(b)) => {

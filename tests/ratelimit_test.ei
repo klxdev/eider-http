@@ -16,7 +16,7 @@ fn lit(s: str) -> List[u8] { sys.lit(s) }
 fn ms(n: i64) -> i64 { n * 1000000 }
 
 fn say(label: str, d: ratelimit.Decision) uses io {
-    var l = lit(label)
+    let mut l = lit(label)
     l.push(32)
     if d.allowed { bytes.append(inout l, lit("allowed")) } else {
         bytes.append(inout l, lit("limited, retry in "))
@@ -54,7 +54,7 @@ fn main() uses io, clock, threads {
     say("t=10s #3", lim.allow_at(a, ms(10000)))
     say("t=10s #4", lim.allow_at(a, ms(10000)))
     // the sustained rate: one request every 100 ms is always allowed
-    var steady = 0
+    let mut steady = 0
     for i in 0..100 {
         if lim.allow_at(lit("steady"), ms(20000 + (i as i64) * 100)).allowed { steady += 1 }
     }
@@ -84,7 +84,7 @@ fn main() uses io, clock, threads {
     io.outln(key_of("[2001:db8:1:3:0:0:0:1]:80"))
     io.outln(key_of("unix:/run/x.sock"))
     io.outln(key_of(""))
-    var long: List[u8] = List.new()
+    let mut long: List[u8] = List.new()
     for i in 0..5000 { long.push(120) }
     let tiny = ratelimit.new(1, time.seconds(1), 1)
     say("long key", tiny.allow_at(long, 0))
@@ -93,7 +93,7 @@ fn main() uses io, clock, threads {
 
     print("-- memory is bounded")
     let small = ratelimit.new(1, time.seconds(1), 2).with_max_keys(100)
-    var admitted = 0
+    let mut admitted = 0
     for i in 0..10000 {
         if small.allow_at(bytes.from_i64(i as i64), 0).allowed { admitted += 1 }
     }
@@ -114,12 +114,12 @@ fn main() uses io, clock, threads {
     for w in 0..8 {
         let l = cl
         ts.push(spawn(|| -> i64 {
-            var n: i64 = 0
+            let mut n: i64 = 0
             for i in 0..500 { if l.allow_at(lit("same"), 0).allowed { n += 1 } }
             n
         }))
     }
-    var total: i64 = 0
+    let mut total: i64 = 0
     for t in ts { total += t.join() }
     print(total)
 
@@ -130,7 +130,7 @@ fn main() uses io, clock, threads {
     let c = testing.client(app).from_peer("203.0.113.9:4000")
     for i in 0..4 {
         let r = c.get("/")
-        var l = bytes.from_i64(r.status as i64)
+        let mut l = bytes.from_i64(r.status as i64)
         match r.header("retry-after") {
             Some(v) => {
                 bytes.append(inout l, lit(" retry-after="))
@@ -164,7 +164,7 @@ fn main() uses io, clock, threads {
     let trust = proxy.trust_none().allow("10.0.0.0/8").unwrap()
     let behind = proxy.middleware(trust, ratelimit.middleware(strict, echo))
     // a client reaching the service directly, a different forged address on every request
-    var passed = 0
+    let mut passed = 0
     for i in 0..50 {
         let sp = testing.client(behind).from_peer("203.0.113.9:4000").with_header("X-Forwarded-For", "198.51.100.7")
         let sp2 = testing.client(behind).from_peer("203.0.113.9:4000").with_header("Forwarded", "for=192.0.2.1")
@@ -175,10 +175,10 @@ fn main() uses io, clock, threads {
     // through the trusted proxy, a client's own forged left side doesn't help either ...
     let strict2 = ratelimit.new(100, time.seconds(1), 5)
     let behind2 = proxy.middleware(trust, ratelimit.middleware(strict2, echo))
-    var passed2 = 0
+    let mut passed2 = 0
     for i in 0..50 {
         let forged = bytes.concat(lit("6.6.6."), bytes.from_i64(i as i64))
-        var q = http.request("GET", lit("/"))
+        let mut q = http.request("GET", lit("/"))
         q.peer = lit("10.1.2.3:4000")
         q.headers.push(http.Header(lit("X-Forwarded-For"), bytes.concat(forged, lit(", 198.51.100.7"))))
         if behind2(q).status == 200 { passed2 += 1 }
@@ -187,10 +187,10 @@ fn main() uses io, clock, threads {
     // ... while two real clients behind it have a bucket each
     let strict3 = ratelimit.new(100, time.seconds(1), 5)
     let behind3 = proxy.middleware(trust, ratelimit.middleware(strict3, echo))
-    var each = 0
+    let mut each = 0
     for who in ["198.51.100.7", "198.51.100.8"] {
         for i in 0..20 {
-            var q = http.request("GET", lit("/"))
+            let mut q = http.request("GET", lit("/"))
             q.peer = lit("10.1.2.3:4000")
             q.headers.push(http.Header(lit("X-Forwarded-For"), lit(who)))
             if behind3(q).status == 200 { each += 1 }
@@ -199,10 +199,10 @@ fn main() uses io, clock, threads {
     print(each)
     // without the proxy layer every client of the proxy is the proxy
     let flat = ratelimit.middleware(ratelimit.new(100, time.seconds(1), 5), echo)
-    var shared = 0
+    let mut shared = 0
     for who in ["198.51.100.7", "198.51.100.8"] {
         for i in 0..20 {
-            var q = http.request("GET", lit("/"))
+            let mut q = http.request("GET", lit("/"))
             q.peer = lit("10.1.2.3:4000")
             q.headers.push(http.Header(lit("X-Forwarded-For"), lit(who)))
             if flat(q).status == 200 { shared += 1 }
@@ -211,7 +211,7 @@ fn main() uses io, clock, threads {
     print(shared)
     // the same IPv6 host spelled differently is one bucket
     let v6 = ratelimit.middleware(ratelimit.new(100, time.seconds(1), 2), echo)
-    var v6ok = 0
+    let mut v6ok = 0
     for p in ["[2001:db8:0:1:0:0:0:1]:1", "[2001:db8:0:1:0:0:0:2]:2", "[2001:db8:0:1:ffff:0:0:3]:3", "[2001:db8:0:1:0:0:0:4]:4"] {
         if testing.client(v6).from_peer(p).get("/").status == 200 { v6ok += 1 }
     }

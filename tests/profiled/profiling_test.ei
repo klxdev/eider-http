@@ -15,10 +15,10 @@ fn lit(s: str) -> List[u8] { sys.lit(s) }
 
 fn main() uses io, fs, clock {
     print(profile.enabled())
-    var opts = profiling.options()
+    let mut opts = profiling.options()
     opts.enabled = true
     opts.max_seconds = 2
-    var r = router.new()
+    let mut r = router.new()
     r.get("/work/:n", |q: http.Request| -> http.Response { http.text(200, "worked") })
     profiling.label_routes(inout r)
     profiling.mount(inout r, opts)
@@ -41,10 +41,10 @@ fn main() uses io, fs, clock {
     let p = c.get("/debug/profile?seconds=1")
     print(p.status)
     print(bytes.starts_with(p.body, lit("{{\"eider_prof\":1")))
-    var remote = profiling.options()
+    let mut remote = profiling.options()
     remote.enabled = true
     remote.remote = true
-    var r2 = router.new()
+    let mut r2 = router.new()
     profiling.mount(inout r2, remote)
     print(testing.client(router.handler(r2)).from_peer("203.0.113.9:1").get("/debug/heap").status)
 }
