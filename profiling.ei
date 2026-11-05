@@ -32,6 +32,7 @@ import std.profile
 import std.time
 import http
 import http.router
+import http.proxy
 
 /// What `mount` adds. `enabled`: false adds nothing. `remote`: whether peers other than the
 /// local host (127.0.0.1, ::1, or a request that didn't come from a socket) may use them.
@@ -62,9 +63,22 @@ pub fn label_routes(inout r: router.Router) {
     r.wrap_routes(|m: List[u8], p: List[u8], h: http.Handler| -> http.Handler { route_labels(m, p, h) })
 }
 
-/// Whether `peer` ("127.0.0.1:50312", "[::1]:8080", "") is the local host.
+/// Whether `peer` ("127.0.0.1:50312", "[::1]:8080", "") is the local host: an IP literal in
+/// 127.0.0.0/8 or ::1 (IPv4-mapped included), or no address at all. Text that is not an IP
+/// address ("127.evil.example:80") is not local. Behind a proxy on this host `peer` is the proxy
+/// unless `proxy.middleware` put the client there: use it, or keep `remote` false and the
+/// endpoints behind `middleware.bearer`, or every visitor looks local.
 pub fn is_local(peer: List[u8]) -> bool {
-    peer.len() == 0 || bytes.starts_with(peer, sys.lit("127.")) || bytes.starts_with(peer, sys.lit("[::1]"))
+    if peer.len() == 0 { return true }
+    match proxy.peer_ip(peer) {
+        Some(ip) => {
+            if ip.len() == 4 { return ip[0] == 127 }
+            let mut zero = true
+            for i in 0..15 { if ip[i as usize] != 0 { zero = false } }
+            zero && ip[15] == 1
+        }
+        None => false
+    }
 }
 
 fn refusal(o: Options, req: http.Request) -> Option[http.Response] {

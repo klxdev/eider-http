@@ -31,7 +31,7 @@ type St = { counts: Map[Key, i64], hists: Map[List[u8], Hist], in_flight: i64 }
 
 /// Counters shared by copies (see the module comment). `bounds_us`: the histogram's upper
 /// bounds in microseconds, ascending.
-pub type Metrics = { st: sync.Lock[St], bounds_us: List[i64], per_route: bool }
+pub type Metrics = { st: sync.Lock[St], bounds_us: List[i64], per_route: bool, sources: sync.Lock[List[fn() -> List[u8]]] }
 
 /// Prometheus's default buckets: 5 ms to 10 s.
 pub fn new() -> Metrics {
@@ -42,14 +42,14 @@ pub fn new() -> Metrics {
 
 /// A histogram with these upper bounds (microseconds, ascending; `+Inf` is added).
 pub fn with_buckets(bounds_us: List[i64]) -> Metrics {
-    Metrics(sync.lock(St(Map.new(), Map.new(), 0)), bounds_us, false)
+    Metrics(sync.lock(St(Map.new(), Map.new(), 0)), bounds_us, false, sync.lock(List.new()))
 }
 
 /// The same series labelled by route as well (`http_requests_total{method,route,code}`, a latency
 /// histogram per route): the label is the route pattern the router matched (`/todos/:id`), the
 /// operation id when an OpenAPI service set one, and `unmatched` for requests no route took
 /// (404, 405), so a client can't make new series. Copies share the numbers.
-pub fn by_route(m: Metrics) -> Metrics { Metrics(m.st, m.bounds_us, true) }
+pub fn by_route(m: Metrics) -> Metrics { Metrics(m.st, m.bounds_us, true, m.sources) }
 
 /// The method as a label value (see the module comment).
 pub fn method_label(m: List[u8]) -> List[u8] {
@@ -119,7 +119,40 @@ fn line(inout out: List[u8], s: str) {
     out.push(10)
 }
 
+/// A counter in the exposition format: its HELP and TYPE lines and one sample (for `add_source`).
+pub fn counter_text(name: str, help: str, value: i64) -> List[u8] { series_text(name, help, "counter", value) }
+
+/// A gauge in the exposition format (for `add_source`).
+pub fn gauge_text(name: str, help: str, value: i64) -> List[u8] { series_text(name, help, "gauge", value) }
+
+fn series_text(name: str, help: str, kind: str, value: i64) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    bytes.append(inout out, sys.lit("# HELP "))
+    bytes.append(inout out, sys.lit(name))
+    out.push(32)
+    bytes.append(inout out, sys.lit(help))
+    out.push(10)
+    bytes.append(inout out, sys.lit("# TYPE "))
+    bytes.append(inout out, sys.lit(name))
+    out.push(32)
+    bytes.append(inout out, sys.lit(kind))
+    out.push(10)
+    bytes.append(inout out, sys.lit(name))
+    out.push(32)
+    bytes.append(inout out, bytes.from_i64(value))
+    out.push(10)
+    out
+}
+
 impl Metrics {
+    /// Adds series that `f` writes (whole exposition text, `counter_text` / `gauge_text`) after
+    /// the built-in ones on every render: how a component outside this module (the server's
+    /// counters, a rate limiter's, a pool's) shows up on `/metrics`. Copies share the sources.
+    /// `f` runs on the scraping worker; it must not call `render` of the same Metrics.
+    fn add_source(self, f: fn() -> List[u8]) {
+        self.sources.modify(|inout l: List[fn() -> List[u8]]| -> () { l.push(f) })
+    }
+
     /// Counts one answered request that took `dur_ns` (no route: `observe_route` with "").
     fn observe(self, method: List[u8], status: i32, dur_ns: i64) { self.observe_route(method, List.new(), status, dur_ns) }
 
@@ -272,6 +305,7 @@ impl Metrics {
             bytes.append(inout out, bytes.from_i64(h.count))
             out.push(10)
         }
+        for f in self.sources.get() { bytes.append(inout out, f()) }
         out
     }
 

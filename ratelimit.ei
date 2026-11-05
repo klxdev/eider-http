@@ -25,6 +25,7 @@ import std.sync
 import std.time
 import http
 import http.proxy
+import http.metrics
 
 /// What `allow` says: whether the request may go on, and when to try again if not (ns).
 pub type Decision = { allowed: bool, retry_ns: i64 }
@@ -123,6 +124,20 @@ impl Limiter {
 
     /// Requests allowed and refused so far.
     fn counts(self) -> (i64, i64) { self.st.modify(|inout s: State| -> (i64, i64) { (s.allowed, s.limited) }) }
+
+    /// Adds `http_ratelimit_allowed_total`, `http_ratelimit_limited_total` and the gauge
+    /// `http_ratelimit_tracked_keys` to `m`'s exposition.
+    fn expose(self, m: metrics.Metrics) {
+        let lm = self
+        m.add_source(|| -> List[u8] {
+            let (ok, no) = lm.counts()
+            let mut o: List[u8] = List.new()
+            bytes.append(inout o, metrics.counter_text("http_ratelimit_allowed_total", "Requests the rate limiter let through.", ok))
+            bytes.append(inout o, metrics.counter_text("http_ratelimit_limited_total", "Requests the rate limiter refused (429).", no))
+            bytes.append(inout o, metrics.gauge_text("http_ratelimit_tracked_keys", "Clients the rate limiter remembers.", lm.tracked() as i64))
+            o
+        })
+    }
 
     /// Clients remembered now.
     fn tracked(self) -> usize { self.st.modify(|inout s: State| -> usize { s.tat.len() }) }

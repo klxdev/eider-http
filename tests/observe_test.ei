@@ -1,0 +1,102 @@
+// Observability: the server's and the rate limiter's counters on /metrics (Metrics.add_source),
+// per-route metrics with a trap, tracing with the trap, and http/profiling: the opt-in endpoints
+// and their refusals (this output is for a build without --profile; with --profile the endpoints
+// answer, see profiling_test).
+
+import core.sys
+import std.bytes
+import std.io
+import std.net
+import std.task
+import std.time
+import http
+import http.client
+import http.server
+import http.router
+import http.metrics
+import http.middleware
+import http.ratelimit
+import http.testing
+import http.profiling
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn has(s: List[u8], n: str) -> bool { bytes.find(s, lit(n), 0).is_some() }
+
+fn main() uses io, net, clock, threads, fs {
+    print("-- sources")
+    let m = metrics.new()
+    m.add_source(|| -> List[u8] { metrics.counter_text("jobs_done_total", "Jobs done.", 42) })
+    m.add_source(|| -> List[u8] { metrics.gauge_text("queue_depth", "Jobs waiting.", 0 - 3) })
+    io.outln(m.render())
+    let copy = metrics.by_route(m)
+    print(has(copy.render(), "jobs_done_total 42"))
+
+    print("-- the server's counters")
+    let mm = metrics.by_route(metrics.new())
+    let lim = ratelimit.new(100, time.seconds(1), 4).except(|q: http.Request| -> bool { bytes.eq(q.path, lit("/metrics")) })
+    lim.expose(mm)
+    let mut r = router.new()
+    r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello") })
+    r.get("/boom", |q: http.Request| -> http.Response {
+        panic("boom")
+        http.text(200, "unreachable")
+    })
+    r.get("/metrics", mm.handler())
+    var cfg = server.config()
+    cfg.log = None
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    srv.expose(mm)
+    let app = mm.wrap(middleware.recover(None, ratelimit.middleware(lim, router.handler(r))))
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(app, t).unwrap() })
+    let a = srv.addr()
+    let dl = time.after_ms(20000)
+    var codes: List[i32] = List.new()
+    for path in ["/hello", "/hello", "/boom", "/nope", "/hello", "/hello"] {
+        match client.get(a, path, dl) {
+            Ok(x) => { codes.push(x.status) }
+            Err(e) => { print(e) }
+        }
+    }
+    print(codes)
+    let body = client.get(a, "/metrics", dl).unwrap().body
+    // the rate limiter (burst 4 from one address, /metrics excepted) let 4 through and refused 2
+    print(has(body, "http_requests_total{{method=\"GET\",route=\"/hello\",code=\"200\"}} 2"))
+    print(has(body, "code=\"500\"}} 1"))
+    print(has(body, "route=\"unmatched\",code=\"404\"}} 1"))
+    print(has(body, "route=\"unmatched\",code=\"429\"}} 2"))
+    print(has(body, "http_requests_in_flight 1"))
+    print(has(body, "http_server_connections_total 7"))
+    print(has(body, "http_server_handler_traps_total 0"))
+    print(has(body, "http_ratelimit_allowed_total 4"))
+    print(has(body, "http_ratelimit_limited_total 2"))
+    print(has(body, "http_ratelimit_tracked_keys 1"))
+    print(has(body, "# TYPE http_server_connections_waiting gauge"))
+    tok.cancel()
+    let st = th.join()
+    print(st.connections)
+    print(st.traps)
+    print(srv.stats().requests)
+
+    print("-- profiling endpoints (a build without --profile)")
+    var opts = profiling.options()
+    var off = router.new()
+    profiling.mount(inout off, opts)
+    print(testing.client(router.handler(off)).get("/debug/heap").status)
+    opts.enabled = true
+    var on = router.new()
+    profiling.mount(inout on, opts)
+    let c = testing.client(router.handler(on))
+    print(c.get("/debug/heap").status)
+    print(c.get("/debug/profile?seconds=1").status)
+    print(c.from_peer("203.0.113.9:1").get("/debug/heap").status)
+    print(profiling.is_local(lit("127.0.0.1:5")))
+    print(profiling.is_local(lit("[::1]:5")))
+    print(profiling.is_local(lit("")))
+    print(profiling.is_local(lit("10.0.0.1:5")))
+    print(profiling.is_local(lit("127.evil.example:5")))
+    let lab = profiling.labels(|q: http.Request| -> http.Response { http.text(200, "labelled") })
+    print(lab(http.request("GET", lit("/"))).status)
+}

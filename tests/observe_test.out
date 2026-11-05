@@ -1,0 +1,57 @@
+-- sources
+# HELP http_requests_total Requests answered, by method and status code.
+# TYPE http_requests_total counter
+# HELP http_requests_in_flight Requests being handled now.
+# TYPE http_requests_in_flight gauge
+http_requests_in_flight 0
+# HELP http_request_duration_seconds Time to answer a request.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.005"} 0
+http_request_duration_seconds_bucket{le="0.01"} 0
+http_request_duration_seconds_bucket{le="0.025"} 0
+http_request_duration_seconds_bucket{le="0.05"} 0
+http_request_duration_seconds_bucket{le="0.1"} 0
+http_request_duration_seconds_bucket{le="0.25"} 0
+http_request_duration_seconds_bucket{le="0.5"} 0
+http_request_duration_seconds_bucket{le="1"} 0
+http_request_duration_seconds_bucket{le="2.5"} 0
+http_request_duration_seconds_bucket{le="5"} 0
+http_request_duration_seconds_bucket{le="10"} 0
+http_request_duration_seconds_bucket{le="+Inf"} 0
+http_request_duration_seconds_sum 0
+http_request_duration_seconds_count 0
+# HELP jobs_done_total Jobs done.
+# TYPE jobs_done_total counter
+jobs_done_total 42
+# HELP queue_depth Jobs waiting.
+# TYPE queue_depth gauge
+queue_depth -3
+
+true
+-- the server's counters
+[200, 200, 500, 404, 429, 429]
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+7
+0
+7
+-- profiling endpoints (a build without --profile)
+404
+501
+501
+501
+true
+true
+true
+false
+false
+200

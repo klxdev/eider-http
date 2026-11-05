@@ -61,6 +61,7 @@ import http
 import http.parse
 import http.sock
 import http.middleware
+import http.metrics
 
 pub type Config = {
     workers: usize,
@@ -93,17 +94,17 @@ fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) 
 /// handlers (or response producers) that trapped and were contained (answered 500).
 pub type Stats = { connections: i64, rejected: i64, requests: i64, bad: i64, timeouts: i64, traps: i64 }
 
-type Shared = { stats: Stats, waiting: i64 }
+pub type Shared = { stats: Stats, waiting: i64 }
 
 /// A listening server (bound, not yet serving).
-pub type Server = { ls: i32, addr: net.Addr, cfg: Config }
+pub type Server = { ls: i32, addr: net.Addr, cfg: Config, sh: sync.Lock[Shared] }
 
 /// Binds and listens on `a` (port 0: any free port; `addr()` says which).
 pub fn listen(a: net.Addr, cfg: Config) -> Result[Server, String] uses net, io {
     if cfg.workers == 0 || cfg.queue == 0 { return Err(String.from("server: workers and queue must be at least 1")) }
     let ls = net.listener(a, true)?
     match net.local_addr(ls) {
-        Ok(la) => Ok(Server(ls, la, cfg))
+        Ok(la) => Ok(Server(ls, la, cfg, sync.lock(Shared(Stats(0, 0, 0, 0, 0, 0), 0))))
         Err(e) => {
             fd.close(ls)
             Err(e)
@@ -132,6 +133,33 @@ impl Server {
 
     fn port(self) -> i32 { self.addr.port }
 
+    /// The counts so far (while serving, or after).
+    fn stats(self) -> Stats { self.sh.get().stats }
+
+    /// Connections waiting for a slot now.
+    fn waiting(self) -> i64 { self.sh.get().waiting }
+
+    /// Adds the server's counters to `m`'s exposition: `http_server_connections_total`,
+    /// `http_server_connections_rejected_total` (503), `http_server_requests_handled_total`,
+    /// `http_server_bad_requests_total` (refused by the parser), `http_server_timeouts_total`,
+    /// `http_server_handler_traps_total` (contained, answered 500) and the gauge
+    /// `http_server_connections_waiting`.
+    fn expose(self, m: metrics.Metrics) {
+        let sv = self
+        m.add_source(|| -> List[u8] {
+            let s = sv.stats()
+            let mut o: List[u8] = List.new()
+            bytes.append(inout o, metrics.counter_text("http_server_connections_total", "Connections accepted.", s.connections))
+            bytes.append(inout o, metrics.counter_text("http_server_connections_rejected_total", "Connections answered 503 because the queue was full.", s.rejected))
+            bytes.append(inout o, metrics.counter_text("http_server_requests_handled_total", "Requests handed to the handler.", s.requests))
+            bytes.append(inout o, metrics.counter_text("http_server_bad_requests_total", "Requests the parser refused.", s.bad))
+            bytes.append(inout o, metrics.counter_text("http_server_timeouts_total", "Requests that did not arrive, or responses that could not be written, in time.", s.timeouts))
+            bytes.append(inout o, metrics.counter_text("http_server_handler_traps_total", "Handlers that trapped and were answered 500.", s.traps))
+            bytes.append(inout o, metrics.gauge_text("http_server_connections_waiting", "Connections waiting for a worker slot.", sv.waiting()))
+            o
+        })
+    }
+
     /// Serves connections with `h` until `tok` is cancelled (or expires), then shuts down
     /// gracefully (see the module comment) and returns the counts. Closes the listener.
     /// Err only when the server can't start (no poller, waker or threads).
@@ -155,7 +183,7 @@ impl Server {
             poll.wake(sw)
             0
         })
-        let sh = sync.lock(Shared(Stats(0, 0, 0, 0, 0, 0), 0))
+        let sh = self.sh
         // `workers` slots: a connection holds one while it is served
         let slots: chan.Channel[bool] = chan.bounded(cfg.workers)
         for i in 0..cfg.workers { let z = slots.try_send(true) }

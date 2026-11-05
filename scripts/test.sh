@@ -9,7 +9,7 @@
 # built once under ThreadSanitizer and run once each, when $CC can build a TSan program
 # (else `skip`). Prints `ok   <test>` or `FAIL <test>` with a diff, then `ALL OK`; exits 1
 # on a failure, 2 when there is no usable toolchain (scripts/env.sh).
-TSAN="tests/ratelimit_test.ei tests/trap_test.ei tests/server_test.ei tests/middleware_test.ei tests/stream_test.ei tests/ws_test.ei"
+TSAN="tests/observe_test.ei tests/ratelimit_test.ei tests/trap_test.ei tests/server_test.ei tests/middleware_test.ei tests/stream_test.ei tests/ws_test.ei"
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 if [ -z "$NOBUILD" ]; then
   sh "$here/scripts/build.sh" || exit $?
@@ -21,6 +21,12 @@ for f in tests/*.ei examples/*/tests/*.ei; do
   [ -f "$f" ] && [ -f "${f%.ei}.out" ] || continue
   got=$(ei run "$f" 2>&1 < /dev/null)
   if [ "$got" = "$(cat "${f%.ei}.out")" ]; then echo "ok   $f"; else echo "FAIL $f"; echo "$got" | diff "${f%.ei}.out" - | head -10; fail=1; fi
+done
+# tests/profiled/*.ei are run with --profile=cpu,mem (the profiler's endpoints need it)
+for f in tests/profiled/*.ei; do
+  [ -f "$f" ] && [ -f "${f%.ei}.out" ] || continue
+  got=$(ei run --profile=cpu,mem "$f" 2>&1 < /dev/null)
+  if [ "$got" = "$(cat "${f%.ei}.out")" ]; then echo "ok   $f (--profile)"; else echo "FAIL $f (--profile)"; echo "$got" | diff "${f%.ei}.out" - | head -10; fail=1; fi
 done
 if [ -n "$TSAN" ]; then
   T=$(mktemp -d)

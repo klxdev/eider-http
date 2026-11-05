@@ -31,6 +31,16 @@ For Eider 0.7 (`eider = "0.7"`).
   request), the PROXY protocol, a rate limit shared between processes. Per-route limits: wrap
   that route's handler in its own limiter.
 
+- **Observability** (eider-http#5, the criteria left open): `Metrics.add_source(f)` with
+  `metrics.counter_text` / `gauge_text` puts other components on `/metrics`; `Server.expose(m)`
+  adds the server's counters (connections, rejected, handled, bad, timeouts, handler traps, the
+  waiting gauge), `Limiter.expose(m)` the rate limiter's; `Server.stats()` and `waiting()` read them
+  live (`Server` has a new last field, `sh`: **breaking** for code that builds it by position, which
+  only `listen` should). `Metrics` has a new last field (`sources`), likewise. Tracing (`traceparent`) and
+  metrics by route/operation were done in 0.5.0; the sampling profiler for services is
+  `http/profiling` (eider-profiler reads its files), now tested in both a plain and a `--profile`
+  build. `profiling.is_local` accepts IP literals only (it took any text starting with `127.`).
+
 ## 0.7.0
 
 For Eider 0.7 (`eider = "0.7"`). Requires eider-json 0.7.0. Nothing else changed.

@@ -302,6 +302,12 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   that stays at `max_keys` under 10,000 distinct keys, 8 threads on one key getting exactly the
   burst, the middleware (429, `Retry-After`, `except`, `by`), and the pair with `proxy`: forged
   headers from a direct client or forged left sides behind a proxy buy no extra bucket.
+- `observe_test`: `add_source`, the server's and the rate limiter's series on a live `/metrics`
+  next to per-route series with a contained trap (500), a 404 and rate-limited 429s; the profiling
+  endpoints in a build without `--profile` (404 when not mounted, 501) and `is_local` (including
+  `127.evil.example`). `tests/profiled/profiling_test` runs with `--profile=cpu,mem`: the endpoints
+  answer a profile (version 1 header, the program's files), 403 for remote peers, 400 for bad
+  `seconds`.
 - `server_test`: a server on 127.0.0.1 on an ephemeral port: routing, keep-alive,
   pipelining, chunked bodies, `Expect: 100-continue`, refused smuggling, the read and idle
   deadlines, `max_requests`, back-pressure (503 and keep-alive given up), graceful shutdown
@@ -380,6 +386,21 @@ route: `{route="/todos/:id",le="0.005"}`. A handler or layer that sets the respo
 `operation` (an OpenAPI operation id) is labelled by that instead; requests no route took are
 `unmatched`, so the label set is bounded by the routes. `metrics.new()` without `by_route` writes the
 series as before. Sampling profiles of a running service are `http/profiling` with eider-profiler.
+
+**Other components on `/metrics`.** `Metrics.add_source(f)` appends the text `f` writes
+(`metrics.counter_text`, `metrics.gauge_text`) after the built-in series on every render.
+`srv.expose(m)` adds the server's counters (`http_server_connections_total`,
+`..._connections_rejected_total`, `..._requests_handled_total`, `..._bad_requests_total`,
+`..._timeouts_total`, `..._handler_traps_total`, the gauge `..._connections_waiting`; `srv.stats()`
+reads the same numbers live), and `lim.expose(m)` the rate limiter's (`http_ratelimit_allowed_total`,
+`..._limited_total`, `http_ratelimit_tracked_keys`). Order the layers so the 429s and 500s are
+counted: `metrics.wrap` outside `ratelimit.middleware` and `recover`.
+
+**Profiling endpoints.** `profiling.mount` is opt-in (`enabled`), answers 501 in a build without
+`--profile`, 403 to peers other than the local host (an IP literal in 127.0.0.0/8 or `::1`; text that
+only begins with `127.` is not local) unless `remote`. Behind a proxy on the same host every visitor
+is the proxy, hence local: put `proxy.middleware` (with the proxy trusted) outside, or
+`middleware.bearer` in front of the endpoints.
 
 
 ## Streaming bodies and per-route limits
