@@ -3,7 +3,7 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.2
 
 - **`Content-Encoding` with eider-compression** (eider-lang#37; for Eider 0.7.3). `[deps.compression]` (eider-compression 0.7.0, granted `io` and `clock`: its `streams` module names them, see docs/services.md N20) and a new module `http/compress`:
   - **Response compression**, `compress.responses(options, h)`: `Accept-Encoding` negotiated with q-values among gzip and deflate (zstd only after `with_zstd(level)`: eider-compression's encoder has no Huffman literal coding, so its ratio, 3.07 at level 3, is below gzip's 3.72 at similar speed), `Vary: Accept-Encoding`, a 1024-byte floor, an allow-list of media types (`text/*`, JSON, XML, JavaScript, SVG; `with_type`), strong ETags made weak, no double encoding, nothing for HEAD, 1xx/204/205/206/304, `Content-Range`, `Range` requests, `Cache-Control: no-transform`, `compress.never(resp)` or `except(f)`; a body that does not shrink is sent as it is; streamed (chunked) responses are compressed piece by piece (flushed per event for `text/event-stream`); `with_level`.
