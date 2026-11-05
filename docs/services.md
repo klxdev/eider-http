@@ -45,7 +45,7 @@ the step-by-step guide to both ("Building services").
 | `http/client` | `connect`, `Conn.request`, `fetch`, `get`, `post` | `net, io, clock` |
 | `http/router` | method + path patterns with parameters, 404/405 | none |
 | `http/problem` | `ApiError`: errors as values, written as RFC 9457 problem+json | none |
-| `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` | none; `io, clock` for `access_log` and `timeout`, `io` for `random_ids` |
+| `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `recover`, `chain` | none; `io, clock` for `access_log`, `timeout` and `recover`, `io` for `random_ids` |
 | `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format; `by_route` labels both with the route (or operation id) | `clock` for `wrap` |
 | `http/trace` | W3C Trace Context: `traceparent` in, a span per request to a sink (`log_sink`, `collect`), `inject` for outgoing calls | `io, clock` for `wrap` and `inject` |
 | `http/sse` | server-sent events over a chunked response: `response(run)`, `Stream.event/data/comment/retry`, `format_event` | none |
@@ -151,8 +151,19 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   `Result[http.Response, problem.ApiError]` and answers an Err with its problem+json.
   `problems(h)` rewrites exactly the package's plain-text error responses
   (`http.error_response`, such as the router's 404 and 405) as problem+json and keeps their
-  headers (`Allow`, `Retry-After`). A handler's own text is left alone. Turning a *trap* into
-  a 500 still needs N5.
+  headers (`Allow`, `Retry-After`). A handler's own text is left alone.
+- **Traps become 500s** (N5, eider-lang#54). `recover(lg, h)` runs `h` under `task.catch`
+  (eider-lang C803): a panic, overflow, out-of-bounds index or failed assert is answered `500
+  Internal Server Error` (the standard text; nothing of the trap reaches the client), logged to
+  `lg` (method, path cut at 200 bytes, the trap's text with file and line) and the connection is
+  closed after the response. Put it inside the access log and `metrics.wrap` so they see the 500
+  (a trap that unwinds through `metrics.wrap` would leave its in-flight gauge raised). Without it
+  `http/server` does the same around every handler as a last resort (`Config.log`, `Stats.traps`).
+  `timeout`'s pool worker contains a trap too and the layer answers 500 at once instead of 503 at
+  the deadline. What is safe afterwards: no drops run for what the handler was building (a
+  leak, bounded by one request), a `sync.Lock` it held in `modify` stays empty (so a handler that
+  traps inside a lock shared with other requests takes that lock's value; keep such state out of
+  reach of code that can trap, or check before computing), a stack overflow is not contained.
 - **Body limits per route** (C86). `body_limit(n, h)` answers 413 above `n` bytes, after the
   server has read the body (up to `Limits.max_body`, the server-wide ceiling). To refuse
   before reading, give the route a plan: `r.route_with("POST", "/upload", http.Plan(4096,
@@ -231,9 +242,9 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   `secured`.
 - **What can still go wrong.** A handler that blocks forever holds a worker forever
   (`middleware.timeout` bounds the answer, not the thread). A trap in a handler (panic,
-  overflow, out-of-bounds) ends the process, as any trap does today (needs N5). eider-rpc's kvstore
-  example checks arithmetic before doing it so a caller can't crash it. There is no rate
-  limiting yet.
+  overflow, out-of-bounds) is contained at the handler call: 500, logged, connection closed; the
+  leak of what it was building is bounded by one request (see "Traps become 500s"), but a stack
+  overflow still ends the process. There is no rate limiting yet.
 
 ## Testing
 
@@ -249,6 +260,12 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   mutants (bytes flipped, inserted or deleted, framing headers added, CRLF turned into bare
   LF or CR, cut short, under default and tight limits) must parse identically however they
   are split, and every message the parser accepts must satisfy the framing invariants.
+- `trap_test`: handlers that panic, overflow and index out of bounds are answered 500 with the
+  standard text and nothing of the trap (checked for the secret in the panic message, the file
+  name), the connection is closed after the 500 (also with a pipelined request behind), a trap
+  while a streamed request body is half read and in a streamed response's producer do not leak the
+  connection, 40 traps mixed with good requests leave the counts right (`Stats.traps`), and
+  `recover` under `metrics.wrap` shows the 500 and an in-flight gauge of 0.
 - `server_test`: a server on 127.0.0.1 on an ephemeral port: routing, keep-alive,
   pipelining, chunked bodies, `Expect: 100-continue`, refused smuggling, the read and idle
   deadlines, `max_requests`, back-pressure (503 and keep-alive given up), graceful shutdown
@@ -273,7 +290,7 @@ Recorded rather than worked around; none blocks the design.
 | ~~N2~~ | `\r`, `\xNN` and `\u{...}` string escapes, and literal concatenation | CRLF in messages, test corpora | done: messages are written with `\r\n` literals (eider-lang's docs/compiler.md "C8.17"); the tests keep `wire()`, where `\n` is CRLF, by choice (C104) |
 | N3 | `std/net`: a send that reports would-block (`try_send`, like `try_recv`) | sock.send_by | wait for writability before every send (correct: one writer per socket) |
 | N4 | Waiting on two descriptors with a deadline without a poller per connection (e.g. `fd.wait_any`, or one event.Loop per worker thread) | each connection waits on its socket and the stop signal | one epoll descriptor per connection (four system calls more per connection) |
-| N5 | Containing a trap: a handler's panic or overflow ends the process | server | documented; validate input before arithmetic |
+| ~~N5~~ | Containing a trap: a handler's panic or overflow ends the process | server | done: `task.catch` (eider-lang C803) around every handler in `http/server`, and `middleware.recover` |
 | N6 | Stackless tasks (C4) | thread per connection being served | a fixed pool; `serve` keeps its API when tasks arrive |
 | N7 | References (8.6): reading a List out of a record copies it | the request path copies heads and bodies a few times | fine at these sizes, measured nothing yet |
 | N8 | Comptime reflection and derive (P0.9, P0.10) | typed JSON-RPC parameters and results | decoder and encoder functions per type (`add_typed`) |
@@ -289,8 +306,8 @@ Recorded rather than worked around; none blocks the design.
 
 ## Next steps toward OpenAPI
 
-1. **Middleware and observability:** done in a first form (above). Still to do: panics
-   turned into 500 once traps can be contained (N5); a `Forwarded`-aware peer address behind
+1. **Middleware and observability:** done in a first form (above). Panics turned into 500: done
+   (`recover`, and the server's last resort). Still to do: a `Forwarded`-aware peer address behind
    a configured proxy; rate limiting;
    tracing (W3C `traceparent`, carried like the request id).
 2. **Streaming:** done: request bodies as readers, chunked responses from a producer, per-route

@@ -3,6 +3,19 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+For Eider 0.7 (`eider = "0.7"`).
+
+- **A trap in a handler is a 500** (eider-lang#54): `http/server` runs every handler (and the
+  producer of a streamed response) under `task.catch`: the client gets the standard `500 Internal
+  Server Error` and nothing of the trap, the trap is logged (`Config.log`, a `std/log` Logger,
+  error level to stderr by default; `None` turns it off), `Stats.traps` counts it, the connection
+  is closed after the response, and the server carries on. `middleware.recover(lg, h)` does the
+  same inside the access log and `metrics.wrap` so they record the 500; `middleware.timeout` answers a
+  trapped handler 500 at once (it was 503 at the deadline). **Breaking for code that builds the
+  records by position:** `Config` has a new last field (`log`) and `Stats` has `traps`.
+
 ## 0.7.0
 
 For Eider 0.7 (`eider = "0.7"`). Requires eider-json 0.7.0. Nothing else changed.

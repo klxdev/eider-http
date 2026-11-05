@@ -32,13 +32,14 @@
 //!   `WWW-Authenticate`.
 //! Metrics (counters and latency histograms in the Prometheus text format) are http/metrics.
 //!
-//! None of this can contain a trap: a handler that panics or overflows still ends the
-//! process (docs/services.md N5). `errors` is the way not to need one.
+//! - `recover`: a trap in the handler (panic, overflow, out of bounds) becomes a 500 and a log
+//!   record, and the server goes on. `errors` is the way not to need it.
 
 import core.sys
 import std.bytes
 import std.atomic
 import std.encoding
+import std.utf8
 import std.log
 import std.random
 import std.stream
@@ -59,6 +60,52 @@ pub fn chain(h: http.Handler, layers: List[http.Middleware]) -> http.Handler {
         out = l(out)
     }
     out
+}
+
+// ---- containing a trap
+
+fn bfield(key: str, v: List[u8], max: usize) -> log.Field {
+    let cut = if v.len() > max { bytes.slice(v, 0, max) } else { v }
+    log.text(key, utf8.lossy(cut))
+}
+
+/// The log record of a contained trap (a handler's panic: `recover` and http/server): the method, the path (cut at 200 bytes, made valid
+/// UTF-8; the logger escapes it) and the trap's text. Nothing of it goes to the client.
+pub fn trap_fields(method: List[u8], path: List[u8], why: String) -> log.Fields {
+    log.fields().add(bfield("method", method, 32)).add(bfield("path", path, 200)).text("trap", why)
+}
+
+/// Contains a trap in `h` (a panic, an overflow, an index out of bounds, a failed assert, ...,
+/// eider-lang's `task.catch`): the request is answered `500 Internal Server Error` with the
+/// package's standard text and nothing of the trap, which goes to `lg` as an error record (`None`:
+/// not logged) (the
+/// method, the path cut at 200 bytes, the trap's text with file and line). The connection is
+/// closed after the response, since the handler may have left state we know nothing about.
+/// Place it inside `metrics.wrap` and the access log so they count and log the 500:
+/// `request_id(ids, access_log(log, m.wrap(recover(lg, router))))`. `http/server` contains traps
+/// itself as a last resort (then outer layers do not see the request).
+///
+/// What is safe afterwards (docs/runtime.md "What is safe afterwards"): what `h` was building
+/// leaks (no drops run) and a `sync.Lock` it held in `modify` stays empty, so a handler that
+/// traps inside a lock shared with other requests takes that lock's value with it; put such
+/// state behind a lock the handler cannot trap in, or validate before computing.
+pub fn recover(lg: Option[log.Logger], h: http.Handler) -> http.Handler uses io, clock {
+    |req: http.Request| -> http.Response {
+        let method = req.method.copy()
+        let path = req.path.copy()
+        match task.catch(|| -> http.Response { h(req) }) {
+            Ok(r) => r
+            Err(why) => {
+                match lg {
+                    Some(l) => l.error("handler trapped", trap_fields(method, path, why))
+                    None => {}
+                }
+                let mut resp = http.error_response(500)
+                resp.keep_alive = false
+                resp
+            }
+        }
+    }
 }
 
 // ---- request ids
@@ -355,8 +402,15 @@ pub fn timeout(d: time.Duration, pool: task.Pool, h: http.Handler) -> http.Handl
         }
         match pool.run(|| -> http.Response { h(r) }, dl) {
             Ok(fut) => {
-                match fut.get(dl) {
-                    Some(resp) => resp
+                match fut.result(dl) {
+                    Some(Ok(resp)) => resp
+                    Some(Err(why)) => {
+                        // the worker contained a trap in the handler: 500 now, not 503 at
+                        // the deadline (wrap `h` in `recover` to have it logged)
+                        let mut resp = http.error_response(500)
+                        resp.keep_alive = false
+                        resp
+                    }
                     None => late("the handler did not answer within ")
                 }
             }

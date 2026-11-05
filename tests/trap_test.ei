@@ -1,0 +1,239 @@
+// Containing a trap (eider-lang#54): a handler that panics, overflows or indexes out of bounds
+// is answered 500 (standard text, nothing of the trap) and the server keeps serving; a trap in
+// a streamed response's producer or in a streamed request body's reader does not leak the
+// connection; middleware.recover gives the same one layer inside the metrics and access log.
+// Over loopback on an ephemeral port; no sleeps.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.log
+import std.net
+import std.stream
+import std.sync
+import std.task
+import std.time
+import std.utf8
+import http
+import http.parse
+import http.server
+import http.client
+import http.router
+import http.middleware
+import http.metrics
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn wire(s: str) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for c in sys.lit(s) {
+        if c == 10 {
+            out.push(13)
+            out.push(10)
+        } else {
+            out.push(c)
+        }
+    }
+    out
+}
+
+fn has(s: List[u8], n: List[u8]) -> bool { bytes.find(s, n, 0).is_some() }
+
+fn zero() -> i32 { 0 }
+
+fn app() -> router.Router uses io {
+    let mut r = router.new()
+    r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello") })
+    r.get("/panic", |q: http.Request| -> http.Response {
+        panic("secret internal state: key=hunter2")
+        http.text(200, "unreachable")
+    })
+    r.get("/overflow", |q: http.Request| -> http.Response {
+        let big: i32 = 2147483647
+        let n = big + 1 + zero()
+        http.text(200, "overflow")
+    })
+    r.get("/index", |q: http.Request| -> http.Response {
+        let xs: List[u8] = List.new()
+        let i: usize = 3 + zero() as usize
+        let mut one = lit("x")
+        one.push(xs[i])
+        http.respond(200, "text/plain", one)
+    })
+    r.post("/echo", |q: http.Request| -> http.Response { http.respond(200, "application/octet-stream", q.body) })
+    r.route_with("POST", "/up-trap", http.Plan(100, true), |q: http.Request| -> http.Response {
+        let mut body = q.stream.unwrap()
+        let first = body.read(2)
+        panic("trapped while the body is half read")
+        http.text(200, "unreachable")
+    })
+    r.get("/events", |q: http.Request| -> http.Response {
+        let mut resp = http.response(200)
+        resp.set_header("Content-Type", lit("text/plain"))
+        resp.stream = Some(http.Stream(|d: http.Duplex| -> () {
+            let a = d.write(lit("one\n"))
+            panic("producer failed")
+        }, false))
+        resp
+    })
+    r
+}
+
+fn show_resp(r: http.Response) uses io {
+    let mut l = bytes.from_u64(r.status as u64)
+    l.push(32)
+    for name in [lit("content-type"), lit("content-length"), lit("connection")] {
+        match http.find(r.headers, name) {
+            Some(v) => {
+                bytes.append(inout l, name)
+                l.push(61)
+                bytes.append(inout l, v)
+                l.push(32)
+            }
+            None => {}
+        }
+    }
+    bytes.append(inout l, lit("| "))
+    bytes.append(inout l, r.body)
+    io.outln(l)
+}
+
+fn show(r: Result[http.Response, String]) uses io {
+    match r {
+        Ok(resp) => show_resp(resp)
+        Err(e) => print(e)
+    }
+}
+
+fn raw(a: net.Addr) -> i32 uses net {
+    let s = net.socket(net.IPV4, net.STREAM, false).unwrap()
+    net.connect(s, a).unwrap()
+    s
+}
+
+/// Everything the peer sends until it closes or `dl`: the text and whether it closed.
+fn read_all(s: i32, dl: time.Deadline) -> (List[u8], bool) uses io, clock {
+    let mut got: List[u8] = List.new()
+    while true {
+        match fd.read_by(s, 65536, dl) {
+            Ok(Some(b)) => {
+                if b.len() == 0 { return (got, true) }
+                bytes.append(inout got, b)
+            }
+            Ok(None) => { return (got, false) }
+            Err(e) => { return (got, true) }
+        }
+    }
+    (got, false)
+}
+
+fn main() uses io, net, clock, threads {
+    let dl = time.after_ms(20000)
+    let mut cfg = server.config()
+    cfg.log = None
+    cfg.workers = 4
+    let rt = app()
+    cfg.plan = rt.planner()
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let h = router.handler(rt)
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+    let a = srv.addr()
+
+    print("-- a trap is a 500")
+    show(client.get(a, "/panic", dl))
+    show(client.get(a, "/overflow", dl))
+    show(client.get(a, "/index", dl))
+    // the server goes on, on new connections and on a connection that did not trap
+    show(client.get(a, "/hello", dl))
+    let mut c = client.connect(a, dl).unwrap()
+    show(c.request(http.request("GET", lit("/hello")), dl))
+    show(c.request(http.request("GET", lit("/hello")), dl))
+    print(c.open)
+    // a connection that trapped is closed after the 500 (and the 500 says so)
+    let mut c2 = client.connect(a, dl).unwrap()
+    show(c2.request(http.request("GET", lit("/panic")), dl))
+    print(c2.open)
+    // a pipelined request behind the trapping one is not answered: the connection closes
+    let sp = raw(a)
+    net.send_all(sp, wire("GET /panic HTTP/1.1\nHost: x\n\nGET /hello HTTP/1.1\nHost: x\n\n")).unwrap()
+    let (got, closed) = read_all(sp, dl)
+    print(closed)
+    print(bytes.starts_with(got, lit("HTTP/1.1 500 ")))
+    print(has(got, lit("hello")))
+    fd.close(sp).unwrap()
+
+    print("-- nothing of the trap reaches the client")
+    let (g2, cl2) = read_one(a, dl)
+    print(has(g2, lit("secret")))
+    print(has(g2, lit("hunter2")))
+    print(has(g2, lit("trap_test")))
+    print(has(g2, lit("panic")))
+
+    print("-- a trap while a streamed body is half read")
+    let su = raw(a)
+    net.send_all(su, wire("POST /up-trap HTTP/1.1\nHost: x\nContent-Length: 10\n\nabc")).unwrap()
+    let (g3, cl3) = read_all(su, dl)
+    print(cl3)
+    print(bytes.starts_with(g3, lit("HTTP/1.1 500 ")))
+    fd.close(su).unwrap()
+
+    print("-- a trap in a streamed response's producer")
+    let se = raw(a)
+    net.send_all(se, wire("GET /events HTTP/1.1\nHost: x\n\n")).unwrap()
+    let (g4, cl4) = read_all(se, dl)
+    print(cl4)
+    print(has(g4, lit("one")))
+    print(has(g4, lit("producer")))
+    fd.close(se).unwrap()
+
+    print("-- the same many times, mixed with good requests")
+    var bad_ok = 0
+    var good_ok = 0
+    for i in 0..40 {
+        match client.get(a, "/panic", dl) {
+            Ok(r) => { if r.status == 500 { bad_ok += 1 } }
+            Err(e) => {}
+        }
+        match client.get(a, "/hello", dl) {
+            Ok(r) => { if r.status == 200 { good_ok += 1 } }
+            Err(e) => {}
+        }
+    }
+    print(bad_ok)
+    print(good_ok)
+
+    tok.cancel()
+    let st = th.join()
+    print(st.traps)
+    print(st.requests)
+
+    print("-- recover")
+    let m = metrics.new()
+    let wrapped = m.wrap(middleware.recover(None, router.handler(app())))
+    let r1 = wrapped(http.request("GET", lit("/panic")))
+    print(r1.status)
+    print(r1.keep_alive)
+    print(has(r1.body, lit("secret")))
+    let r2 = wrapped(http.request("GET", lit("/hello")))
+    print(r2.status)
+    let text = m.render()
+    print(has(text, lit("method=\"GET\",code=\"500\"}} 1")))
+    print(has(text, lit("http_requests_in_flight 0")))
+
+    print("-- the log record")
+    var weird = lit("/a\"b\nc")
+    weird.push(255)
+    let f = middleware.trap_fields(lit("GET"), weird, String.from("boom (x.ei:1)"))
+    print(utf8.lossy(log.format(0, log.Error, String.from("handler trapped"), log.fields(), f)))
+}
+
+fn read_one(a: net.Addr, dl: time.Deadline) -> (List[u8], bool) uses io, net, clock {
+    let s = raw(a)
+    net.send_all(s, wire("GET /panic HTTP/1.1\nHost: x\n\n")).unwrap()
+    let out = read_all(s, dl)
+    fd.close(s).unwrap()
+    out
+}

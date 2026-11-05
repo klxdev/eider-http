@@ -32,7 +32,18 @@
 //!
 //! A handler runs in the connection's task and must not block forever (nothing can interrupt
 //! it; a handler that computes without waiting holds a scheduler thread).
-//! A trap (panic, overflow) in a handler ends the whole process, as any trap does today.
+//!
+//! A trap (panic, overflow, out-of-bounds, failed assert) in a handler, or in the producer of a
+//! streamed response, is contained at the handler call (`task.catch`, eider-lang's decision
+//! C803): the client gets `500 Internal Server Error` with the standard text and nothing of
+//! the trap, the trap (text, file and line, the method and the path) is logged with
+//! `Config.log`, `Stats.traps` counts it, and the connection is closed after the response (a
+//! handler that trapped may have left a half-read request body or state we know nothing
+//! about). What the handler was building leaks and a `sync.Lock` it held in `modify` stays empty
+//! (eider-lang's docs/runtime.md "What is safe afterwards"); the server's own state is never
+//! touched by a handler, so every other connection, the listener and the counters carry on.
+//! A stack overflow is not contained. `middleware.recover` does the same one layer inside
+//! the access log and the metrics, so they see the 500.
 
 import core.sys
 import std.bytes
@@ -44,9 +55,12 @@ import std.time
 import std.task
 import std.chan
 import std.sync
+import std.log
+import std.utf8
 import http
 import http.parse
 import http.sock
+import http.middleware
 
 pub type Config = {
     workers: usize,
@@ -58,14 +72,16 @@ pub type Config = {
     limits: http.Limits,
     date: bool,
     plan: http.Planner,
+    log: Option[log.Logger],
 }
 
 /// 10,000 connections served at once, a queue of 64, 5 s idle, 10 s to read a request, 10 s to write a
 /// response, 1000 requests per connection, the default parser limits, `Date` headers, and no
 /// per-route plan (`cfg.plan = router.planner()` gives routes their own body limits, enforced
-/// before the body is read, and streamed request bodies: `http.Plan`).
+/// before the body is read, and streamed request bodies: `http.Plan`), and traps in handlers logged
+/// at error level to stderr (`None` turns that off; the 500 and `Stats.traps` stay).
 pub fn config() -> Config {
-    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan)
+    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan, Some(log.new(log.Error)))
 }
 
 fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) }
@@ -73,8 +89,9 @@ fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) 
 /// What a server did, counted over its life.
 /// `connections`: accepted and handed to a worker; `rejected`: answered 503 because the
 /// queue was full; `requests`: handled; `bad`: refused by the parser; `timeouts`: a request
-/// that didn't arrive in time (408) or a response that couldn't be written in time.
-pub type Stats = { connections: i64, rejected: i64, requests: i64, bad: i64, timeouts: i64 }
+/// that didn't arrive in time (408) or a response that couldn't be written in time; `traps`:
+/// handlers (or response producers) that trapped and were contained (answered 500).
+pub type Stats = { connections: i64, rejected: i64, requests: i64, bad: i64, timeouts: i64, traps: i64 }
 
 type Shared = { stats: Stats, waiting: i64 }
 
@@ -103,6 +120,7 @@ fn bump(sh: sync.Lock[Shared], what: i32) {
         if what == 4 { t.stats.timeouts += 1 }
         if what == 5 { t.waiting += 1 }
         if what == 6 { t.waiting -= 1 }
+        if what == 7 { t.stats.traps += 1 }
     })
 }
 
@@ -137,7 +155,7 @@ impl Server {
             poll.wake(sw)
             0
         })
-        let sh = sync.lock(Shared(Stats(0, 0, 0, 0, 0), 0))
+        let sh = sync.lock(Shared(Stats(0, 0, 0, 0, 0, 0), 0))
         // `workers` slots: a connection holds one while it is served
         let slots: chan.Channel[bool] = chan.bounded(cfg.workers)
         for i in 0..cfg.workers { let z = slots.try_send(true) }
@@ -294,6 +312,30 @@ fn refuse(c: i32, status: i32, cfg: Config) uses net, io, clock {
     }
 }
 
+fn log_trap(cfg: Config, method: List[u8], path: List[u8], why: String) uses io, clock {
+    match cfg.log {
+        Some(lg) => lg.error("handler trapped", middleware.trap_fields(method, path, why))
+        None => {}
+    }
+}
+
+/// What a guarded call gave: the response, and whether a trap was contained to make it.
+type Answer = { resp: http.Response, trapped: bool }
+
+/// Calls `h` with a trap contained: a trap is a 500 with the standard text, logged and counted.
+fn guarded(h: http.Handler, req: http.Request, cfg: Config, sh: sync.Lock[Shared]) -> Answer uses io, clock {
+    let method = req.method.copy()
+    let path = req.path.copy()
+    match task.catch(|| -> http.Response { h(req) }) {
+        Ok(r) => Answer(r, false)
+        Err(why) => {
+            bump(sh, 7)
+            log_trap(cfg, method, path, why)
+            Answer(http.error_response(500), true)
+        }
+    }
+}
+
 fn is_head(m: List[u8]) -> bool { m.len() == 4 && m[0] == 72 && m[1] == 69 && m[2] == 65 && m[3] == 68 }
 
 /// The parser of a connection while a handler reads a streamed request body through it.
@@ -374,7 +416,7 @@ fn closed_err() -> stream.Error { stream.error(stream.BrokenPipe, "the connectio
 /// connection. Returns what ends the connection (0 keep serving, 1 lingering close, 2 close now).
 /// `left` is what the parser read beyond the request (for an upgrade: the first bytes the
 /// client sent after its handshake).
-fn run_stream(c: i32, watch: sync.Lock[bool], resp: http.Response, stm: http.Stream, keep: bool, left: List[u8], cfg: Config, stop: poll.Waker) -> i32 uses net, io, clock {
+fn run_stream(c: i32, watch: sync.Lock[bool], resp: http.Response, stm: http.Stream, keep: bool, left: List[u8], cfg: Config, stop: poll.Waker, sh: sync.Lock[Shared], method: List[u8], path: List[u8]) -> i32 uses net, io, clock {
     let head = match http.write_stream_head(resp, stm.raw, keep, date_of(cfg)) {
         Ok(b) => b
         Err(e) => { return 2 }
@@ -419,7 +461,16 @@ fn run_stream(c: i32, watch: sync.Lock[bool], resp: http.Response, stm: http.Str
     }
     let stopping = || -> bool { stop_signalled(stop) }
     let run = stm.run
-    run(http.Duplex(recv, send, stopping))
+    let dx = http.Duplex(recv, send, stopping)
+    match task.catch(|| -> () { run(dx) }) {
+        Ok(z) => {}
+        Err(why) => {
+            // the head is sent: the response can't become a 500, the connection is dropped
+            bump(sh, 7)
+            log_trap(cfg, method, path, why)
+            return 2
+        }
+    }
     if raw { return 1 }
     if !sock.send_by(c, sys.lit("0\r\n\r\n"), time.after(cfg.write_timeout)) { return 2 }
     if keep { return 0 }
@@ -545,6 +596,9 @@ fn serve_slot(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.W
         let mut req = parse.to_request(m)
         req.peer = peer
         let head_only = is_head(req.method)
+        let mut trapped = false
+        let call_method = req.method.copy()
+        let call_path = req.path.copy()
         // `stopping` is what the last wait saw; the stop may have come after it, while the
         // rest of this request was read (a wait that saw only data, then a read that got the
         // bytes sent after the stop too), so the signal is checked again here: a request in
@@ -556,13 +610,24 @@ fn serve_slot(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.W
             // the body is read by the handler as it goes: the parser is shared with the reader
             let link = sync.lock(Link(parser.copy()))
             req.stream = Some(http.Body(body_pull(link, c, watch, cfg, stop)))
-            resp = h(req)
-            // what the handler left unread is read and dropped; a body that can't be finished
-            // ends the connection after the response
-            if !drain_body(link, c, watch, cfg, stop) { keep = false }
-            parser = link.get().parser.copy()
+            let ans = guarded(h, req, cfg, sh)
+            resp = ans.resp
+            trapped = ans.trapped
+            if trapped {
+                // the handler may have died holding the body's lock (it would never come
+                // back): the body is not drained and the connection closes after the 500
+                keep = false
+            } else {
+                // what the handler left unread is read and dropped; a body that can't be
+                // finished ends the connection after the response
+                if !drain_body(link, c, watch, cfg, stop) { keep = false }
+                parser = link.get().parser.copy()
+            }
         } else {
-            resp = h(req)
+            let ans = guarded(h, req, cfg, sh)
+            resp = ans.resp
+            trapped = ans.trapped
+            if trapped { keep = false }
         }
         match resp.stream {
             Some(stm) => {
@@ -573,7 +638,7 @@ fn serve_slot(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.W
                     resp = hr
                 } else {
                     let left = bytes.slice(parser.buf, parser.pos, parser.buf.len())
-                    end = run_stream(c, watch, resp, stm, keep, left, cfg, stop)
+                    end = run_stream(c, watch, resp, stm, keep, left, cfg, stop, sh, call_method, call_path)
                     if end == 0 { resp.keep_alive = true }
                     if end != 0 { break }
                     continue

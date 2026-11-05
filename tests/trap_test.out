@@ -1,0 +1,43 @@
+-- a trap is a 500
+500 content-type=text/plain; charset=utf-8 content-length=26 connection=close | 500 Internal Server Error
+
+500 content-type=text/plain; charset=utf-8 content-length=26 connection=close | 500 Internal Server Error
+
+500 content-type=text/plain; charset=utf-8 content-length=26 connection=close | 500 Internal Server Error
+
+200 content-type=text/plain; charset=utf-8 content-length=5 connection=close | hello
+200 content-type=text/plain; charset=utf-8 content-length=5 | hello
+200 content-type=text/plain; charset=utf-8 content-length=5 | hello
+true
+500 content-type=text/plain; charset=utf-8 content-length=26 connection=close | 500 Internal Server Error
+
+false
+true
+true
+false
+-- nothing of the trap reaches the client
+false
+false
+false
+false
+-- a trap while a streamed body is half read
+true
+true
+-- a trap in a streamed response's producer
+true
+true
+false
+-- the same many times, mixed with good requests
+40
+40
+48
+91
+-- recover
+500
+false
+false
+200
+true
+true
+-- the log record
+{"time":"1970-01-01T00:00:00.000Z","level":"error","msg":"handler trapped","method":"GET","path":"/a\"b\nc�","trap":"boom (x.ei:1)"}

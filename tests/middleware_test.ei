@@ -184,6 +184,16 @@ fn main() uses io, clock, threads {
     gate.send(1)
     // the late handler ends now; the pool serves the next one
     show(t_fast(get("/")))
+    // a handler that traps on a worker: 500 at once, the worker and the pool go on
+    let boom = |q: http.Request| -> http.Response {
+        panic("secret internal state")
+        http.text(200, "unreachable")
+    }
+    let t_boom = middleware.timeout(time.seconds(10), pool, boom)
+    let tb = t_boom(get("/"))
+    show(tb)
+    print(tb.keep_alive)
+    show(t_fast(get("/")))
     pool.shutdown()
 
     print("-- cors")

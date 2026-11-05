@@ -30,7 +30,7 @@ fn main() uses io, net, clock, threads {
 | `http/server` | `listen`, `Server.serve(handler, token)`: a task per connection, deadlines, graceful shutdown |
 | `http/client` | `connect`, `Conn.request`, `fetch`, `get`, `post` |
 | `http/router` | method and path patterns with parameters, 404 and 405 |
-| `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` |
+| `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `std/log` Logger), `errors`, `problems`, `recover`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` |
 | `http/metrics` | counters, an in-flight gauge and a latency histogram (Prometheus text), optionally per route |
 | `http/sse` | server-sent events |
 | `http/ws` | WebSockets (RFC 6455) with limits, a codec and a test client |
