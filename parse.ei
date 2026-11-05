@@ -17,7 +17,8 @@
 //! - request smuggling: Content-Length together with Transfer-Encoding, two Content-Length
 //!   fields (even equal ones), two Transfer-Encoding fields, a Content-Length that isn't
 //!   only digits, Transfer-Encoding in HTTP/1.0, or a final coding other than chunked are
-//!   400; codings besides chunked are 501; an HTTP/1.1 request needs exactly one Host;
+//!   400; codings besides chunked are 501 (except one of gzip, deflate or zstd in front of it,
+//!   which http/server decodes: `Transfer-Encoding: gzip, chunked`); an HTTP/1.1 request needs exactly one Host;
 //! - chunk sizes are hex with no sign or space (at most 15 digits), chunk extensions are
 //!   checked for control characters, a chunk must end in CRLF, and trailers are checked
 //!   like headers (and then dropped);
@@ -508,6 +509,14 @@ fn status_line(inout p: Parser, line: List[u8]) -> Option[Step] {
     None
 }
 
+/// The codings http/compress decodes (gzip, x-gzip, deflate, zstd).
+fn known_coding(c: List[u8]) -> bool {
+    for n in ["gzip", "x-gzip", "deflate", "zstd"] {
+        if http.eq_ci(c, sys.lit(n)) { return true }
+    }
+    false
+}
+
 fn framing(inout p: Parser) -> Option[Step] {
     let hs = p.m.headers
     let te_n = http.count(hs, sys.lit("transfer-encoding"))
@@ -553,7 +562,8 @@ fn framing(inout p: Parser) -> Option[Step] {
             }
             return Some(fail(inout p, 400, "the final transfer coding is not chunked"))
         }
-        if n > 1 { return Some(fail(inout p, 501, "transfer codings other than chunked are not supported")) }
+        // one content coding that http/compress decodes may precede `chunked` (`gzip, chunked`)
+        if n > 2 || (n == 2 && !known_coding(codings[0])) { return Some(fail(inout p, 501, "transfer codings other than chunked are not supported")) }
         p.phase = CHUNK_SIZE
         expect(inout p)
         return stream_head(inout p)

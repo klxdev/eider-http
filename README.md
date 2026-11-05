@@ -2,7 +2,7 @@
 
 HTTP/1.1 for [Eider](https://github.com/klxdev/eider-lang): a strict incremental parser, a
 server with deadlines, back-pressure and graceful shutdown, a blocking client, a router,
-middleware (request ids, access logs, errors as problem+json, traps as 500s, rate limiting, forwarded client addresses, body limits and timeouts per
+middleware (request ids, access logs, compression, errors as problem+json, traps as 500s, rate limiting, forwarded client addresses, body limits and timeouts per
 route, CORS, bearer and Basic authentication), Prometheus metrics, and the profiler's
 labels and debugging endpoints.
 
@@ -31,7 +31,8 @@ fn main() uses io, net, clock, threads {
 | `http/client` | `connect`, `Conn.request`, `fetch`, `get`, `post` |
 | `http/router` | method and path patterns with parameters, 404 and 405 |
 | `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `logging` Logger), `errors`, `problems`, `recover`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `chain` |
-| `http/static` | static files from a directory (`static.mount`): media types, ETag, cache rules, index, SPA fallback, path-traversal checks |
+| `http/compress` | `Content-Encoding`: response compression (gzip, deflate, opt-in zstd; `Accept-Encoding` q-values, allow-list, size floor, streamed bodies) and request decoding with hard limits (413 on a bomb, 415, 400) |
+| `http/static` | static files from a directory (`static.mount`): media types, ETag, cache rules, index, SPA fallback, path-traversal checks, precompressed `.gz` siblings |
 | `http/health` | liveness and readiness endpoints, the drain flag |
 | `http/service` | production defaults in one call (probes, `/metrics`, request ids, rate limit, trusted proxies, traps as 500s) and a serve loop that drains on SIGTERM |
 | `http/proxy` | the client address behind trusted proxies (`X-Forwarded-For`, `Forwarded`): an allow-list of proxy ranges, nothing trusted by default |
@@ -50,6 +51,14 @@ known gaps. JSON-RPC 2.0 over this package is
 [eider-rpc](https://github.com/klxdev/eider-rpc); OpenAPI 3.1 services are
 [eider-openapi](https://github.com/klxdev/eider-openapi). eider-lang's site has the
 step-by-step guide ("Building services").
+
+Compression is [eider-compression](https://github.com/klxdev/eider-compression) (a git
+dependency, granted `io` and `clock` in this package's eider.toml). `compress.responses(compress.options(), h)`
+compresses allow-listed responses (text, JSON, XML, JavaScript, SVG; at least 1 KiB) when the client
+accepts gzip or deflate, `compress.requests(compression.limit_output(1048576), h)` decodes
+`Content-Encoding` request bodies, and the server decodes `Transfer-Encoding: gzip, chunked` itself;
+`http/service` has both on by default (docs/services.md "Compression"; read its BREACH note).
+`client.Conn.with_decoding(limits)` asks for and decodes compressed responses.
 
 ## Using it
 
@@ -99,7 +108,7 @@ MAJOR.MINOR (the `eider` field of `eider.toml`), else they stop with exit 2 and 
 release to use. eiderc and eider-pkg run through `eider` (`eider eiderc ...`, `eider eider-pkg
 ...`, with that toolchain), or directly when `eider` is not on the PATH.
 
-The dependency, eider-json, is a git package. To build offline or against a checkout with
+The dependencies, eider-json, eider-logging and eider-compression, are git packages. To build offline or against a checkout with
 uncommitted changes, eider-pkg's `EIDER_PKG_OVERRIDE=json=<dir>` takes it from a local
 directory; `scripts/env.sh` sets it for you to `$EIDER_JSON`, else `../eider-json` when that
 checkout exists, else the pinned release `.vendor/json` of an eider-lang checkout used as the toolchain

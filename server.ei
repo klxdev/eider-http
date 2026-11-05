@@ -20,7 +20,8 @@
 //!   for sending one response (then the connection is dropped). `max_requests` per
 //!   connection, then `Connection: close`.
 //! - Errors in a request are answered with the parser's status (400, 413, 414, 431, 501,
-//!   505) and the connection is closed: after a framing error the next request can't be
+//!   505; 501 for a transfer coding other than chunked, except one gzip, deflate or zstd before
+//!   chunked, which is decoded with hard limits: `Config.decode_max`) and the connection is closed: after a framing error the next request can't be
 //!   found safely. Closing after a response half-closes and drains what the client still
 //!   sends for a moment (a lingering close), so the client reads the response instead of a
 //!   reset.
@@ -62,6 +63,8 @@ import http.parse
 import http.sock
 import http.middleware
 import http.metrics
+import http.compress
+import compression
 
 pub type Config = {
     workers: usize,
@@ -74,15 +77,20 @@ pub type Config = {
     date: bool,
     plan: http.Planner,
     log: Option[logging.Logger],
+    decode_max: usize,
 }
 
 /// 10,000 connections served at once, a queue of 64, 5 s idle, 10 s to read a request, 10 s to write a
 /// response, 1000 requests per connection, the default parser limits, `Date` headers, and no
 /// per-route plan (`cfg.plan = router.planner()` gives routes their own body limits, enforced
 /// before the body is read, and streamed request bodies: `http.Plan`), and traps in handlers logged
-/// at error level to stderr (`None` turns that off; the 500 and `Stats.traps` stay).
+/// at error level to stderr (`None` turns that off; the 500 and `Stats.traps` stay). A request body
+/// with a transfer coding (`Transfer-Encoding: gzip, chunked`) is decoded (gzip, deflate or zstd;
+/// http/compress) to at most `decode_max` bytes (0: the route's body limit, `Plan.max_body` or
+/// `limits.max_body`) and at most 1100 times its size: 413 when it goes over, 400 when the data is
+/// corrupt or cut short; other codings are 501.
 pub fn config() -> Config {
-    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan, Some(logging.new(logging.Error)))
+    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan, Some(logging.new(logging.Error)), 0)
 }
 
 fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) }
@@ -364,6 +372,18 @@ fn guarded(h: http.Handler, req: http.Request, cfg: Config, sh: sync.Lock[Shared
     }
 }
 
+/// The limits for decoding a request's transfer coding: the route's body limit unless
+/// `Config.decode_max` says another.
+fn decode_limits(cfg: Config, req: http.Request) -> compression.Limits {
+    let mut n = cfg.decode_max.copy()
+    if n == 0 {
+        let pl = cfg.plan
+        n = pl(req.method, req.path).max_body
+        if n == 0 { n = cfg.limits.max_body }
+    }
+    compression.limit_output(n as u64)
+}
+
 fn is_head(m: List[u8]) -> bool { m.len() == 4 && m[0] == 72 && m[1] == 69 && m[2] == 65 && m[3] == 68 }
 
 /// The parser of a connection while a handler reads a streamed request body through it.
@@ -634,7 +654,19 @@ fn serve_slot(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.W
         if !stopping && stop_signalled(stop) { stopping = true }
         let mut keep = req.keep_alive && served < cfg.max_requests && !stopping && waiting(sh) == 0
         let mut resp = http.response(500)
-        if streaming_req {
+        // a transfer coding (`gzip, chunked`) is undone before the handler sees the request
+        let mut refused: Option[http.Response] = None
+        match compress.decode_request(req, true, decode_limits(cfg, req)) {
+            Ok(r) => { req = r }
+            Err(r) => {
+                refused = Some(r)
+                bump(sh, 3)
+            }
+        }
+        if refused.is_some() {
+            resp = refused.unwrap()
+            keep = false
+        } else if streaming_req {
             // the body is read by the handler as it goes: the parser is shared with the reader
             let link = sync.lock(Link(parser.copy()))
             req.stream = Some(http.Body(body_pull(link, c, watch, cfg, stop)))

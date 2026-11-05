@@ -30,6 +30,8 @@ done GET /after-empty-lines v11 keep [host=a] body=
 done GET /1 v11 keep [host=a] body=
 done POST /2 v11 keep [host=a] [content-length=3] body=abc
 done GET /3 v11 keep [host=a] body=
+> POST /z HTTP/1.1\nHost: a\nTransfer-Encoding: gzip, chunked\n\n3\nabc\n0\n\n
+done POST /z v11 keep [host=a] [transfer-encoding=gzip, chunked] body=abc
 > POST /c HTTP/1.1\nHost: a\nTransfer-Encoding: chunked\n\n3\nabc\n0\n\nGET /next HTTP/1.1\nHost: a\n\n
 done POST /c v11 keep [host=a] [transfer-encoding=chunked] body=abc
 done GET /next v11 keep [host=a] body=
@@ -146,8 +148,12 @@ bad 400 more than one Transfer-Encoding
 bad 400 the final transfer coding is not chunked
 > POST / HTTP/1.1\nHost: a\nTransfer-Encoding: chunked, gzip\n\n0\n\n
 bad 400 the final transfer coding is not chunked
-> POST / HTTP/1.1\nHost: a\nTransfer-Encoding: gzip, chunked\n\n0\n\n
+> POST / HTTP/1.1\nHost: a\nTransfer-Encoding: br, chunked\n\n0\n\n
 bad 501 transfer codings other than chunked are not supported
+> POST / HTTP/1.1\nHost: a\nTransfer-Encoding: gzip, gzip, chunked\n\n0\n\n
+bad 501 transfer codings other than chunked are not supported
+> POST / HTTP/1.1\nHost: a\nTransfer-Encoding: gzip, deflate\n\n0\n\n
+bad 400 the final transfer coding is not chunked
 > POST / HTTP/1.1\nHost: a\nTransfer-Encoding: xchunked\n\n0\n\n
 bad 400 the final transfer coding is not chunked
 > POST / HTTP/1.1\nHost: a\nTransfer-Encoding:\n\n0\n\n

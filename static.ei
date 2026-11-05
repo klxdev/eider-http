@@ -18,6 +18,9 @@
 //! - A directory serves its `index.html` (`Options.index`); with no index, or for any listing, 404:
 //!   directories are never listed. `/dir` (no trailing slash) is redirected to `/dir/` (301,
 //!   Location built from the validated request path).
+//! - Precompressed files (`with_precompressed()`): a client that accepts gzip gets `name.gz` for
+//!   `name` when both exist, as `Content-Encoding: gzip` with the file's `Content-Type`, its own
+//!   ETag and `Vary: Accept-Encoding`; the sibling passes the same root and symlink checks.
 //! - SPA fallback (`with_spa(file)`): a GET for a missing path whose last segment has no extension
 //!   serves that one file with 200 (the file is fixed at construction, never taken from the
 //!   request); a missing `/app.js` is still 404.
@@ -44,6 +47,8 @@ import std.fs
 import std.utf8
 import http
 import http.router
+import http.compress
+import compression.codec as codec
 
 /// Settings; `options()` has the defaults.
 pub type Options = {
@@ -53,36 +58,47 @@ pub type Options = {
     max_size: usize,
     hashed_cache: List[u8],
     other_cache: List[u8],
+    precompressed: bool,
 }
 
 /// `index.html`, no SPA fallback, no dot files, 16 MiB, hashed names cached for a year
 /// (`immutable`), the rest revalidated (`no-cache`).
 pub fn options() -> Options {
-    Options(sys.lit("index.html"), None, false, 16777216, sys.lit("public, max-age=31536000, immutable"), sys.lit("no-cache"))
+    Options(sys.lit("index.html"), None, false, 16777216, sys.lit("public, max-age=31536000, immutable"), sys.lit("no-cache"), false)
 }
 
 impl Options {
     /// The file served (200) for a missing path without an extension, relative to the root.
     fn with_spa(self, file: str) -> Options {
-        Options(self.index, Some(sys.lit(file)), self.well_known, self.max_size, self.hashed_cache, self.other_cache)
+        Options(self.index, Some(sys.lit(file)), self.well_known, self.max_size, self.hashed_cache, self.other_cache, self.precompressed)
+    }
+
+    /// Serves a `.gz` sibling instead of a file (`app.js.gz` for `app.js`) to a client whose
+    /// `Accept-Encoding` allows gzip: `Content-Encoding: gzip`, the file's own `Content-Type`, an
+    /// ETag of the gzip bytes, `Vary: Accept-Encoding`. The sibling is found, checked and read like
+    /// any file (inside the root, regular, `max_size`); the original must exist too. Nothing is
+    /// compressed here: `scripts` that build the site write the `.gz` files (use
+    /// `compress.responses` for compressing on the fly).
+    fn with_precompressed(self) -> Options {
+        Options(self.index, self.spa, self.well_known, self.max_size, self.hashed_cache, self.other_cache, true)
     }
 
     /// Serves `/.well-known/...` (and only that dot directory).
     fn with_well_known(self) -> Options {
-        Options(self.index, self.spa, true, self.max_size, self.hashed_cache, self.other_cache)
+        Options(self.index, self.spa, true, self.max_size, self.hashed_cache, self.other_cache, self.precompressed)
     }
 
     fn with_index(self, name: str) -> Options {
-        Options(sys.lit(name), self.spa, self.well_known, self.max_size, self.hashed_cache, self.other_cache)
+        Options(sys.lit(name), self.spa, self.well_known, self.max_size, self.hashed_cache, self.other_cache, self.precompressed)
     }
 
     fn with_max_size(self, n: usize) -> Options {
-        Options(self.index, self.spa, self.well_known, n, self.hashed_cache, self.other_cache)
+        Options(self.index, self.spa, self.well_known, n, self.hashed_cache, self.other_cache, self.precompressed)
     }
 
     /// The `Cache-Control` values of hashed files and of the others.
     fn with_cache(self, hashed: str, other: str) -> Options {
-        Options(self.index, self.spa, self.well_known, self.max_size, sys.lit(hashed), sys.lit(other))
+        Options(self.index, self.spa, self.well_known, self.max_size, sys.lit(hashed), sys.lit(other), self.precompressed)
     }
 }
 
@@ -271,7 +287,32 @@ fn read_file(d: Dir, canon: List[u8]) -> Option[List[u8]] uses fs {
 
 fn not_found() -> http.Response { http.error_response(404) }
 
-fn file_response(d: Dir, req: http.Request, name: List[u8], data: List[u8]) -> http.Response {
+/// The gzip sibling of the file at `canon` when `with_precompressed` is on, the client allows gzip
+/// and the sibling is a regular file inside the root.
+fn gz_sibling(d: Dir, req: http.Request, canon: List[u8]) -> Option[List[u8]] uses fs {
+    if !d.opts.precompressed { return None }
+    match codec.negotiate(compress.joined(req.headers, "accept-encoding"), List[codec.Gzip]) {
+        Some(f) => {}
+        None => { return None }
+    }
+    let c = match fs.canonical(bytes.concat(canon, sys.lit(".gz"))) {
+        Ok(x) => x
+        Err(e) => { return None }
+    }
+    if !inside(d, c) { return None }
+    read_file(d, c)
+}
+
+/// The response for the file `canon` (read as `data`): the gzip sibling when there is one to send.
+fn serve_file(d: Dir, req: http.Request, name: List[u8], canon: List[u8], data: List[u8]) -> http.Response uses fs {
+    file_response(d, req, name, data, gz_sibling(d, req, canon))
+}
+
+fn file_response(d: Dir, req: http.Request, name: List[u8], plain: List[u8], gz: Option[List[u8]]) -> http.Response {
+    let data = match gz {
+        Some(g) => g
+        None => plain
+    }
     let tag = etag(data)
     let cache = if is_hashed(name) { d.opts.hashed_cache } else { d.opts.other_cache }
     let mut r = http.response(200)
@@ -284,6 +325,8 @@ fn file_response(d: Dir, req: http.Request, name: List[u8], data: List[u8]) -> h
     r.set_header("ETag", tag)
     r.set_header("Cache-Control", cache)
     r.set_header("X-Content-Type-Options", sys.lit("nosniff"))
+    if d.opts.precompressed { r.set_header("Vary", sys.lit("Accept-Encoding")) }
+    if gz.is_some() { r.set_header("Content-Encoding", sys.lit("gzip")) }
     if r.status == 304 { return r }
     r.set_header("Content-Type", media_type(name))
     r.body = data
@@ -320,13 +363,13 @@ impl Dir {
                         }
                         if !inside(d, ic) { return not_found() }
                         match read_file(d, ic) {
-                            Some(data) => { return file_response(d, req, d.opts.index, data) }
+                            Some(data) => { return serve_file(d, req, d.opts.index, ic, data) }
                             None => { return not_found() }
                         }
                     }
                     if wants_dir { return not_found() }
                     match read_file(d, canon) {
-                        Some(data) => file_response(d, req, segs[segs.len() - 1], data)
+                        Some(data) => serve_file(d, req, segs[segs.len() - 1], canon, data)
                         None => not_found()
                     }
                 }
@@ -363,7 +406,7 @@ fn spa(d: Dir, req: http.Request, segs: List[List[u8]]) -> http.Response uses fs
             match locate(d, fsegs) {
                 Some(c) => {
                     match read_file(d, c) {
-                        Some(data) => file_response(d, req, f, data)
+                        Some(data) => serve_file(d, req, f, c, data)
                         None => not_found()
                     }
                 }

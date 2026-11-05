@@ -15,3 +15,11 @@ version = "0.7.0"
 git = "https://github.com/klxdev/eider-logging.git"
 version = "0.7.0"
 uses = ["io", "clock"]
+
+# Content-Encoding: gzip, deflate and zstd, with hard decompression limits (compress.ei,
+# server.ei, client.ei, static.ei); the codecs are pure, but compression.streams (not used here)
+# names io and clock, and eider-pkg grants per package, so both are granted
+[deps.compression]
+git = "https://github.com/klxdev/eider-compression.git"
+version = "0.7.0"
+uses = ["io", "clock"]

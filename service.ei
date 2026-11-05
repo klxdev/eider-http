@@ -10,9 +10,11 @@
 //!   request ids (`X-Request-Id`)  >  client address behind trusted proxies (`http/proxy`, nothing
 //!   trusted unless `with_trust`)  >  one access-log record per request (`o.logger`)  >  metrics
 //!   (`http_requests_total`... with the route, the server's and the rate limiter's counters)  >
-//!   errors as problem+json (`middleware.problems`: 404, 405, 429, 500...)  >  rate limiting per client
+//!   errors as problem+json (`middleware.problems`: 404, 405, 429, 500...)  >  response compression
+//!   (`http/compress`, on for the allow-listed types, see below)  >  rate limiting per client
 //!   address (`o.limit`; `/healthz`, `/readyz` and `/metrics` are exempt)  >  trap -> 500
-//!   (`middleware.recover`)  >  the router.
+//!   (`middleware.recover`)  >  request decoding (`Content-Encoding` gzip, deflate, zstd; hard
+//!   limits)  >  the router.
 //! It also mounts `GET /healthz`, `GET /readyz` (`http/health`, with `o.health`'s checks), `GET
 //! /metrics`, and, only when `o.profiling.enabled`, the profiler's endpoints (`http/profiling`);
 //! with `--profile` the routes are labelled for `eider-profiler report --by route`.
@@ -21,6 +23,19 @@
 //! address (`ratelimit`), generous against abuse, not against traffic. Behind a load balancer the
 //! address is the balancer's unless you say which proxies to trust (`with_trust`): until then every
 //! client shares one bucket. `no_rate_limit()` turns it off, `with_limit` sets another limiter.
+//!
+//! **Compression is on in both directions.** Responses: gzip or deflate (what the client
+//! accepts) for text, JSON, XML, JavaScript and SVG bodies of at least 1 KiB, with `Vary:
+//! Accept-Encoding` and weak ETags; `no_compression()` turns it off, `with_compression(o)` sets
+//! another `compress.Options`, `compress.never(resp)` exempts one response. Compression of a body
+//! that mixes a secret with reflected input leaks the secret (BREACH, http/compress): such
+//! responses must be exempted or masked. Requests: a body with `Content-Encoding` is decoded
+//! before the handler, to at most the server's `limits.max_body` (`with_request_decoding(n)` for
+//! another cap; `no_request_decoding()` hands the bytes over as they came): a bomb is 413, an
+//! unsupported coding 415, corrupt data 400. Decoding is on because it is bounded by hard limits
+//! and replaces handlers that would otherwise have been given compressed bytes they cannot use;
+//! response compression is on because it is what clients expect from a production service and the
+//! risk is confined to bodies that reflect input next to secrets.
 //!
 //! **Draining** (`serve`, `run`): when the stop token is cancelled (`run`: SIGTERM or SIGINT,
 //! std/service), readiness turns 503 at once (the balancer stops sending), the server goes on
@@ -44,6 +59,8 @@ import http.health
 import http.proxy
 import http.ratelimit
 import http.profiling
+import http.compress
+import compression
 
 /// The settings. All have defaults (`options()`); `with_...` returns a changed copy.
 pub type Options = {
@@ -55,6 +72,8 @@ pub type Options = {
     profiling: profiling.Options,
     server: server.Config,
     drain_delay: time.Duration,
+    compress: Option[compress.Options],
+    decode: Option[usize],
 }
 
 /// The defaults of the module comment: info-level access logs and trap logs to stderr, metrics by route, nothing
@@ -64,50 +83,71 @@ pub fn options() -> Options {
     let lg = logging.new(logging.Info)
     let mut cfg = server.config()
     cfg.log = Some(lg)
-    Options(health.new(), metrics.by_route(metrics.new()), Some(lg), proxy.trust_none(), Some(ratelimit.new(1000, time.seconds(1), 2000)), profiling.options(), cfg, time.seconds(5))
+    Options(health.new(), metrics.by_route(metrics.new()), Some(lg), proxy.trust_none(), Some(ratelimit.new(1000, time.seconds(1), 2000)), profiling.options(), cfg, time.seconds(5), Some(compress.options()), Some(0))
 }
 
 impl Options {
     fn with_trust(self, t: proxy.Trust) -> Options {
-        Options(self.health, self.metrics, self.logger, t, self.limit, self.profiling, self.server, self.drain_delay)
+        Options(self.health, self.metrics, self.logger, t, self.limit, self.profiling, self.server, self.drain_delay, self.compress, self.decode)
     }
 
     fn with_limit(self, l: ratelimit.Limiter) -> Options {
-        Options(self.health, self.metrics, self.logger, self.trust, Some(l), self.profiling, self.server, self.drain_delay)
+        Options(self.health, self.metrics, self.logger, self.trust, Some(l), self.profiling, self.server, self.drain_delay, self.compress, self.decode)
     }
 
     fn no_rate_limit(self) -> Options {
-        Options(self.health, self.metrics, self.logger, self.trust, None, self.profiling, self.server, self.drain_delay)
+        Options(self.health, self.metrics, self.logger, self.trust, None, self.profiling, self.server, self.drain_delay, self.compress, self.decode)
     }
 
     fn with_health(self, h: health.Health) -> Options {
-        Options(h, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, self.drain_delay)
+        Options(h, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, self.drain_delay, self.compress, self.decode)
     }
 
     /// Logs access records and traps to `lg`.
     fn with_logger(self, lg: logging.Logger) -> Options {
         let mut c = self.server.copy()
         c.log = Some(lg)
-        Options(self.health, self.metrics, Some(lg), self.trust, self.limit, self.profiling, c, self.drain_delay)
+        Options(self.health, self.metrics, Some(lg), self.trust, self.limit, self.profiling, c, self.drain_delay, self.compress, self.decode)
     }
 
     /// No access log and no trap log (the metrics still count everything).
     fn without_logs(self) -> Options {
         let mut c = self.server.copy()
         c.log = None
-        Options(self.health, self.metrics, None, self.trust, self.limit, self.profiling, c, self.drain_delay)
+        Options(self.health, self.metrics, None, self.trust, self.limit, self.profiling, c, self.drain_delay, self.compress, self.decode)
     }
 
     fn with_drain_delay(self, d: time.Duration) -> Options {
-        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, d)
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, d, self.compress, self.decode)
     }
 
     fn with_server(self, c: server.Config) -> Options {
-        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, c, self.drain_delay)
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, c, self.drain_delay, self.compress, self.decode)
+    }
+
+    /// Compresses responses with `c` (`compress.options()` is the default).
+    fn with_compression(self, c: compress.Options) -> Options {
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, self.drain_delay, Some(c), self.decode)
+    }
+
+    /// No response compression (see the BREACH note in http/compress).
+    fn no_compression(self) -> Options {
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, self.drain_delay, None, self.decode)
+    }
+
+    /// Decodes request bodies with a `Content-Encoding` to at most `max` bytes (the server's
+    /// `limits.max_body` when `max` is 0; a route with a larger body limit needs a larger `max`).
+    fn with_request_decoding(self, max: usize) -> Options {
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, self.drain_delay, self.compress, Some(max))
+    }
+
+    /// Request bodies are handed to the handlers as they arrived, `Content-Encoding` and all.
+    fn no_request_decoding(self) -> Options {
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, self.drain_delay, self.compress, None)
     }
 
     fn with_profiling(self, p: profiling.Options) -> Options {
-        Options(self.health, self.metrics, self.logger, self.trust, self.limit, p, self.server, self.drain_delay)
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, p, self.server, self.drain_delay, self.compress, self.decode)
     }
 }
 
@@ -122,7 +162,15 @@ pub fn handler(r: router.Router, o: Options) -> http.Handler uses io, clock, fs 
     o.health.mount(inout rt)
     profiling.label_routes(inout rt)
     profiling.mount(inout rt, o.profiling)
-    var h = middleware.recover(o.logger, router.handler(rt))
+    var inner = router.handler(rt)
+    match o.decode {
+        Some(n) => {
+            let cap = if n == 0 { o.server.limits.max_body } else { n }
+            inner = compress.requests(compression.limit_output(cap as u64), inner)
+        }
+        None => {}
+    }
+    var h = middleware.recover(o.logger, inner)
     match o.limit {
         Some(l) => {
             let lim = l.except(exempt)
@@ -132,6 +180,10 @@ pub fn handler(r: router.Router, o: Options) -> http.Handler uses io, clock, fs 
         None => {}
     }
     h = middleware.problems(h)
+    match o.compress {
+        Some(c) => { h = compress.responses(c, h) }
+        None => {}
+    }
     h = o.metrics.wrap(h)
     match o.logger {
         Some(lg) => { h = middleware.access_log_with(lg, h) }

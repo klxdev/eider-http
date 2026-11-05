@@ -1,0 +1,837 @@
+// http/compress: response compression (negotiation with q-values, the allow-list, the size floor,
+// HEAD/204/304/206/Range/encoded/no-transform, ETags, Vary, streamed bodies), request decoding
+// (gzip, deflate, zstd; bombs 413, unsupported 415, corrupt and truncated 400, every truncation and
+// every flipped byte of a body), the server's `Transfer-Encoding: gzip, chunked`, the client's
+// decoding, http/service's defaults and http/static's precompressed files.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.fs
+import std.io
+import std.net
+import std.stream
+import std.sync
+import std.task
+import std.time
+import compression
+import compression.codec as codec
+import http
+import http.parse
+import http.client
+import http.compress
+import http.router
+import http.server
+import http.service
+import http.static
+import http.testing
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn text_body(n: usize) -> List[u8] {
+    let mut b: List[u8] = List.new()
+    let mut i: usize = 0
+    while b.len() < n {
+        bytes.append(inout b, lit("hello compression "))
+        bytes.append(inout b, bytes.from_u64(i as u64))
+        b.push(10)
+        i += 1
+    }
+    bytes.slice(b, 0, n)
+}
+
+// bytes that do not compress: an LCG
+fn noise(n: usize) -> List[u8] {
+    let mut b: List[u8] = List.new()
+    let mut x: u64 = 88172645
+    for i in 0..n {
+        x = (x * 1103515245 + 12345) % 2147483648
+        b.push(((x / 65536) % 251) as u8)
+    }
+    b
+}
+
+fn zeros(n: usize) -> List[u8] {
+    let mut b: List[u8] = List.new()
+    for i in 0..n { b.push(0) }
+    b
+}
+
+fn h(name: str, value: str) -> http.Header { http.Header(lit(name), lit(value)) }
+
+fn request(method: str, headers: List[http.Header], body: List[u8]) -> http.Request {
+    let mut r = http.request(method, lit("/x"))
+    for x in headers { r.headers.push(x) }
+    r.body = body
+    r
+}
+
+fn answering(ct: str, body: List[u8]) -> http.Response { http.respond(200, ct, body) }
+
+fn field(r: http.Response, name: str) -> String {
+    match r.header(name) {
+        Some(v) => sys.to_string(v)
+        None => String.from("-")
+    }
+}
+
+fn fields(r: http.Response, name: str) -> String {
+    let mut out = String.from("")
+    for x in r.headers {
+        if http.eq_ci(x.name, lit(name)) {
+            if out.len() > 0 { out.push_str("; ") }
+            out.append(sys.to_string(x.value))
+        }
+    }
+    if out.len() == 0 { return String.from("-") }
+    out
+}
+
+/// What a response looks like after the middleware: status, coding, Vary, ETag, whether the
+/// body round-trips to `plain`.
+fn show(label: str, r: http.Response, plain: List[u8]) uses io {
+    let mut l = String.from(label)
+    l.push_str(": ")
+    l.append(String.from_int(r.status as i64))
+    l.push_str(" ce=")
+    l.append(field(r, "content-encoding"))
+    l.push_str(" vary=")
+    l.append(fields(r, "vary"))
+    l.push_str(" etag=")
+    l.append(field(r, "etag"))
+    let ce = r.header("content-encoding")
+    match ce {
+        Some(name) => {
+            let f = codec.format_of(name).unwrap_or(codec.Identity)
+            if bytes.eq(name, lit("br")) {
+                l.push_str(" body untouched=")
+                l.append(String.from(if bytes.eq(r.body, plain) { "yes" } else { "NO" }))
+                io.outln(l.bytes())
+                return
+            }
+            match codec.decode(f, r.body, compression.limits()) {
+                Ok(back) => {
+                    l.push_str(" roundtrip=")
+                    l.append(String.from(if bytes.eq(back, plain) { "ok" } else { "DIFFERENT" }))
+                    l.push_str(" smaller=")
+                    l.append(String.from(if r.body.len() < plain.len() { "yes" } else { "NO" }))
+                }
+                Err(e) => {
+                    l.push_str(" decode failed: ")
+                    l.append(e.message.copy())
+                }
+            }
+        }
+        None => {
+            l.push_str(" identity=")
+            l.append(String.from(if bytes.eq(r.body, plain) { "ok" } else { "DIFFERENT" }))
+        }
+    }
+    io.outln(l.bytes())
+}
+
+fn run(o: compress.Options, req: http.Request, resp: http.Response) -> http.Response {
+    let hd = compress.responses(o, |q: http.Request| -> http.Response { resp })
+    hd(req)
+}
+
+fn ae(v: str) -> List[http.Header] { List[h("Accept-Encoding", v)] }
+
+fn responses_part() uses io {
+    print("-- negotiation")
+    let body = text_body(3000)
+    let o = compress.options()
+    for v in ["gzip", "deflate", "gzip, deflate", "deflate, gzip;q=0.5", "gzip;q=0, deflate;q=0.5", "gzip;q=0", "*", "*;q=0", "identity", "br, gzip", "br", "GZIP", "x-gzip", "gzip;q=0.001, deflate;q=0.002", "gzip;q=2", "zstd", ""] {
+        let r = run(o, request("GET", ae(v), List.new()), answering("text/plain", body))
+        show(v, r, body)
+    }
+    show("no Accept-Encoding", run(o, request("GET", List.new(), List.new()), answering("text/plain", body)), body)
+    let two = List[h("Accept-Encoding", "identity"), h("Accept-Encoding", "gzip")]
+    show("two fields", run(o, request("GET", two, List.new()), answering("text/plain", body)), body)
+
+    print("-- zstd")
+    let oz = compress.options().with_zstd(2)
+    show("zstd, gzip", run(oz, request("GET", ae("zstd, gzip"), List.new()), answering("text/plain", body)), body)
+    show("gzip, zstd", run(oz, request("GET", ae("gzip, zstd"), List.new()), answering("text/plain", body)), body)
+    show("gzip, zstd;q=0.1", run(oz, request("GET", ae("gzip, zstd;q=0.1"), List.new()), answering("text/plain", body)), body)
+    show("zstd;q=0, gzip", run(oz, request("GET", ae("zstd;q=0, gzip"), List.new()), answering("text/plain", body)), body)
+    show("zstd off by default", run(o, request("GET", ae("zstd"), List.new()), answering("text/plain", body)), body)
+
+    print("-- levels and the size floor")
+    for lv in [-5, 1, 9, 40] {
+        show("level", run(compress.options().with_level(lv), request("GET", ae("gzip"), List.new()), answering("text/plain", body)), body)
+    }
+    let b1023 = text_body(1023)
+    let b1024 = text_body(1024)
+    show("1023 bytes", run(o, request("GET", ae("gzip"), List.new()), answering("text/plain", b1023)), b1023)
+    show("1024 bytes", run(o, request("GET", ae("gzip"), List.new()), answering("text/plain", b1024)), b1024)
+    show("min_size 10", run(compress.options().with_min_size(10), request("GET", ae("gzip"), List.new()), answering("text/plain", text_body(50))), text_body(50))
+    let nz = noise(4000)
+    show("noise stays as it is", run(o, request("GET", ae("gzip"), List.new()), answering("text/plain", nz)), nz)
+
+    print("-- the allow-list")
+    for ct in ["text/html; charset=utf-8", "TEXT/CSS", "application/json", "application/problem+json", "application/ld+json; charset=utf-8", "application/xml", "application/atom+xml", "application/javascript", "image/svg+xml", "text/event-stream", "image/png", "application/octet-stream", "application/gzip", "application/wasm", "video/mp4", "application/jsonx"] {
+        show(ct, run(o, request("GET", ae("gzip"), List.new()), answering(ct, body)), body)
+    }
+    let none = compress.options().without_types()
+    show("empty list", run(none, request("GET", ae("gzip"), List.new()), answering("text/plain", body)), body)
+    show("custom type", run(none.with_type("application/wasm"), request("GET", ae("gzip"), List.new()), answering("application/wasm", body)), body)
+    show("custom pattern", run(none.with_type("model/*+json"), request("GET", ae("gzip"), List.new()), answering("model/x+json", body)), body)
+    let mut untyped = http.response(200)
+    untyped.body = body
+    show("no Content-Type", run(o, request("GET", ae("gzip"), List.new()), untyped), body)
+    print(compress.type_matches(lit("text/*"), lit("text/plain")))
+    print(compress.type_matches(lit("text/*"), lit("textx/plain")))
+    print(compress.type_matches(lit("a*b"), lit("ab")))
+    print(compress.type_matches(lit("a*b"), lit("a")))
+    print(compress.type_matches(lit("Application/JSON"), lit("application/json")))
+
+    print("-- what is never compressed")
+    let gz = ae("gzip")
+    show("HEAD", run(o, request("HEAD", gz, List.new()), answering("text/plain", body)), body)
+    show("Range request", run(o, request("GET", List[h("Accept-Encoding", "gzip"), h("Range", "bytes=0-9")], List.new()), answering("text/plain", body)), body)
+    let mut r204 = answering("text/plain", List.new())
+    r204.status = 204
+    show("204", run(o, request("GET", gz, List.new()), r204), List.new())
+    let mut r304 = answering("text/plain", body)
+    r304.status = 304
+    show("304", run(o, request("GET", gz, List.new()), r304), body)
+    let mut r206 = answering("text/plain", body)
+    r206.status = 206
+    show("206", run(o, request("GET", gz, List.new()), r206), body)
+    let mut rcr = answering("text/plain", body)
+    rcr.set_header("Content-Range", lit("bytes 0-99/100"))
+    show("Content-Range", run(o, request("GET", gz, List.new()), rcr), body)
+    let mut r101 = answering("text/plain", body)
+    r101.status = 101
+    show("101", run(o, request("GET", gz, List.new()), r101), body)
+    let mut already = answering("text/plain", body)
+    already.set_header("Content-Encoding", lit("br"))
+    show("already encoded", run(o, request("GET", gz, List.new()), already), body)
+    let mut ident = answering("text/plain", body)
+    ident.set_header("Content-Encoding", lit("identity"))
+    show("Content-Encoding: identity", run(o, request("GET", gz, List.new()), ident), body)
+    let mut nt = answering("text/plain", body)
+    nt.set_header("Cache-Control", lit("public, No-Transform"))
+    show("no-transform", run(o, request("GET", gz, List.new()), nt), body)
+    show("never()", run(o, request("GET", gz, List.new()), compress.never(answering("text/plain", body))), body)
+    let secret = compress.options().except(|q: http.Request, p: http.Response| -> bool { p.header("set-cookie").is_some() })
+    let mut sc = answering("text/plain", body)
+    sc.set_header("Set-Cookie", lit("sid=1"))
+    show("except(Set-Cookie)", run(secret, request("GET", gz, List.new()), sc), body)
+    show("except, no cookie", run(secret, request("GET", gz, List.new()), answering("text/plain", body)), body)
+
+    print("-- ETag and Vary")
+    let mut strong = answering("text/plain", body)
+    strong.set_header("ETag", lit("\"abc\""))
+    show("strong ETag", run(o, request("GET", gz, List.new()), strong), body)
+    let mut weak = answering("text/plain", body)
+    weak.set_header("ETag", lit("W/\"abc\""))
+    show("weak ETag", run(o, request("GET", gz, List.new()), weak), body)
+    let mut sv = answering("text/plain", body)
+    sv.set_header("Vary", lit("Origin"))
+    show("Vary: Origin", run(o, request("GET", gz, List.new()), sv), body)
+    let mut sv2 = answering("text/plain", body)
+    sv2.set_header("Vary", lit("origin, accept-encoding"))
+    show("Vary has it", run(o, request("GET", gz, List.new()), sv2), body)
+    let mut sv3 = answering("text/plain", body)
+    sv3.set_header("Vary", lit("*"))
+    show("Vary: *", run(o, request("GET", gz, List.new()), sv3), body)
+    let mut cl = answering("text/plain", body)
+    cl.set_header("Content-Length", bytes.from_u64(body.len() as u64))
+    let rcl = run(o, request("GET", gz, List.new()), cl)
+    print(field(rcl, "content-length"))
+    // the written message has the compressed length
+    let wire = http.write_response(rcl, false, true, List.new()).unwrap()
+    let parsed = parse_one(wire)
+    print(parsed.body.len() == rcl.body.len())
+}
+
+fn parse_one(wire: List[u8]) -> http.Response {
+    let mut p = parse.responses(http.limits())
+    p.feed(wire)
+    match p.next() {
+        parse.Done(m) => parse.to_response(m)
+        parse.More => http.response(0)
+        parse.Bad(st, why) => http.response(1)
+    }
+}
+
+// ---- streamed responses
+
+/// Runs a streamed response's producer against a recording Duplex: every `send`.
+fn sends_of(resp: http.Response) -> List[List[u8]] {
+    let none: List[List[u8]] = List.new()
+    let log = sync.lock(none)
+    let recv = |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] { Err(stream.error(stream.Unsupported, "no reading")) }
+    let send = |data: List[u8]| -> Result[(), stream.Error] {
+        log.modify(|inout l: List[List[u8]]| -> () { l.push(data) })
+        Ok(())
+    }
+    let stopping = || -> bool { false }
+    let run = resp.stream.unwrap().run
+    run(http.Duplex(recv, send, stopping))
+    log.get()
+}
+
+fn producer(pieces: List[List[u8]], ct: str) -> http.Response {
+    let mut r = http.response(200)
+    r.set_header("Content-Type", lit(ct))
+    r.stream = Some(http.Stream(|dx: http.Duplex| -> () {
+        for p in pieces {
+            let z = dx.write(p)
+        }
+    }, false))
+    r
+}
+
+fn cat(xs: List[List[u8]]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for x in xs { bytes.append(inout out, x) }
+    out
+}
+
+fn streams_part() uses io {
+    print("-- streamed responses")
+    let o = compress.options()
+    let mut pieces: List[List[u8]] = List.new()
+    for i in 0..(8 as i32) { pieces.push(text_body(20000 + (i as usize))) }
+    let plain = cat(pieces)
+    let r = run(o, request("GET", ae("gzip"), List.new()), producer(pieces, "text/plain"))
+    print(r.stream.is_some())
+    print(field(r, "content-encoding"))
+    print(field(r, "vary"))
+    let sent = sends_of(r)
+    let wire = cat(sent)
+    print(sent.len() >= 2)
+    match codec.decode(codec.Gzip, wire, compression.limits()) {
+        Ok(back) => print(bytes.eq(back, plain))
+        Err(e) => print(e)
+    }
+    print(wire.len() < plain.len() / 2)
+    // other codings, and no coding when the client accepts none
+    let rd = run(o, request("GET", ae("deflate"), List.new()), producer(pieces, "application/json"))
+    print(field(rd, "content-encoding"))
+    match codec.decode(codec.Deflate, cat(sends_of(rd)), compression.limits()) {
+        Ok(back) => print(bytes.eq(back, plain))
+        Err(e) => print(e)
+    }
+    let rn = run(o, request("GET", List.new(), List.new()), producer(pieces, "text/plain"))
+    print(field(rn, "content-encoding"))
+    print(bytes.eq(cat(sends_of(rn)), plain))
+    let rs = run(o, request("GET", ae("gzip"), List.new()), producer(pieces, "image/png"))
+    print(field(rs, "content-encoding"))
+    // a producer that sends nothing still makes a valid gzip stream
+    let re = run(o, request("GET", ae("gzip"), List.new()), producer(List.new(), "text/plain"))
+    match codec.decode(codec.Gzip, cat(sends_of(re)), compression.limits()) {
+        Ok(back) => print(back.len())
+        Err(e) => print(e)
+    }
+    // an upgrade is never touched
+    let mut up = producer(pieces, "text/plain")
+    up.status = 101
+    up.stream = Some(http.Stream(up.stream.unwrap().run, true))
+    print(field(run(o, request("GET", ae("gzip"), List.new()), up), "content-encoding"))
+    // server-sent events: every send is decodable at once
+    let events = List[lit("data: one\n\n"), lit("data: two\n\n"), lit("data: three\n\n")]
+    let rev = run(o, request("GET", ae("gzip"), List.new()), producer(events, "text/event-stream"))
+    let log = sends_of(rev)
+    print(log.len())
+    let mut dec = codec.decoder(codec.Gzip, compression.limits())
+    let mut got: List[u8] = List.new()
+    let mut upto: usize = 0
+    for i in 0..(events.len() + 1) {
+        match dec.feed(log[i], inout got) {
+            Ok(z) => {}
+            Err(e) => print(e)
+        }
+        if i < events.len() {
+            upto += events[i].len()
+            print(got.len() == upto)
+        }
+    }
+    print(dec.finish().is_ok())
+    // a stream through the testing client's writer would need the server: see the loopback part
+}
+
+// ---- requests
+
+fn gzip_of(b: List[u8]) -> List[u8] { codec.encode(codec.Gzip, b, 6) }
+
+fn encoded(f: codec.Format, b: List[u8]) -> List[u8] { codec.encode(f, b, 3) }
+
+fn echo(q: http.Request) -> http.Response {
+    let mut t = String.from("len=")
+    t.append(String.from_int(q.body.len() as i64))
+    t.push_str(" ce=")
+    t.append(match q.header("content-encoding") { Some(v) => sys.to_string(v), None => String.from("-") })
+    t.push_str(" cl=")
+    t.append(match q.header("content-length") { Some(v) => sys.to_string(v), None => String.from("-") })
+    t.push_str(" ctx=")
+    t.append(match q.get_ctx("content_encoding") { Some(v) => sys.to_string(v), None => String.from("-") })
+    t.push_str(" sum=")
+    let mut sum: u64 = 0
+    for c in q.body { sum = (sum * 31 + (c as u64)) % 1000003 }
+    t.append(String.from_int(sum as i64))
+    http.respond(200, "text/plain", t.bytes())
+}
+
+fn post(hd: http.Handler, ce: str, body: List[u8]) -> http.Response {
+    let mut hs: List[http.Header] = List.new()
+    if ce.len() > 0 { hs.push(h("Content-Encoding", ce)) }
+    hs.push(http.Header(lit("Content-Length"), bytes.from_u64(body.len() as u64)))
+    hd(request("POST", hs, body))
+}
+
+fn say(label: str, r: http.Response) uses io {
+    let mut l = String.from(label)
+    l.push_str(": ")
+    l.append(String.from_int(r.status as i64))
+    l.push_str(" ")
+    l.append(sys.to_string(r.body))
+    io.outln(l.bytes())
+}
+
+fn requests_part() uses io {
+    print("-- request bodies")
+    let plain = text_body(5000)
+    let mut sum: u64 = 0
+    for c in plain { sum = (sum * 31 + (c as u64)) % 1000003 }
+    print(sum)
+    let hd = compress.requests(compression.limit_output(100000), echo)
+    say("none", post(hd, "", plain))
+    say("identity", post(hd, "identity", plain))
+    say("gzip", post(hd, "gzip", gzip_of(plain)))
+    say("x-gzip", post(hd, "x-gzip", gzip_of(plain)))
+    say("GZip", post(hd, "GZip", gzip_of(plain)))
+    say("deflate (zlib)", post(hd, "deflate", encoded(codec.Zlib, plain)))
+    say("deflate (raw)", post(hd, "deflate", encoded(codec.Raw, plain)))
+    say("zstd", post(hd, "zstd", encoded(codec.Zstd, plain)))
+    say("zstd level 0 (stored)", post(hd, "zstd", codec.encode(codec.Zstd, plain, 0)))
+    say("gzip, identity", post(hd, "gzip, identity", gzip_of(plain)))
+    say("empty body", post(hd, "gzip", List.new()))
+
+    print("-- refused")
+    say("br", post(hd, "br", plain))
+    say("compress", post(hd, "compress", plain))
+    say("gzip, gzip", post(hd, "gzip, gzip", gzip_of(gzip_of(plain))))
+    say("gzip, zstd", post(hd, "gzip, zstd", plain))
+    say("not gzip at all", post(hd, "gzip", plain))
+    say("gzip body labelled zstd", post(hd, "zstd", gzip_of(plain)))
+    let gz = gzip_of(plain)
+    say("cut off", post(hd, "gzip", bytes.slice(gz, 0, gz.len() - 5)))
+    say("header only", post(hd, "gzip", bytes.slice(gz, 0, 10)))
+    let mut flipped = gz.copy()
+    flipped[gz.len() - 6] = flipped[gz.len() - 6] ^ 255
+    say("flipped byte near the end", post(hd, "gzip", flipped))
+    let mut crc = gz.copy()
+    crc[gz.len() - 8] = crc[gz.len() - 8] ^ 1
+    say("bad CRC", post(hd, "gzip", crc))
+    let mut trailing = gz.copy()
+    bytes.append(inout trailing, lit("garbage that is not a member"))
+    say("trailing garbage", post(hd, "gzip", trailing))
+    let big = text_body(200000)
+    say("over max_output", post(hd, "gzip", gzip_of(big)))
+    let bomb = zeros(3000000)
+    let bg = gzip_of(bomb)
+    print(bg.len() < 5000)
+    say("bomb (gzip)", post(hd, "gzip", bg))
+    say("bomb (zstd, stored RLE)", post(hd, "zstd", codec.encode(codec.Zstd, bomb, 0)))
+    say("bomb (deflate)", post(hd, "deflate", codec.encode(codec.Deflate, bomb, 1)))
+    // the ratio limit applies below max_output
+    let ratio = compress.requests(compression.Limits(1000000000, 20, 1000, 8388608, 65536), echo)
+    say("ratio 20", post(ratio, "gzip", gzip_of(bomb)))
+    say("ratio 20 on text", post(ratio, "gzip", gz))
+    let refusal = post(hd, "gzip", bg)
+    print(refusal.keep_alive)
+
+    print("-- every truncation and every flipped byte of a body")
+    let small = text_body(400)
+    let gs = gzip_of(small)
+    let mut counts = (0, 0, 0)
+    let mut by_status: Map[i32, i32] = Map.new()
+    for n in 0..gs.len() {
+        let r = post(hd, "gzip", bytes.slice(gs, 0, n))
+        by_status.insert(r.status, by_status.get(r.status).unwrap_or(0) + 1)
+    }
+    print(by_status.get(400).unwrap_or(0) == (gs.len() as i32) - 1)
+    print(by_status.get(200).unwrap_or(0))
+    let mut flips: Map[i32, i32] = Map.new()
+    for i in 0..gs.len() {
+        let mut c = gs.copy()
+        c[i] = c[i] ^ 85
+        let r = post(hd, "gzip", c)
+        flips.insert(r.status, flips.get(r.status).unwrap_or(0) + 1)
+    }
+    print(flips.get(200).unwrap_or(0))
+    print(flips.get(200).unwrap_or(0) + flips.get(400).unwrap_or(0) == gs.len() as i32)
+
+    print("-- a streamed request body")
+    let pieces = cut(gz, 7)
+    say("streamed gzip", streamed(plain_cap(100000), "gzip", pieces))
+    say("streamed, one piece", streamed(plain_cap(100000), "gzip", List[gz]))
+    say("streamed deflate", streamed(plain_cap(100000), "deflate", cut(encoded(codec.Zlib, plain), 100)))
+    say("streamed zstd", streamed(plain_cap(100000), "zstd", cut(encoded(codec.Zstd, plain), 100)))
+    say("streamed cut off", streamed(plain_cap(100000), "gzip", cut(bytes.slice(gz, 0, gz.len() - 3), 50)))
+    say("streamed corrupt", streamed(plain_cap(100000), "gzip", cut(flipped, 50)))
+    say("streamed bomb", streamed(plain_cap(100000), "gzip", cut(bg, 500)))
+    say("streamed br", streamed(plain_cap(100000), "br", pieces))
+    say("streamed identity", streamed(plain_cap(100000), "identity", List[plain]))
+}
+
+fn plain_cap(n: u64) -> compression.Limits { compression.limit_output(n) }
+
+fn cut(b: List[u8], n: usize) -> List[List[u8]] {
+    let mut out: List[List[u8]] = List.new()
+    let mut i: usize = 0
+    while i < b.len() {
+        let e = if i + n < b.len() { i + n } else { b.len() }
+        out.push(bytes.slice(b, i, e))
+        i = e
+    }
+    out
+}
+
+/// A streamed request whose body arrives in `pieces`; the handler reads it whole.
+fn streamed(lim: compression.Limits, ce: str, pieces: List[List[u8]]) -> http.Response {
+    let left = sync.lock(pieces)
+    let pull = |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
+        left.modify(|inout ps: List[List[u8]]| -> Result[List[u8], stream.Error] {
+            if ps.len() == 0 { return Ok(List.new()) }
+            let first = ps[0]
+            let n = if first.len() < max { first.len() } else { max }
+            let out = bytes.slice(first, 0, n)
+            let mut rest: List[List[u8]] = List.new()
+            if n < first.len() { rest.push(bytes.slice(first, n, first.len())) }
+            for i in 1..ps.len() { rest.push(ps[i]) }
+            ps = rest
+            Ok(out)
+        })
+    }
+    let reader = |q: http.Request| -> http.Response {
+        let mut body: List[u8] = List.new()
+        let mut b = q.stream.unwrap()
+        let t = b.pull
+        while true {
+            match t(1000, time.never()) {
+                Ok(x) => {
+                    if x.len() == 0 { break }
+                    bytes.append(inout body, x)
+                }
+                Err(e) => {
+                    let mut m = String.from("error ")
+                    m.append(e.message.copy())
+                    return http.respond(200, "text/plain", m.bytes())
+                }
+            }
+        }
+        let mut sum: u64 = 0
+        for c in body { sum = (sum * 31 + (c as u64)) % 1000003 }
+        let mut t2 = String.from("read ")
+        t2.append(String.from_int(body.len() as i64))
+        t2.push_str(" sum=")
+        t2.append(String.from_int(sum as i64))
+        t2.push_str(" ce=")
+        t2.append(match q.header("content-encoding") { Some(v) => sys.to_string(v), None => String.from("-") })
+        http.respond(200, "text/plain", t2.bytes())
+    }
+    let hd = compress.requests(lim, reader)
+    let mut req = http.request("POST", lit("/up"))
+    req.set_header("Content-Encoding", lit(ce))
+    req.stream = Some(http.Body(pull))
+    hd(req)
+}
+
+// ---- over a socket
+
+fn lines(b: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for c in b {
+        if c == 13 { continue }
+        out.push(c)
+    }
+    out
+}
+
+fn wire(head: str, body: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for c in lit(head) {
+        if c == 10 {
+            out.push(13)
+            out.push(10)
+        } else {
+            out.push(c)
+        }
+    }
+    bytes.append(inout out, body)
+    out
+}
+
+fn reply(s: i32, dl: time.Deadline) -> http.Response uses io, net, clock {
+    let mut p = parse.responses(http.limits())
+    while true {
+        match p.next() {
+            parse.Done(m) => { return parse.to_response(m) }
+            parse.Bad(st, why) => { return http.response(1) }
+            parse.More => {}
+        }
+        match fd.read_by(s, 65536, dl) {
+            Ok(Some(b)) => {
+                if b.len() == 0 { return http.response(2) }
+                p.feed(b)
+            }
+            Ok(None) => { return http.response(3) }
+            Err(e) => { return http.response(4) }
+        }
+    }
+    http.response(5)
+}
+
+fn raw(a: net.Addr, label: str, payload: List[u8], dl: time.Deadline) uses io, net, clock {
+    let s = net.socket(net.IPV4, net.STREAM, false).unwrap()
+    net.connect(s, a).unwrap()
+    net.send_all(s, payload).unwrap()
+    say(label, reply(s, dl))
+    fd.close(s).unwrap()
+}
+
+fn te(label: str, a: net.Addr, coding: str, body: List[u8], dl: time.Deadline) uses io, net, clock {
+    let mut payload = wire("POST /echo HTTP/1.1\nHost: x\nConnection: close\nTransfer-Encoding: ", List.new())
+    bytes.append(inout payload, lit(coding))
+    bytes.append(inout payload, lit(", chunked\r\n\r\n"))
+    bytes.append(inout payload, http.chunk(body))
+    bytes.append(inout payload, lit("0\r\n\r\n"))
+    raw(a, label, payload, dl)
+}
+
+fn sockets_part() uses io, net, clock, threads {
+    print("-- Transfer-Encoding: gzip, chunked")
+    let dl = time.after_ms(30000)
+    let mut cfg = server.config()
+    cfg.workers = 4
+    cfg.decode_max = 100000
+    cfg.log = None
+    let mut r = router.new()
+    r.post("/echo", echo)
+    r.get("/text", |q: http.Request| -> http.Response { http.text(200, "text") })
+    let page = text_body(6000)
+    r.get("/page", |q: http.Request| -> http.Response { http.respond(200, "text/html", page) })
+    let bombed = gzip_of(zeros(3000000))
+    r.get("/bomb", |q: http.Request| -> http.Response {
+        let mut b = http.respond(200, "application/octet-stream", bombed)
+        b.set_header("Content-Encoding", lit("gzip"))
+        b
+    })
+    r.get("/br", |q: http.Request| -> http.Response {
+        let mut b = http.respond(200, "text/plain", lit("not brotli at all"))
+        b.set_header("Content-Encoding", lit("br"))
+        b
+    })
+    r.get("/corrupt", |q: http.Request| -> http.Response {
+        let mut b = http.respond(200, "text/plain", lit("this is not gzip"))
+        b.set_header("Content-Encoding", lit("gzip"))
+        b
+    })
+    let hd = compress.responses(compress.options(), router.handler(r))
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let a = srv.addr()
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(hd, t).unwrap() })
+    let plain = text_body(5000)
+    te("gzip, chunked", a, "gzip", gzip_of(plain), dl)
+    te("Gzip, Chunked", a, "Gzip", gzip_of(plain), dl)
+    te("deflate, chunked", a, "deflate", encoded(codec.Zlib, plain), dl)
+    te("zstd, chunked", a, "zstd", encoded(codec.Zstd, plain), dl)
+    te("bomb", a, "gzip", gzip_of(zeros(3000000)), dl)
+    te("over decode_max", a, "gzip", gzip_of(text_body(200000)), dl)
+    te("corrupt", a, "gzip", plain, dl)
+    te("br, chunked", a, "br", plain, dl)
+    te("gzip, gzip, chunked", a, "gzip, gzip", gzip_of(gzip_of(plain)), dl)
+    let gzb = gzip_of(plain)
+    te("cut off", a, "gzip", bytes.slice(gzb, 0, gzb.len() - 4), dl)
+    // the connection that was refused is closed; a following request works on a new one
+    raw(a, "plain chunked still works", wire("POST /echo HTTP/1.1\nHost: x\nConnection: close\nTransfer-Encoding: chunked\n\n5\nhello\n0\n\n", List.new()), dl)
+    // Content-Encoding on a body of the server is the handler's business without the middleware
+    let mut ce = wire("POST /echo HTTP/1.1\nHost: x\nConnection: close\nContent-Encoding: gzip\nContent-Length: ", List.new())
+    bytes.append(inout ce, bytes.from_u64(gzb.len() as u64))
+    bytes.append(inout ce, lit("\r\n\r\n"))
+    bytes.append(inout ce, gzb)
+    raw(a, "Content-Encoding without the middleware", ce, dl)
+
+    print("-- the client")
+    let mut c = client.connect(a, dl).unwrap()
+    let mut get = http.request("GET", lit("/page"))
+    let plainr = c.request(get, dl).unwrap()
+    print(field(plainr, "content-encoding"))
+    print(plainr.body.len())
+    let mut c2 = client.connect(a, dl).unwrap().with_decoding(compression.limit_output(100000))
+    let dec = c2.request(http.request("GET", lit("/page")), dl).unwrap()
+    print(field(dec, "content-encoding"))
+    print(dec.body.len())
+    print(bytes.eq(dec.body, page))
+    print(field(dec, "content-length"))
+    print(field(dec, "vary"))
+    // a second request on the same connection
+    let again = c2.request(http.request("GET", lit("/page")), dl).unwrap()
+    print(bytes.eq(again.body, page))
+    // the caller's own Accept-Encoding wins
+    let mut own = http.request("GET", lit("/page"))
+    own.set_header("Accept-Encoding", lit("deflate"))
+    let ro = c2.request(own, dl).unwrap()
+    print(bytes.eq(ro.body, page))
+    // HEAD has no body to decode
+    let rh = c2.request(http.request("HEAD", lit("/page")), dl).unwrap()
+    print(rh.status)
+    print(rh.body.len())
+    c2.close()
+    let mut c3 = client.connect(a, dl).unwrap().with_decoding(compression.limit_output(1000))
+    match c3.request(http.request("GET", lit("/page")), dl) {
+        Ok(x) => print("decoded?")
+        Err(e) => print(e)
+    }
+    print(c3.open)
+    let mut c4 = client.connect(a, dl).unwrap().with_decoding(compression.limit_output(100000))
+    match c4.request(http.request("GET", lit("/bomb")), dl) {
+        Ok(x) => print("decoded?")
+        Err(e) => print(e)
+    }
+    let mut c5 = client.connect(a, dl).unwrap().with_decoding(compression.limit_output(100000))
+    match c5.request(http.request("GET", lit("/br")), dl) {
+        Ok(x) => print("decoded?")
+        Err(e) => print(e)
+    }
+    let mut c6 = client.connect(a, dl).unwrap().with_decoding(compression.limit_output(100000))
+    match c6.request(http.request("GET", lit("/corrupt")), dl) {
+        Ok(x) => print("decoded?")
+        Err(e) => print(e)
+    }
+    // not asked for: the bytes as they came
+    let mut c7 = client.connect(a, dl).unwrap()
+    let rb = c7.request(http.request("GET", lit("/bomb")), dl).unwrap()
+    print(field(rb, "content-encoding"))
+    print(rb.body.len() < 5000)
+    c7.close()
+    tok.cancel()
+    let stats = th.join()
+    print(stats.bad)
+}
+
+// ---- http/service
+
+fn service_part() uses io, clock, fs {
+    print("-- http/service")
+    var rt = router.new()
+    let doc = text_body(4000)
+    rt.get("/doc", |q: http.Request| -> http.Response { http.respond(200, "text/html", doc) })
+    rt.get("/img", |q: http.Request| -> http.Response { http.respond(200, "image/png", doc) })
+    rt.get("/secret", |q: http.Request| -> http.Response { compress.never(http.respond(200, "text/html", doc)) })
+    rt.post("/echo", echo)
+    rt.get("/missing-body", |q: http.Request| -> http.Response { http.error_response(404) })
+    let o = service.options().without_logs()
+    let c = testing.client(service.handler(rt, o)).with_header("Accept-Encoding", "gzip")
+    let r = c.get("/doc")
+    show("doc", r, doc)
+    show("png", c.get("/img"), doc)
+    show("never", c.get("/secret"), doc)
+    let m = c.get("/metrics")
+    print(field(m, "content-encoding"))
+    print(field(m, "vary"))
+    let p = c.get("/nope")
+    print(p.status)
+    print(field(p, "content-type"))
+    print(field(p, "content-encoding"))
+    let off = testing.client(service.handler(rt, o.no_compression())).with_header("Accept-Encoding", "gzip")
+    show("no_compression", off.get("/doc"), doc)
+    let tuned = testing.client(service.handler(rt, o.with_compression(compress.options().with_min_size(5000)))).with_header("Accept-Encoding", "gzip")
+    show("min size 5000", tuned.get("/doc"), doc)
+    // request bodies
+    let plain = text_body(5000)
+    let big = text_body(2000000)
+    let gz = List[h("Content-Encoding", "gzip")]
+    say("gzip body", c.send("POST", "/echo", gz, gzip_of(plain)))
+    say("deflate body", c.send("POST", "/echo", List[h("Content-Encoding", "deflate")], encoded(codec.Zlib, plain)))
+    say("zstd body", c.send("POST", "/echo", List[h("Content-Encoding", "zstd")], encoded(codec.Zstd, plain)))
+    say("br body", c.send("POST", "/echo", List[h("Content-Encoding", "br")], plain))
+    say("corrupt body", c.send("POST", "/echo", gz, plain))
+    let bomb = c.send("POST", "/echo", gz, gzip_of(big))
+    print(bomb.status)
+    print(field(bomb, "content-type"))
+    let raw_in = testing.client(service.handler(rt, o.no_request_decoding()))
+    say("decoding off", raw_in.send("POST", "/echo", gz, gzip_of(plain)))
+    let wide = testing.client(service.handler(rt, o.with_request_decoding(3000000)))
+    say("decoding up to 3 MB", wide.send("POST", "/echo", gz, gzip_of(big)))
+}
+
+// ---- http/static
+
+fn put(path: str, data: List[u8]) uses fs {
+    let p = lit(path)
+    fs.mkdir_all(fs.dirname(p)).unwrap()
+    fs.write(p, data).unwrap()
+}
+
+fn static_part() uses io, fs, clock {
+    print("-- http/static: precompressed files")
+    let base = lit("target/compress-fixture")
+    if fs.exists(base) { fs.remove_all(base).unwrap() }
+    let js = text_body(3000)
+    put("target/compress-fixture/www/app.js", js)
+    put("target/compress-fixture/www/app.js.gz", gzip_of(js))
+    put("target/compress-fixture/www/lonely.js.gz", gzip_of(js))
+    put("target/compress-fixture/www/plain.css", lit("a{{}}"))
+    put("target/compress-fixture/www/index.html", text_body(500))
+    put("target/compress-fixture/www/index.html.gz", gzip_of(text_body(500)))
+    put("target/compress-fixture/outside.js.gz", lit("TOP SECRET"))
+    put("target/compress-fixture/www/leak.js", lit("console.log(1)"))
+    fs.symlink(lit("../outside.js.gz"), lit("target/compress-fixture/www/leak.js.gz")).unwrap()
+    var rt = router.new()
+    static.mount(inout rt, "", "target/compress-fixture/www", static.options().with_precompressed()).unwrap()
+    let c = testing.client(router.handler(rt))
+    let g = c.with_header("Accept-Encoding", "gzip")
+    let r = g.get("/app.js")
+    show("app.js with gzip", r, js)
+    print(field(r, "content-type"))
+    print(field(r, "etag") != field(c.get("/app.js"), "etag"))
+    show("app.js without", c.get("/app.js"), js)
+    show("app.js, gzip;q=0", c.with_header("Accept-Encoding", "gzip;q=0").get("/app.js"), js)
+    show("app.js, br", c.with_header("Accept-Encoding", "br").get("/app.js"), js)
+    show("a file with no sibling", g.get("/plain.css"), lit("a{{}}"))
+    print(g.get("/lonely.js").status)
+    show("the .gz itself", g.get("/app.js.gz"), gzip_of(js))
+    show("index", g.get("/"), text_body(500))
+    show("a link out of the root", g.get("/leak.js"), lit("console.log(1)"))
+    // If-None-Match with the tag of the gzip variant
+    let tag = r.header("etag").unwrap()
+    let mut inm: List[http.Header] = List.new()
+    inm.push(http.Header(lit("If-None-Match"), tag))
+    let r304 = g.send("GET", "/app.js", inm, List.new())
+    print(r304.status)
+    print(field(r304, "vary"))
+    // without the option nothing changes
+    var rt2 = router.new()
+    static.mount(inout rt2, "", "target/compress-fixture/www", static.options()).unwrap()
+    let c2 = testing.client(router.handler(rt2)).with_header("Accept-Encoding", "gzip")
+    show("option off", c2.get("/app.js"), js)
+    // with the middleware on top, an uncompressed file is compressed on the fly, weak ETag
+    var rt3 = router.new()
+    static.mount(inout rt3, "", "target/compress-fixture/www", static.options()).unwrap()
+    let dyn = testing.client(compress.responses(compress.options(), router.handler(rt3))).with_header("Accept-Encoding", "gzip")
+    let rd = dyn.get("/app.js")
+    show("on the fly", rd, js)
+    // and a precompressed one is not compressed twice
+    var rt4 = router.new()
+    static.mount(inout rt4, "", "target/compress-fixture/www", static.options().with_precompressed()).unwrap()
+    let both = testing.client(compress.responses(compress.options(), router.handler(rt4))).with_header("Accept-Encoding", "gzip")
+    show("precompressed under the middleware", both.get("/app.js"), js)
+    fs.remove_all(base).unwrap()
+}
+
+fn main() uses io, net, clock, threads, fs {
+    responses_part()
+    streams_part()
+    requests_part()
+    sockets_part()
+    service_part()
+    static_part()
+}

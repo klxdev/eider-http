@@ -48,6 +48,7 @@ the step-by-step guide to both ("Building services").
 | `http/middleware` | `request_id`, `access_log`, `access_log_with` (a `logging` Logger), `errors`, `problems`, `body_limit`, `timeout`, `cors`, `bearer`, `basic`, `recover`, `chain` | none; `io, clock` for `access_log`, `timeout` and `recover`, `io` for `random_ids` |
 | `http/metrics` | request counters, an in-flight gauge and a latency histogram, in the Prometheus text format; `by_route` labels both with the route (or operation id) | `clock` for `wrap` |
 | `http/trace` | W3C Trace Context: `traceparent` in, a span per request to a sink (`log_sink`, `collect`), `inject` for outgoing calls | `io, clock` for `wrap` and `inject` |
+| `http/compress` | `Content-Encoding` both ways: `responses(options, h)` (gzip/deflate, opt-in zstd; `Accept-Encoding` negotiation, allow-list, size floor, `Vary`, weak ETags, streamed bodies), `requests(limits, h)` (decoding under `compression.Limits`), `never(resp)`, `except(f)`; the server and the client use `decode_request` / `decode_response` | none |
 | `http/static` | serves a directory for a rest route: media types, ETag/`If-None-Match`, cache rules for hashed names, index files, SPA fallback, strict path checks | `fs` |
 | `http/health` | `/healthz` (liveness), `/readyz` (readiness with checks, 503 while draining), the drain flag | none |
 | `http/service` | production defaults: `handler(router, options)` stacks request ids, trusted-proxy peer, access log, metrics, rate limit, trap containment, problem+json and mounts the probes and `/metrics`; `serve`/`run` drain on SIGTERM | `net, io, clock, threads, fs` |
@@ -212,6 +213,7 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
 | Whole head | 64 KiB | `Limits.max_head` | 431 |
 | Body after chunked decoding | 1 MiB | `Limits.max_body` | 413 (a Content-Length above it is refused before reading) |
 | Chunk size | 15 hex digits | parse.ei | 400 |
+| A decoded request body (`Transfer-Encoding: gzip, chunked`) | the route's body limit, and 1100 times the compressed size above 4 MiB | `Config.decode_max` (0: the route's limit) | 413 (bomb), 400 (corrupt, cut short), 501 (other codings) |
 | Empty lines before a request line | 4 | parse.ei | 400 |
 | Idle connection | 5 s | `Config.idle_timeout` | closed |
 | Reading one request | 10 s from its first byte | `Config.read_timeout` | 408, closed |
@@ -232,8 +234,9 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   Transfer-Encoding; two Content-Length fields (even equal), or one that isn't only digits;
   two Transfer-Encoding fields; Transfer-Encoding in HTTP/1.0; a final coding other than
   chunked; obs-fold; a bare CR or LF anywhere in the head or a chunk line; whitespace between
-  a field name and its colon; an HTTP/1.1 request without exactly one Host. Codings other
-  than chunked are 501 (nothing decodes gzip). Conflicting framing is refused in responses
+  a field name and its colon; an HTTP/1.1 request without exactly one Host. One of gzip,
+  deflate or zstd in front of `chunked` is decoded (below, "Compression"); any other coding
+  is 501. Conflicting framing is refused in responses
   too, also where the body is ignored (HEAD, 304). After any framing error the connection is
   closed, never reused.
 - **Header injection.** Framing headers (Content-Length, Transfer-Encoding, Connection) are
@@ -256,6 +259,17 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   header held can reach logs or other headers, and addresses are canonical (IPv4-mapped IPv6 is
   IPv4). The proxy must set or append to the header; one that passes a client's header
   through unchanged makes the *rightmost* element, the proxy's own appended one, the client.
+- **Decompression bombs.** Every decoder runs under `compression.Limits`: the output may not pass
+  the body limit (`max_output`, set to what the route accepts) nor 1100 times the input read (above
+  4 MiB), and a zstd frame may not ask for a window over 8 MiB; the limit is checked before the
+  bytes are produced, so a few kilobytes cannot become gigabytes in memory. A bomb is 413, an
+  unsupported coding 415, bad data 400, none of them a trap (the compression tests alter every
+  byte of their vectors). Bodies are decoded after the framing limits, so the compressed size is
+  already bounded by `max_body`.
+- **BREACH.** A compressed response that holds a secret and text the attacker controls and the
+  response reflects leaks the secret through its size. `http/service` compresses the allow-listed
+  types by default (see "Compression"); exempt such responses with `compress.never`, `except`, or
+  `no_compression()`, and mask secrets per response.
 - **Rate limiting** (eider-http#3). `ratelimit.middleware` limits per client address (IPv6 per
   /64) with the generic cell rate algorithm; put `proxy.middleware` outside it behind a proxy, or
   all clients share the proxy's bucket. The table is bounded (`max_keys`, 10,000; beyond that new
@@ -352,6 +366,12 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
   pipelining, chunked bodies, `Expect: 100-continue`, refused smuggling, the read and idle
   deadlines, `max_requests`, back-pressure (503 and keep-alive given up), graceful shutdown
   with a request in flight.
+- `compress_test`: negotiation (q-values, `*`, `q=0`, case, two fields, malformed), the allow-list,
+  the size floor, HEAD/Range/204/206/304/101, encoded and `no-transform` responses, ETags and `Vary`,
+  streamed responses (and `text/event-stream` decodable after every event), request bodies in all
+  four codings, 415/413/400 including bombs (gzip, zstd, deflate, ratio), every truncation and every
+  flipped byte of a gzip body, a streamed request body, `Transfer-Encoding: gzip, chunked` and the
+  client's decoding over loopback, `http/service`'s defaults, and precompressed static files.
 - `middleware_test`: every middleware called directly. The timeout case uses a handler
   blocked on a channel that the test releases after the 503, so nothing sleeps. It also
   covers problem+json and the Prometheus text from fixed observations.
@@ -385,6 +405,10 @@ Recorded rather than worked around; none blocks the design.
 | N15 | Interrupting a handler (cancellation reaching blocked code; with N6) | `middleware.timeout` | 503 at the deadline; the handler finishes on its pool's worker, `req.deadline` for cooperation |
 | ~~N16~~ | A per-route body limit before the body is read (the router consulted after the head) or streaming bodies | `middleware.body_limit` | done: `http.Plan`, `Router.planner`, streamed bodies (below); `body_limit` remains for handlers behind other layers |
 | N17 | A List literal (`["a", "b"]` is a fixed array) and `if` as a call argument (E0103) | builders, tests | `push` loops and `let`s |
+| N18 | `String` to `str` (`http.text(200, s)` takes a `str`; building a body from a String needs `http.respond(.., s.bytes())`) | tests, middleware | `String.bytes()` |
+| N19 | Borrowing two fields of one record in a call (`s.d.feed(x, inout s.pending)` is E0301) | the streaming request decoder | copy the field out, call, store it back |
+| N20 | eider-compression's README says it needs no capability, but `compression.streams` names `io` and `clock`, and the grant is per package (N14), so http grants it both | eider.toml | `uses = ["io", "clock"]` |
+| N21 | Response compression happens at the handler (the whole body is held; deflate is 33 MB/s at level 6) | http/compress | `with_level(1)`; a cache or the proxy for hot responses; eider-compression's encoder has no way to hand out partial blocks early other than `flush` |
 
 ## Next steps toward OpenAPI
 
@@ -413,7 +437,7 @@ Recorded rather than worked around; none blocks the design.
 
 `service.handler(router, options())` is the stack a service would write by hand, in the order that
 makes the numbers right (module comment of service.ei): request id, trusted-proxy peer, access log,
-metrics, problem+json, rate limit, trap containment, router; and it mounts `/healthz`, `/readyz`,
+metrics, problem+json, response compression, rate limit, trap containment, request decoding, router; and it mounts `/healthz`, `/readyz`,
 `/metrics` and (opt-in) the profiler's endpoints. `service.run(addr, router, options)` also binds,
 installs the SIGTERM/SIGINT watcher (std/service) and drains: readiness turns 503 at once, the
 server keeps serving for `drain_delay` (5 s: time for a load balancer to notice), then shuts down
@@ -486,6 +510,58 @@ the server writes the head (`Transfer-Encoding: chunked`), calls `run` with an `
 the worker, each `write` is one flushed chunk (bounded by `write_timeout`), and the terminating
 chunk is written when `run` returns; the connection then serves the next request. `is_stopping()`
 tells a long stream the server is shutting down. A `raw` stream is an upgrade (http/ws).
+
+## Compression (`http/compress`)
+
+eider-compression supplies the codecs (deflate/zlib/gzip/zstd, hard `Limits`, never a trap on
+hostile input); http/compress is where they meet the protocol (module comment of compress.ei).
+
+**Responses.** `responses(options, h)`: the coding is `codec.negotiate(Accept-Encoding, [gzip,
+deflate])` (zstd first after `with_zstd`: its encoder has no Huffman literal coding, so the ratio
+is 3.07 against gzip's 3.72 at about the same speed, and it is off unless asked for); no usable
+header means the body as it is. A response is compressed unless: its status is 1xx, 204, 205, 206
+or 304; it has `Content-Range`; the request is HEAD or has `Range` (the server serves no ranges);
+it is encoded already or has `Cache-Control: no-transform`; its type is not on the allow-list
+(`text/*`, `application/json`, `application/*+json`, `application/xml`, `application/*+xml`,
+`application/javascript`, `image/svg+xml`); a buffered body is under 1024 bytes or does not shrink;
+`compress.never(resp)` or `except(f)` says no. `Vary: Accept-Encoding` goes on every response that
+could be compressed (so also on the ones sent as they are), a strong ETag becomes weak, and the
+framing headers are rebuilt from the compressed body. A streamed (chunked) response is
+compressed piece by piece as the producer `send`s, with the trailer when `run` returns; nothing
+but the encoder's block is buffered, and `text/event-stream` is flushed after each send. HEAD
+is passed through with `Vary`; its `Content-Length` is the identity one (a deviation: RFC 9110
+wants HEAD to match GET).
+
+**CPU.** Eider's deflate encodes at 33 MB/s at level 6 and 77 MB/s at level 1 (eider-compression's
+bench): a 1 MiB response is 30 ms of a worker at the default; `with_level(1)` trades a tenth of
+the ratio for twice the speed. Put a cache in front of expensive hot responses or compress at the
+proxy.
+
+**Requests.** `requests(limits, h)` decodes `Content-Encoding: gzip|x-gzip|deflate|zstd`
+(case-insensitive; `identity` is nothing) before the handler: 415 for another coding or a list of
+two, 413 for a bomb (`TooLarge`, `RatioExceeded`), 400 for corrupt, truncated or checksum-failing
+data. The handler gets the plain body, no `Content-Encoding`, the decoded `Content-Length` and
+`ctx["content_encoding"]`. A streamed request body is decoded as it is read (errors are `stream.Error`s
+whose text starts with the status). `http/server` does the same for `Transfer-Encoding: gzip,
+chunked` before the handler (`Config.decode_max`; the parser still answers 501 for any other
+coding and 400 for a final coding that is not chunked).
+
+**Client.** `Conn.with_decoding(limits)` sends `Accept-Encoding: gzip, deflate, zstd` (unless the
+request has its own) and decodes the response under `limits`, closing the connection on failure;
+off by default.
+
+**Static files.** `static.options().with_precompressed()` serves `file.gz` for `file` to a client
+that accepts gzip, with the file's `Content-Type`, `Content-Encoding: gzip`, its own ETag and
+`Vary`; the sibling goes through the same root and symlink checks. Nothing is compressed at
+request time; put `compress.responses` outside `static` for that.
+
+**http/service.** Both directions are on: responses for the allow-list (a production service is
+expected to compress; the risk, BREACH, is confined to bodies mixing a secret with reflected input and is
+documented, with `no_compression()` and `compress.never` as the exits), request decoding up to the
+server's `limits.max_body` (hard limits make it safe, and a handler would otherwise get bytes it
+cannot use; `with_request_decoding(n)` raises the cap for routes with a larger plan,
+`no_request_decoding()` hands the bytes over). Layers: ... problem+json > response compression >
+rate limit > trap containment > request decoding > router.
 
 ## Server-sent events and WebSockets
 

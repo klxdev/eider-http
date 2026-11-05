@@ -28,10 +28,13 @@ import std.time
 import http
 import http.parse
 import http.sock
+import http.compress
+import compression
 
 /// A connection to `addr`. `host` is what goes in the Host header ("127.0.0.1:8080");
 /// `open` says whether a connection is up now.
-pub type Conn = { fd: i32, addr: net.Addr, host: List[u8], lim: http.Limits, parser: parse.Parser, open: bool, name: List[u8], port: i32 }
+/// `decode` is None unless `with_decoding` was called (below).
+pub type Conn = { fd: i32, addr: net.Addr, host: List[u8], lim: http.Limits, parser: parse.Parser, open: bool, name: List[u8], port: i32, decode: Option[compression.Limits] }
 
 /// Connects to `a` before `dl` (non-blocking connect, then a wait for it).
 pub fn connect(a: net.Addr, dl: time.Deadline) -> Result[Conn, String] uses net, io, clock {
@@ -41,7 +44,7 @@ pub fn connect(a: net.Addr, dl: time.Deadline) -> Result[Conn, String] uses net,
 /// `connect`, with limits on the responses it will read.
 pub fn connect_with(a: net.Addr, lim: http.Limits, dl: time.Deadline) -> Result[Conn, String] uses net, io, clock {
     let s = dial(a, dl)?
-    Ok(Conn(s, a, net.text(a), lim, parse.responses(lim), true, List.new(), 0))
+    Ok(Conn(s, a, net.text(a), lim, parse.responses(lim), true, List.new(), 0, None))
 }
 
 fn dial(a: net.Addr, dl: time.Deadline) -> Result[i32, String] uses net, io, clock {
@@ -64,6 +67,18 @@ fn finish_connect(s: i32, a: net.Addr, dl: time.Deadline) -> Result[bool, String
 }
 
 impl Conn {
+    /// Asks for compressed responses and decodes them: a request without `Accept-Encoding`
+    /// gets `Accept-Encoding: gzip, deflate, zstd`, and a response with a `Content-Encoding`
+    /// (or a transfer coding) of gzip, deflate or zstd comes back with the plain body, the coding
+    /// headers gone and `Content-Length` the plain length. `lim` bounds the plain body
+    /// (`compression.limit_output(n)`, and the ratio limit of `compression.limits()`): a bomb,
+    /// corrupt or truncated data, or a coding that is not supported is an Err, and the
+    /// connection is closed. Off by default (a client that did not ask for it sees the bytes the
+    /// server sent). The limit on the compressed body is the connection's `http.Limits`.
+    fn with_decoding(self, lim: compression.Limits) -> Conn {
+        Conn(self.fd, self.addr, self.host, self.lim, self.parser, self.open, self.name, self.port, Some(lim))
+    }
+
     /// Sends `req` and reads its response (skipping 1xx interim responses), connecting
     /// first if no connection is up. The connection is closed afterwards when either side
     /// asked for it. On Err the connection is closed too (its state is unknown).
@@ -80,7 +95,11 @@ impl Conn {
             self.parser = parse.responses(self.lim)
             self.open = true
         }
-        let wire = http.write_request(req, self.host, req.keep_alive)?
+        let mut sent = req.copy()
+        if self.decode.is_some() && sent.header("accept-encoding").is_none() {
+            sent.set_header("Accept-Encoding", sys.lit("gzip, deflate, zstd"))
+        }
+        let wire = http.write_request(sent, self.host, req.keep_alive)?
         if !sock.send_by(self.fd, wire, dl) {
             self.close()
             return Err(String.from("send: deadline exceeded or connection closed"))
@@ -92,6 +111,18 @@ impl Conn {
                 Ok(r) => {
                     if r.status >= 100 && r.status < 200 && r.status != 101 { continue }
                     if !r.keep_alive || !req.keep_alive { self.close() }
+                    match self.decode {
+                        Some(lim) => {
+                            match compress.decode_response(r, lim) {
+                                Ok(plain) => { return Ok(plain) }
+                                Err(why) => {
+                                    self.close()
+                                    return Err(why)
+                                }
+                            }
+                        }
+                        None => {}
+                    }
                     return Ok(r)
                 }
                 Err(e) => {
@@ -246,7 +277,7 @@ pub fn connect_host_with(name: str, port: i32, lim: http.Limits, dl: time.Deadli
     let d = connect_name(n, port, dl)?
     // an address literal is reconnected without the resolver; a name is resolved again
     let literal = net.parse(n, port).is_ok()
-    Ok(Conn(d.fd, d.addr, host_header(n, port), lim, parse.responses(lim), true, if literal { List.new() } else { n }, port))
+    Ok(Conn(d.fd, d.addr, host_header(n, port), lim, parse.responses(lim), true, if literal { List.new() } else { n }, port, None))
 }
 
 /// One request to `name:port` on a new connection, closed afterwards.

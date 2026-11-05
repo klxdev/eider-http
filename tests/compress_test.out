@@ -1,0 +1,243 @@
+-- negotiation
+gzip: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+deflate: 200 ce=deflate vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+gzip, deflate: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+deflate, gzip;q=0.5: 200 ce=deflate vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+gzip;q=0, deflate;q=0.5: 200 ce=deflate vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+gzip;q=0: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+*: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+*;q=0: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+identity: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+br, gzip: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+br: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+GZIP: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+x-gzip: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+gzip;q=0.001, deflate;q=0.002: 200 ce=deflate vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+gzip;q=2: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+zstd: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+no Accept-Encoding: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+two fields: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+-- zstd
+zstd, gzip: 200 ce=zstd vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+gzip, zstd: 200 ce=zstd vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+gzip, zstd;q=0.1: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+zstd;q=0, gzip: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+zstd off by default: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+-- levels and the size floor
+level: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+level: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+level: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+level: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+1023 bytes: 200 ce=- vary=- etag=- identity=ok
+1024 bytes: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+min_size 10: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+noise stays as it is: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+-- the allow-list
+text/html; charset=utf-8: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+TEXT/CSS: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+application/json: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+application/problem+json: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+application/ld+json; charset=utf-8: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+application/xml: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+application/atom+xml: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+application/javascript: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+image/svg+xml: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+text/event-stream: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+image/png: 200 ce=- vary=- etag=- identity=ok
+application/octet-stream: 200 ce=- vary=- etag=- identity=ok
+application/gzip: 200 ce=- vary=- etag=- identity=ok
+application/wasm: 200 ce=- vary=- etag=- identity=ok
+video/mp4: 200 ce=- vary=- etag=- identity=ok
+application/jsonx: 200 ce=- vary=- etag=- identity=ok
+empty list: 200 ce=- vary=- etag=- identity=ok
+custom type: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+custom pattern: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+no Content-Type: 200 ce=- vary=- etag=- identity=ok
+true
+false
+true
+false
+true
+-- what is never compressed
+HEAD: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+Range request: 200 ce=- vary=Accept-Encoding etag=- identity=ok
+204: 204 ce=- vary=- etag=- identity=ok
+304: 304 ce=- vary=- etag=- identity=ok
+206: 206 ce=- vary=- etag=- identity=ok
+Content-Range: 200 ce=- vary=- etag=- identity=ok
+101: 101 ce=- vary=- etag=- identity=ok
+already encoded: 200 ce=br vary=- etag=- body untouched=yes
+Content-Encoding: identity: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+no-transform: 200 ce=- vary=- etag=- identity=ok
+never(): 200 ce=- vary=- etag=- identity=ok
+except(Set-Cookie): 200 ce=- vary=- etag=- identity=ok
+except, no cookie: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+-- ETag and Vary
+strong ETag: 200 ce=gzip vary=Accept-Encoding etag=W/"abc" roundtrip=ok smaller=yes
+weak ETag: 200 ce=gzip vary=Accept-Encoding etag=W/"abc" roundtrip=ok smaller=yes
+Vary: Origin: 200 ce=gzip vary=Origin; Accept-Encoding etag=- roundtrip=ok smaller=yes
+Vary has it: 200 ce=gzip vary=origin, accept-encoding etag=- roundtrip=ok smaller=yes
+Vary: *: 200 ce=gzip vary=* etag=- roundtrip=ok smaller=yes
+-
+true
+-- streamed responses
+true
+gzip
+Accept-Encoding
+true
+true
+true
+deflate
+true
+-
+true
+-
+0
+-
+4
+true
+true
+true
+true
+-- request bodies
+718537
+none: 200 len=5000 ce=- cl=5000 ctx=- sum=718537
+identity: 200 len=5000 ce=identity cl=5000 ctx=- sum=718537
+gzip: 200 len=5000 ce=- cl=5000 ctx=gzip sum=718537
+x-gzip: 200 len=5000 ce=- cl=5000 ctx=x-gzip sum=718537
+GZip: 200 len=5000 ce=- cl=5000 ctx=GZip sum=718537
+deflate (zlib): 200 len=5000 ce=- cl=5000 ctx=deflate sum=718537
+deflate (raw): 200 len=5000 ce=- cl=5000 ctx=deflate sum=718537
+zstd: 200 len=5000 ce=- cl=5000 ctx=zstd sum=718537
+zstd level 0 (stored): 200 len=5000 ce=- cl=5000 ctx=zstd sum=718537
+gzip, identity: 200 len=5000 ce=- cl=5000 ctx=gzip sum=718537
+empty body: 200 len=0 ce=gzip cl=0 ctx=- sum=0
+-- refused
+br: 415 415 Unsupported Media Type
+
+compress: 415 415 Unsupported Media Type
+
+gzip, gzip: 415 415 Unsupported Media Type
+
+gzip, zstd: 415 415 Unsupported Media Type
+
+not gzip at all: 400 400 Bad Request
+
+gzip body labelled zstd: 400 400 Bad Request
+
+cut off: 400 400 Bad Request
+
+header only: 400 400 Bad Request
+
+flipped byte near the end: 400 400 Bad Request
+
+bad CRC: 400 400 Bad Request
+
+trailing garbage: 400 400 Bad Request
+
+over max_output: 413 413 Content Too Large
+
+true
+bomb (gzip): 413 413 Content Too Large
+
+bomb (zstd, stored RLE): 413 413 Content Too Large
+
+bomb (deflate): 413 413 Content Too Large
+
+ratio 20: 413 413 Content Too Large
+
+ratio 20 on text: 200 len=5000 ce=- cl=5000 ctx=gzip sum=718537
+false
+-- every truncation and every flipped byte of a body
+true
+1
+6
+false
+-- a streamed request body
+streamed gzip: 200 read 5000 sum=718537 ce=-
+streamed, one piece: 200 read 5000 sum=718537 ce=-
+streamed deflate: 200 read 5000 sum=718537 ce=-
+streamed zstd: 200 read 5000 sum=718537 ce=-
+streamed cut off: 200 error 400 compressed body: cut short
+streamed corrupt: 200 error 400 compressed body: gzip: CRC-32 mismatch
+streamed bomb: 200 error 413 compressed body: deflate: output over the limit
+streamed br: 415 415 Unsupported Media Type
+
+streamed identity: 200 read 5000 sum=718537 ce=identity
+-- Transfer-Encoding: gzip, chunked
+gzip, chunked: 200 len=5000 ce=- cl=- ctx=gzip sum=718537
+Gzip, Chunked: 200 len=5000 ce=- cl=- ctx=Gzip sum=718537
+deflate, chunked: 200 len=5000 ce=- cl=- ctx=deflate sum=718537
+zstd, chunked: 200 len=5000 ce=- cl=- ctx=zstd sum=718537
+bomb: 413 413 Content Too Large
+
+over decode_max: 413 413 Content Too Large
+
+corrupt: 400 400 Bad Request
+
+br, chunked: 501 501 Not Implemented
+
+gzip, gzip, chunked: 501 501 Not Implemented
+
+cut off: 400 400 Bad Request
+
+plain chunked still works: 200 len=5 ce=- cl=- ctx=- sum=162025
+Content-Encoding without the middleware: 200 len=557 ce=gzip cl=557 ctx=- sum=858161
+-- the client
+-
+6000
+-
+6000
+true
+6000
+Accept-Encoding
+true
+true
+200
+0
+compressed body: deflate: output over the limit
+false
+compressed body: deflate: output over the limit
+unsupported content coding
+compressed body: gzip: bad magic number
+gzip
+true
+6
+-- http/service
+doc: 200 ce=gzip vary=Accept-Encoding etag=- roundtrip=ok smaller=yes
+png: 200 ce=- vary=- etag=- identity=ok
+never: 200 ce=- vary=- etag=- identity=ok
+gzip
+Accept-Encoding
+404
+application/problem+json
+-
+no_compression: 200 ce=- vary=- etag=- identity=ok
+min size 5000: 200 ce=- vary=- etag=- identity=ok
+gzip body: 200 len=5000 ce=- cl=5000 ctx=gzip sum=718537
+deflate body: 200 len=5000 ce=- cl=5000 ctx=deflate sum=718537
+zstd body: 200 len=5000 ce=- cl=5000 ctx=zstd sum=718537
+br body: 415 {"type":"about:blank","title":"Unsupported Media Type","status":415}
+corrupt body: 400 {"type":"about:blank","title":"Bad Request","status":400}
+413
+application/problem+json
+decoding off: 200 len=557 ce=gzip cl=557 ctx=- sum=858161
+decoding up to 3 MB: 200 len=2000000 ce=- cl=2000000 ctx=gzip sum=138789
+-- http/static: precompressed files
+app.js with gzip: 200 ce=gzip vary=Accept-Encoding etag="333439-06c1ba6579f005fc" roundtrip=ok smaller=yes
+text/javascript; charset=utf-8
+true
+app.js without: 200 ce=- vary=Accept-Encoding etag="33303030-772d4d7453739814" identity=ok
+app.js, gzip;q=0: 200 ce=- vary=Accept-Encoding etag="33303030-772d4d7453739814" identity=ok
+app.js, br: 200 ce=- vary=Accept-Encoding etag="33303030-772d4d7453739814" identity=ok
+a file with no sibling: 200 ce=- vary=Accept-Encoding etag="33-245dbf180b887e93" identity=ok
+404
+the .gz itself: 200 ce=- vary=Accept-Encoding etag="333439-06c1ba6579f005fc" identity=ok
+index: 200 ce=gzip vary=Accept-Encoding etag="313036-c3a0f4d62fc142a8" roundtrip=ok smaller=yes
+a link out of the root: 200 ce=- vary=Accept-Encoding etag="3134-acd116d0f963fe8c" identity=ok
+304
+Accept-Encoding
+option off: 200 ce=- vary=- etag="33303030-772d4d7453739814" identity=ok
+on the fly: 200 ce=gzip vary=Accept-Encoding etag=W/"33303030-772d4d7453739814" roundtrip=ok smaller=yes
+precompressed under the middleware: 200 ce=gzip vary=Accept-Encoding etag="333439-06c1ba6579f005fc" roundtrip=ok smaller=yes

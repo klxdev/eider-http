@@ -1,0 +1,539 @@
+//! http/compress: Content-Encoding for responses and requests (RFC 9110 8.4, RFC 9112 7), with
+//! eider-compression's gzip, deflate (zlib framing) and zstd.
+//!
+//!     let h = compress.responses(compress.options(), compress.requests(compression.limit_output(1048576), router.handler(r)))
+//!
+//! **Responses** (`responses(o, h)`): the coding is negotiated from `Accept-Encoding` (q-values,
+//! `*`, `q=0`; `compression.codec.negotiate`) among gzip and deflate, preferring gzip (zstd only
+//! after `with_zstd()`: eider-compression's encoder has no Huffman literal coding, so its
+//! ratio is below gzip's at a similar speed, see its README); without a usable header the body
+//! is sent as it is. A response is compressed when
+//! - its status is not 1xx, 204, 205, 206 or 304 and it has no `Content-Range`, the request is
+//!   not a HEAD (the body is not sent; its `Content-Length` is the identity one) and has no
+//!   `Range` header (the server does not serve ranges; one is never compressed),
+//! - it has no `Content-Encoding` already (no double encoding; the identity token is none) and its
+//!   `Cache-Control` has no `no-transform`, and `compress.never(resp)` was not called on it,
+//! - its `Content-Type` is in the allow-list (`options()`: `text/*`, `application/json`, `*+json`,
+//!   `application/xml`, `*+xml`, `application/javascript`, `image/svg+xml`; `with_type` adds a
+//!   pattern with at most one `*`, `without_types` empties the list),
+//! - a buffered body is at least `min_size` bytes (1024) and compresses to fewer bytes than it
+//!   had (otherwise it is sent as it is),
+//! - `except(f)` did not return true for the request and the response.
+//! `Vary: Accept-Encoding` is added to every response that could be compressed (type and size
+//! pass), compressed or not, so a cache never hands gzip to a client that can not read it. A
+//! strong `ETag` becomes weak (`W/"..."`) on a compressed response: the bytes differ from the
+//! identity ones, the representation is the same, and `If-None-Match` compares weakly. A
+//! streamed response (`Response.stream`, chunked) is compressed piece by piece as the producer
+//! `send`s: nothing is buffered beyond the encoder's own block; the trailer is written when the
+//! producer returns. `text/event-stream` is flushed after every `send`, so each event is
+//! decodable when it is sent; other types are flushed when the encoder's block is full.
+//!
+//! **Requests** (`requests(limits, h)`): a body with `Content-Encoding: gzip`, `x-gzip`,
+//! `deflate` (zlib or raw) or `zstd` is decoded before the handler sees it, under hard
+//! `compression.Limits`: the output may not pass `max_output` (set it to the largest body the
+//! route accepts: a 4 KB body must not become 4 GB) nor `max_ratio` times the input. A bomb is
+//! 413, an unsupported coding (`br`, `compress`, a list of two codings, a zstd dictionary) is
+//! 415, corrupt, truncated or checksum-failing data is 400. The handler gets the plain body,
+//! `Content-Encoding` removed, `Content-Length` the decoded length, and `Request.ctx`
+//! `content_encoding` the coding that was undone. A streamed request body (`Request.stream`)
+//! is decoded as it is read, under the same limits; a failure is a `stream.Error` of kind
+//! `InvalidData` (or `UnexpectedEof` for a body cut short) whose message starts with `413`,
+//! `415` or `400`.
+//! `http/server` itself decodes the transfer codings (`Transfer-Encoding: gzip, chunked`) with
+//! the same code (`Config.decode_max`); it answers 501 only for other codings.
+//!
+//! **BREACH.** Compressing a response whose body holds both a secret (a CSRF token, a session
+//! identifier, a bearer token) and text the client controls and that the response reflects
+//! (a query parameter, a form field) leaks the secret through the compressed size to an
+//! attacker who can make requests with the victim's credentials and observe sizes (HTTPS, a
+//! network position). Mitigations, in the order to prefer: do not put secrets in compressed
+//! bodies of pages that reflect input; mask secrets per response (a random pad); rate limit;
+//! `compress.never(resp)` for the responses that carry both, or `except(f)` for a rule (all
+//! `Set-Cookie` responses, say). `http/service` turns response compression on for the
+//! allow-listed types; `no_compression()` turns it off.
+
+import core.sys
+import std.bytes
+import std.stream
+import std.sync
+import std.time
+import compression
+import compression.codec as codec
+import http
+
+/// The response settings; `options()` has the defaults, `with_...` returns a changed copy.
+pub type Options = {
+    level: i32,
+    zstd: bool,
+    zstd_level: i32,
+    min_size: usize,
+    types: List[List[u8]],
+    skip: fn(http.Request, http.Response) -> bool,
+}
+
+fn never_skip(req: http.Request, resp: http.Response) -> bool { false }
+
+/// gzip/deflate level 6, no zstd, bodies of at least 1024 bytes, the media types of the module
+/// comment, nothing excepted.
+pub fn options() -> Options {
+    let mut ts: List[List[u8]] = List.new()
+    for t in ["text/*", "application/json", "application/*+json", "application/xml", "application/*+xml", "application/javascript", "application/x-javascript", "image/svg+xml"] {
+        ts.push(sys.lit(t))
+    }
+    Options(6, false, 3, 1024, ts, never_skip)
+}
+
+impl Options {
+    /// gzip and deflate level 1 (fast) to 9 (small); out of range is clamped.
+    fn with_level(self, level: i32) -> Options {
+        let l = if level < 1 { 1 } else if level > 9 { 9 } else { level }
+        Options(l, self.zstd, self.zstd_level, self.min_size, self.types, self.skip)
+    }
+
+    /// Offers zstd (level 0 to 3, clamped), ahead of gzip.
+    fn with_zstd(self, level: i32) -> Options {
+        let l = if level < 0 { 0 } else if level > 3 { 3 } else { level }
+        Options(self.level, true, l, self.min_size, self.types, self.skip)
+    }
+
+    /// Buffered bodies shorter than `n` bytes are sent as they are.
+    fn with_min_size(self, n: usize) -> Options {
+        Options(self.level, self.zstd, self.zstd_level, n, self.types, self.skip)
+    }
+
+    /// Allows one more media type: exact (`application/geo+json`) or with one `*`
+    /// (`text/*`, `application/*+json`), compared with the lowercased type and no parameters.
+    fn with_type(self, pattern: str) -> Options {
+        let mut ts = self.types.copy()
+        ts.push(sys.lit(pattern))
+        Options(self.level, self.zstd, self.zstd_level, self.min_size, ts, self.skip)
+    }
+
+    /// Empties the allow-list (then `with_type` builds another).
+    fn without_types(self) -> Options {
+        Options(self.level, self.zstd, self.zstd_level, self.min_size, List.new(), self.skip)
+    }
+
+    /// No compression when `f(request, response)` is true (BREACH rules, for instance).
+    fn except(self, f: fn(http.Request, http.Response) -> bool) -> Options {
+        Options(self.level, self.zstd, self.zstd_level, self.min_size, self.types, f)
+    }
+}
+
+/// Marks `resp` as never to be compressed by `responses`, whatever the client accepts (the
+/// mark is in `Response.ctx`; it is never sent).
+pub fn never(resp: http.Response) -> http.Response {
+    let mut r = resp.copy()
+    r.set_ctx("compress", sys.lit("never"))
+    r
+}
+
+// ---- matching media types
+
+/// Whether the media type `mt` (lowercased, no parameters) matches `pat`: equal, or `pat` has
+/// one `*` and `mt` starts with what is before it and ends with what is after it.
+pub fn type_matches(pat: List[u8], mt: List[u8]) -> bool {
+    match bytes.find_byte(pat, 42, 0) {
+        None => bytes.eq(http.lower(pat), mt)
+        Some(i) => {
+            let pre = http.lower(bytes.slice(pat, 0, i))
+            let suf = http.lower(bytes.slice(pat, i + 1, pat.len()))
+            if mt.len() < pre.len() + suf.len() { return false }
+            bytes.starts_with(mt, pre) && bytes.eq(bytes.slice(mt, mt.len() - suf.len(), mt.len()), suf)
+        }
+    }
+}
+
+fn allowed(o: Options, resp: http.Response) -> bool {
+    match resp.header("content-type") {
+        None => false
+        Some(v) => {
+            let mt = http.media_type(v)
+            for p in o.types {
+                if type_matches(p, mt) { return true }
+            }
+            false
+        }
+    }
+}
+
+// ---- responses
+
+fn is_method(m: List[u8], name: str) -> bool { bytes.eq(m, sys.lit(name)) }
+
+/// The values of every header field called `name`, joined with commas.
+pub fn joined(hs: List[http.Header], name: str) -> List[u8] {
+    let key = sys.lit(name)
+    let mut out: List[u8] = List.new()
+    for h in hs {
+        if http.eq_ci(h.name, key) {
+            if out.len() > 0 { out.push(44) }
+            bytes.append(inout out, h.value)
+        }
+    }
+    out
+}
+
+fn replaced(hs: List[http.Header], name: str, value: List[u8]) -> List[http.Header] {
+    let mut out = http.without(hs, sys.lit(name))
+    out.push(http.Header(sys.lit(name), value))
+    out
+}
+
+/// `W/` in front of a strong ETag.
+fn weakened(hs: List[http.Header]) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    for h in hs {
+        if http.eq_ci(h.name, sys.lit("etag")) && !bytes.starts_with(h.value, sys.lit("W/")) {
+            out.push(http.Header(h.name, bytes.concat(sys.lit("W/"), h.value)))
+        } else {
+            out.push(h)
+        }
+    }
+    out
+}
+
+fn with_vary(r: http.Response) -> http.Response {
+    if http.has_token(r.headers, sys.lit("vary"), sys.lit("accept-encoding")) || http.has_token(r.headers, sys.lit("vary"), sys.lit("*")) { return r }
+    let mut out = r.copy()
+    out.set_header("Vary", sys.lit("Accept-Encoding"))
+    out
+}
+
+/// Whether the response could be compressed at all, whatever the request accepts: the status,
+/// the headers and the type (not the size).
+fn candidate(o: Options, req: http.Request, resp: http.Response) -> bool {
+    let st = resp.status
+    if st < 200 || st == 204 || st == 205 || st == 206 || st == 304 { return false }
+    if resp.stream.is_some() && resp.stream.unwrap().raw { return false }
+    if http.count(resp.headers, sys.lit("content-range")) > 0 { return false }
+    if resp.get_ctx("compress").is_some() { return false }
+    if http.has_token(resp.headers, sys.lit("cache-control"), sys.lit("no-transform")) { return false }
+    // an existing Content-Encoding (other than the identity token) means encoded already
+    for t in http.list_items(joined(resp.headers, "content-encoding")) {
+        if !http.eq_ci(t, sys.lit("identity")) { return false }
+    }
+    if !allowed(o, resp) { return false }
+    let skip = o.skip
+    !skip(req, resp)
+}
+
+fn offered(o: Options) -> List[codec.Format] {
+    let mut fs: List[codec.Format] = List.new()
+    if o.zstd { fs.push(codec.Zstd) }
+    fs.push(codec.Gzip)
+    fs.push(codec.Deflate)
+    fs
+}
+
+fn event_stream(resp: http.Response) -> bool {
+    match resp.header("content-type") {
+        Some(v) => bytes.eq(http.media_type(v), sys.lit("text/event-stream"))
+        None => false
+    }
+}
+
+fn level_for(o: Options, f: codec.Format) -> i32 {
+    match f {
+        codec.Zstd => o.zstd_level
+        _ => o.level
+    }
+}
+
+fn wrap_headers(r: http.Response, f: codec.Format) -> http.Response {
+    let mut out = r.copy()
+    out.headers = weakened(r.headers)
+    out.headers = http.without(out.headers, sys.lit("content-encoding"))
+    out.headers = http.without(out.headers, sys.lit("content-length"))
+    out.set_header("Content-Encoding", sys.lit(codec.name(f)))
+    out
+}
+
+/// The coding of the codec for `f` as the response's compressed form, or `resp` itself.
+fn encode_response(o: Options, f: codec.Format, resp: http.Response) -> http.Response {
+    let packed = codec.encode(f, resp.body, level_for(o, f))
+    if packed.len() >= resp.body.len() { return resp }
+    let mut out = wrap_headers(resp, f)
+    out.body = packed
+    out
+}
+
+fn pieces_error(e: compression.Error) -> stream.Error {
+    stream.error_text(stream.Other, String.from("compress: encoder failed"))
+}
+
+/// A chunked response whose pieces are compressed as the producer sends them.
+fn encode_stream(o: Options, f: codec.Format, flush_each: bool, stm: http.Stream) -> http.Stream {
+    let run = stm.run
+    let level = level_for(o, f)
+    let go = |dx: http.Duplex| -> () {
+        let enc = sync.lock(codec.encoder(f, level))
+        let pass = dx.send
+        let send = |data: List[u8]| -> Result[(), stream.Error] {
+            if data.len() == 0 { return Ok(()) }
+            let wire = enc.modify(|inout e: codec.Encoder| -> Result[List[u8], compression.Error] {
+                let mut out: List[u8] = List.new()
+                e.write(data, inout out)?
+                if flush_each { e.flush(inout out)? }
+                Ok(out)
+            })
+            match wire {
+                Ok(w) => {
+                    if w.len() == 0 { return Ok(()) }
+                    pass(w)
+                }
+                Err(e) => Err(pieces_error(e))
+            }
+        }
+        run(http.Duplex(dx.recv, send, dx.stopping))
+        let tail = enc.modify(|inout e: codec.Encoder| -> List[u8] {
+            let mut out: List[u8] = List.new()
+            match e.finish(inout out) {
+                Ok(z) => {}
+                Err(x) => {}
+            }
+            out
+        })
+        if tail.len() > 0 {
+            let z = pass(tail)
+        }
+    }
+    http.Stream(go, false)
+}
+
+/// What `responses` does to one response (module comment); `req` is the request that was
+/// answered.
+pub fn compress_response(o: Options, req: http.Request, resp: http.Response) -> http.Response {
+    if !candidate(o, req, resp) { return resp }
+    let small = resp.stream.is_none() && resp.body.len() < o.min_size
+    if small { return resp }
+    let r = with_vary(resp)
+    if is_method(req.method, "HEAD") { return r }
+    if http.count(req.headers, sys.lit("range")) > 0 { return r }
+    let f = match codec.negotiate(joined(req.headers, "accept-encoding"), offered(o)) {
+        Some(x) => x
+        None => { return r }
+    }
+    match r.stream {
+        Some(stm) => {
+            let mut out = wrap_headers(r, f)
+            out.stream = Some(encode_stream(o, f, event_stream(r), stm))
+            out
+        }
+        None => encode_response(o, f, r)
+    }
+}
+
+/// The middleware: `h`'s responses compressed as the module comment says.
+pub fn responses(o: Options, h: http.Handler) -> http.Handler {
+    |req: http.Request| -> http.Response { compress_response(o, req, h(req)) }
+}
+
+// ---- decoding
+
+/// A refusal: the status to answer with (a request) and what is wrong.
+pub type Failure = { status: i32, message: String }
+
+/// The status for a decoding error: 413 for a bomb, 415 for what is not supported, 400 else.
+pub fn status_of(e: compression.Error) -> i32 {
+    match e.kind {
+        compression.TooLarge => 413
+        compression.RatioExceeded => 413
+        compression.Unsupported => 415
+        compression.Dictionary => 415
+        _ => 400
+    }
+}
+
+fn failure(status: i32, why: str) -> Failure { Failure(status, String.from(why)) }
+
+fn from_error(e: compression.Error) -> Failure {
+    let mut m = String.from("compressed body: ")
+    m.append(e.message.copy())
+    Failure(status_of(e), m)
+}
+
+/// The codings to undo, outermost last applied first: `Content-Encoding`'s (`identity` dropped), or
+/// for `transfer` the `Transfer-Encoding`'s without the final `chunked`.
+pub fn codings(hs: List[http.Header], transfer: bool) -> List[List[u8]] {
+    let mut items = http.list_items(joined(hs, if transfer { "transfer-encoding" } else { "content-encoding" }))
+    if transfer && items.len() > 0 && http.eq_ci(items[items.len() - 1], sys.lit("chunked")) {
+        items = bytes_prefix(items, items.len() - 1)
+    }
+    let mut out: List[List[u8]] = List.new()
+    for t in items {
+        if !http.eq_ci(t, sys.lit("identity")) { out.push(t) }
+    }
+    out
+}
+
+fn bytes_prefix(xs: List[List[u8]], n: usize) -> List[List[u8]] {
+    let mut out: List[List[u8]] = List.new()
+    for i in 0..n { out.push(xs[i]) }
+    out
+}
+
+/// The format of the one coding `cs` names, None when there is none; Err for several or one
+/// that is not supported (415).
+pub fn format_for(cs: List[List[u8]]) -> Result[Option[codec.Format], Failure] {
+    if cs.len() == 0 { return Ok(None) }
+    if cs.len() > 1 { return Err(failure(415, "more than one content coding")) }
+    match codec.format_of(cs[0]) {
+        Some(f) => Ok(Some(f))
+        None => Err(failure(415, "unsupported content coding"))
+    }
+}
+
+/// Decodes a whole body in format `f` under `lim`.
+pub fn decode_body(f: codec.Format, body: List[u8], lim: compression.Limits) -> Result[List[u8], Failure] {
+    match codec.decode(f, body, lim) {
+        Ok(b) => Ok(b)
+        Err(e) => Err(from_error(e))
+    }
+}
+
+/// Request or response headers after a body was decoded: the coding header gone (for the
+/// transfer codings, `Transfer-Encoding` is just `chunked`) and `Content-Length` the new length
+/// where there was one.
+fn decoded_headers(hs: List[http.Header], transfer: bool, n: usize) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    if transfer {
+        out = replaced(hs, "transfer-encoding", sys.lit("chunked"))
+    } else {
+        out = http.without(hs, sys.lit("content-encoding"))
+        if http.count(out, sys.lit("content-length")) > 0 {
+            out = replaced(out, "content-length", bytes.from_u64(n as u64))
+        }
+    }
+    out
+}
+
+/// Undoes the coding (`Content-Encoding`, or for `transfer` the transfer coding) of a request's
+/// body under `lim`: the request as the handler should see it, or the response to send instead
+/// (413, 415, 400; a plain error response, which `middleware.problems` turns into problem+json).
+pub fn decode_request(req: http.Request, transfer: bool, lim: compression.Limits) -> Result[http.Request, http.Response] {
+    let f = match format_for(codings(req.headers, transfer)) {
+        Ok(Some(x)) => x
+        Ok(None) => { return Ok(req) }
+        Err(fl) => { return Err(refusal(fl)) }
+    }
+    let mut out = req.copy()
+    match req.stream {
+        Some(b) => {
+            out.stream = Some(decoding_body(b, f, lim))
+            out.headers = decoded_headers(req.headers, transfer, 0)
+            out.headers = http.without(out.headers, sys.lit("content-length"))
+        }
+        None => {
+            if req.body.len() == 0 { return Ok(req) }
+            match decode_body(f, req.body, lim) {
+                Ok(plain) => {
+                    out.body = plain
+                    out.headers = decoded_headers(req.headers, transfer, plain.len())
+                }
+                Err(fl) => { return Err(refusal(fl)) }
+            }
+        }
+    }
+    out.set_ctx("content_encoding", codings(req.headers, transfer)[0])
+    Ok(out)
+}
+
+fn refusal(fl: Failure) -> http.Response {
+    let mut r = http.error_response(fl.status)
+    r.keep_alive = false
+    r
+}
+
+/// The middleware: request bodies with a `Content-Encoding` decoded under `lim` (module
+/// comment). Put it inside rate limiting and outside the router.
+pub fn requests(lim: compression.Limits, h: http.Handler) -> http.Handler {
+    |req: http.Request| -> http.Response {
+        match decode_request(req, false, lim) {
+            Ok(r) => h(r)
+            Err(resp) => resp
+        }
+    }
+}
+
+// ---- a streamed body, decoded as it is read
+
+type Dec = { d: codec.Decoder, pending: List[u8], done: bool, failed: Option[stream.Error], inner: http.Pull }
+
+fn fail_of(f: Failure) -> stream.Error {
+    let mut m = String.from_int(f.status as i64)
+    m.push_str(" ")
+    m.append(f.message.copy())
+    stream.error_text(stream.InvalidData, m)
+}
+
+fn pull_decoded(inout s: Dec, max: usize, dl: time.Deadline) -> Result[List[u8], stream.Error] {
+    while true {
+        if s.pending.len() > 0 {
+            let n = if s.pending.len() < max { s.pending.len() } else { max }
+            let out = bytes.slice(s.pending, 0, n)
+            s.pending = bytes.slice(s.pending, n, s.pending.len())
+            return Ok(out)
+        }
+        match s.failed {
+            Some(e) => { return Err(e) }
+            None => {}
+        }
+        if s.done { return Ok(List.new()) }
+        let take = s.inner
+        let got = take(65536, dl)?
+        if got.len() == 0 {
+            match s.d.finish() {
+                Ok(z) => { s.done = true }
+                Err(e) => {
+                    let fl = from_error(e)
+                    let err = match e.kind {
+                        compression.Truncated => stream.error_text(stream.UnexpectedEof, String.from("400 compressed body: cut short"))
+                        _ => fail_of(fl)
+                    }
+                    s.failed = Some(err)
+                }
+            }
+        } else {
+            let mut produced = s.pending.copy()
+            let r = s.d.feed(got, inout produced)
+            s.pending = produced
+            match r {
+                Ok(z) => {}
+                Err(e) => { s.failed = Some(fail_of(from_error(e))) }
+            }
+        }
+    }
+    Err(stream.error(stream.Other, "unreachable"))
+}
+
+fn decoding_body(b: http.Body, f: codec.Format, lim: compression.Limits) -> http.Body {
+    let st = sync.lock(Dec(codec.decoder(f, lim), List.new(), false, None, b.pull))
+    http.Body(|max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
+        st.modify(|inout s: Dec| -> Result[List[u8], stream.Error] { pull_decoded(inout s, max, dl) })
+    })
+}
+
+// ---- responses on the client side
+
+/// Undoes the `Content-Encoding` and the transfer coding of a response (the client's, with
+/// `Conn.with_decoding`) under `lim`: the response with the plain body and no coding headers.
+pub fn decode_response(resp: http.Response, lim: compression.Limits) -> Result[http.Response, String] {
+    let mut out = resp.copy()
+    for transfer in [true, false] {
+        let f = match format_for(codings(out.headers, transfer)) {
+            Ok(Some(x)) => x
+            Ok(None) => { continue }
+            Err(fl) => { return Err(fl.message) }
+        }
+        if out.body.len() == 0 { continue }
+        match decode_body(f, out.body, lim) {
+            Ok(plain) => {
+                out.body = plain
+                out.headers = decoded_headers(out.headers, transfer, plain.len())
+            }
+            Err(fl) => { return Err(fl.message) }
+        }
+    }
+    Ok(out)
+}
