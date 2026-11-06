@@ -1,0 +1,157 @@
+//! http/transport: the bytes under a connection, plain TCP or TLS. The server, the client and
+//! the WebSocket client do every read, write, wait and close of a connection through a
+//! `Transport`, so none of them knows which it has.
+//!
+//! A `Transport` is a socket and, for https, a `Secure`: five functions over the TLS session
+//! (decrypted bytes buffered?, read without waiting, write before a deadline, close_notify, and
+//! what was negotiated). The session itself, eider-tls, is in http/secure and only there: this
+//! module (so http/server, http/client and http/ws, and every program that imports them) does not
+//! import it, so a program that serves or fetches plain HTTP loads no TLS and no crypto code and
+//! needs no grant for them (docs/services.md "TLS"). `Secure` is built by http/secure.
+//!
+//! Plain connections take the same code as before the abstraction: one `match` on `sec` and
+//! then the direct calls (`sock.send_by`, `net.try_recv`, `fd.wait_ready`).
+//!
+//! Waiting: TLS buffers, so the socket being quiet does not mean nothing can be read (a record
+//! that came in with the previous one), and the socket being readable does not mean something can
+//! (half a record). `wait_readable` therefore asks the session first and the socket second, and
+//! `try_recv` returns `None` for "nothing whole yet", as it does for a socket with nothing.
+
+import std.fd
+import std.net
+import std.time
+import http.sock
+
+/// A TLS session, as the functions http needs from it. Built by http/secure (`secure.wrap`).
+/// `ready()`: decrypted bytes (or the peer's close, or a whole record) can be read without waiting
+/// for the network; `recv(max)`: at most `max` decrypted bytes, `Some(empty)` when the peer closed
+/// cleanly, `None` when nothing whole has arrived, `Err` for a failed or truncated session (a
+/// connection cut without close_notify); `send(data, dl)`: all of it before `dl`, false if it
+/// could not; `notify(ms)`: close_notify, best effort, waiting at most `ms` milliseconds for the socket. `alpn` is the negotiated protocol (empty:
+/// none), `suite` the cipher suite name, `peer_certs` the peer's certificates (DER, leaf first;
+/// empty for a client that sent none).
+pub type Secure = {
+    ready: fn() -> bool,
+    recv: fn(usize) -> Result[Option[List[u8]], String],
+    send: fn(List[u8], time.Deadline) -> bool,
+    notify: fn(i64),
+    alpn: List[u8],
+    suite: String,
+    peer_certs: List[List[u8]]
+}
+
+/// A connection: the socket and, over TLS, its session.
+pub type Transport = { fd: i32, sec: Option[Secure] }
+
+/// Runs the server side of TLS on an accepted socket (the handshake, before its own deadline) and
+/// returns the transport; `reload(chain_pem, key_pem)` swaps the certificate used for the
+/// connections accepted after it. Built by http/secure; given to `server.Config.secure`.
+pub type Acceptor = {
+    accept: fn(i32) -> Result[Transport, String],
+    reload: fn(List[u8], List[u8]) -> Result[(), String]
+}
+
+/// Runs the client side of TLS on a connected socket before the deadline. Built by http/secure
+/// (it holds the host name to verify and the trust store); given to `client.connect_host_secure`.
+pub type Connector = fn(i32, time.Deadline) -> Result[Secure, String]
+
+/// A plain connection on `fd`.
+pub fn plain(fd: i32) -> Transport { Transport(fd, None) }
+
+impl Transport {
+    fn is_secure(self) -> bool { self.sec.is_some() }
+
+    /// The negotiated ALPN protocol over TLS (empty: none, or a plain connection).
+    fn alpn(self) -> List[u8] {
+        match self.sec {
+            Some(s) => s.alpn
+            None => List.new()
+        }
+    }
+
+    /// Whether `try_recv` could return data now without the socket becoming readable (always
+    /// false for a plain connection).
+    fn ready_to_read(self) -> bool {
+        match self.sec {
+            Some(s) => {
+                let r = s.ready
+                r()
+            }
+            None => false
+        }
+    }
+
+    /// Sends all of `data` before `dl`: false if the deadline passed or the peer is gone.
+    fn send_by(self, data: List[u8], dl: time.Deadline) -> bool uses net, io, clock {
+        match self.sec {
+            None => sock.send_by(self.fd, data, dl)
+            Some(s) => {
+                let f = s.send
+                f(data, dl)
+            }
+        }
+    }
+
+    /// Reads at most `max` bytes without waiting: `None` when nothing whole is there (after a
+    /// wait for readability), `Some(empty)` when the peer closed.
+    fn try_recv(self, max: i64) -> Result[Option[List[u8]], String] uses net, io, clock {
+        match self.sec {
+            None => net.try_recv(self.fd, max)
+            Some(s) => {
+                let f = s.recv
+                f(max as usize)
+            }
+        }
+    }
+
+    /// Waits until a read may give something (data buffered in the session, or the socket
+    /// readable) or `dl`: false on the deadline.
+    fn wait_readable(self, dl: time.Deadline) -> Result[bool, String] uses io, clock {
+        if self.ready_to_read() { return Ok(true) }
+        fd.wait_ready(self.fd, fd.READY_READ, dl)
+    }
+
+    /// Reads between 1 and `max` bytes, waiting no longer than `dl`: `None` on the deadline,
+    /// `Some(empty)` when the peer closed.
+    fn read_by(self, max: i64, dl: time.Deadline) -> Result[Option[List[u8]], String] uses net, io, clock {
+        match self.sec {
+            None => fd.read_by(self.fd, max, dl)
+            Some(s) => {
+                while true {
+                    if !self.wait_readable(dl)? { return Ok(None) }
+                    match self.try_recv(max)? {
+                        Some(b) => { return Ok(Some(b)) }
+                        None => {}
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Half-close, read and drop what the peer still sends until it closes, 64 KiB or `dl`, then
+    /// close the socket: the peer reads our last response instead of a reset. Over TLS the
+    /// close_notify goes first (within 200 ms: a peer that does not read it is not waited for).
+    fn linger_close(self, dl: time.Deadline) uses net, io, clock {
+        match self.sec {
+            Some(s) => {
+                let n = s.notify
+                n(200)
+            }
+            None => {}
+        }
+        sock.linger_close(self.fd, dl)
+    }
+
+    /// Closes at once: over TLS a best-effort close_notify (100 ms at most) first.
+    fn close_now(self) uses io {
+        match self.sec {
+            Some(s) => {
+                let n = s.notify
+                n(100)
+            }
+            None => {}
+        }
+        fd.close(self.fd)
+    }
+}

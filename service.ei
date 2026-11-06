@@ -60,6 +60,7 @@ import http.proxy
 import http.ratelimit
 import http.profiling
 import http.compress
+import http.transport
 import compression
 
 /// The settings. All have defaults (`options()`); `with_...` returns a changed copy.
@@ -121,8 +122,11 @@ impl Options {
         Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, d, self.compress, self.decode)
     }
 
+    /// Uses `c` as the server's config; the TLS setting of `with_tls` is kept unless `c` has its own.
     fn with_server(self, c: server.Config) -> Options {
-        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, c, self.drain_delay, self.compress, self.decode)
+        let mut cc = c.copy()
+        if cc.secure.is_none() { cc.secure = self.server.secure }
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, cc, self.drain_delay, self.compress, self.decode)
     }
 
     /// Compresses responses with `c` (`compress.options()` is the default).
@@ -144,6 +148,16 @@ impl Options {
     /// Request bodies are handed to the handlers as they arrived, `Content-Encoding` and all.
     fn no_request_decoding(self) -> Options {
         Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, self.server, self.drain_delay, self.compress, None)
+    }
+
+    /// Serves https: every connection runs the TLS handshake of `a` (from http/secure: `secure.server_from_files(...)?.acceptor()`)
+    /// before its first request. `serve` and `run` use it through `server.Config.secure`; the server must be
+    /// `server.listen`ed with these options (`run` does). This module does not import TLS: programs that serve plain
+    /// HTTP load none of it.
+    fn with_tls(self, a: transport.Acceptor) -> Options {
+        let mut c = self.server.copy()
+        c.secure = Some(a)
+        Options(self.health, self.metrics, self.logger, self.trust, self.limit, self.profiling, c, self.drain_delay, self.compress, self.decode)
     }
 
     fn with_profiling(self, p: profiling.Options) -> Options {

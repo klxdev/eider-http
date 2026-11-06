@@ -316,7 +316,7 @@ fn main() uses io, net, clock, threads {
             wire = ws.encode_frame(true, ws.BINARY, over, key)
         }
         if which == 3 { wire = ws.encode_frame(true, ws.CONTINUATION, lit("x"), key) }
-        net.send_all(cv.fd, wire).unwrap()
+        net.send_all(cv.tr.fd, wire).unwrap()
         match cv.recv_frame(dl) {
             Ok(f) => print(close_text(f))
             Err(e) => print(cat("error: ", e))

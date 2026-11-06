@@ -15,7 +15,12 @@
 //! (control bytes, spaces, `/`, `@`, `#`, `?`, non-ASCII, over 253 bytes) is refused before
 //! anything is sent or resolved.
 //!
-//! Not here yet (docs/services.md "Next steps"): TLS (C3: use a proxy), connection pools,
+//! https (http/secure): a `Conn` made by `secure.connect_url` or `secure.connect_host` runs TLS 1.3 on
+//! each connection it opens (again on every reconnect) before the first request; the certificate and
+//! the host name are verified by the `Connector` it was made with, and keep-alive reuse works as over
+//! TCP. This module does not import TLS (http/transport); `connect_bytes` takes the connector.
+//!
+//! Not here yet (docs/services.md "Next steps"): connection pools,
 //! redirects, automatic retries (a request on a reused connection that the server had
 //! already closed fails with Err; send it again on a new Conn if it is idempotent), streaming
 //! bodies, and happy-eyeballs (addresses are tried one after the other).
@@ -28,13 +33,16 @@ import std.time
 import http
 import http.parse
 import http.sock
+import http.transport
 import http.compress
 import compression
 
 /// A connection to `addr`. `host` is what goes in the Host header ("127.0.0.1:8080");
 /// `open` says whether a connection is up now.
-/// `decode` is None unless `with_decoding` was called (below).
-pub type Conn = { fd: i32, addr: net.Addr, host: List[u8], lim: http.Limits, parser: parse.Parser, open: bool, name: List[u8], port: i32, decode: Option[compression.Limits] }
+/// `decode` is None unless `with_decoding` was called (below). `connector` is None for plain HTTP; over
+/// https it runs the TLS handshake on each new socket and `sec` is the session of the connection
+/// that is up.
+pub type Conn = { fd: i32, addr: net.Addr, host: List[u8], lim: http.Limits, parser: parse.Parser, open: bool, name: List[u8], port: i32, decode: Option[compression.Limits], connector: Option[transport.Connector], sec: Option[transport.Secure] }
 
 /// Connects to `a` before `dl` (non-blocking connect, then a wait for it).
 pub fn connect(a: net.Addr, dl: time.Deadline) -> Result[Conn, String] uses net, io, clock {
@@ -44,7 +52,23 @@ pub fn connect(a: net.Addr, dl: time.Deadline) -> Result[Conn, String] uses net,
 /// `connect`, with limits on the responses it will read.
 pub fn connect_with(a: net.Addr, lim: http.Limits, dl: time.Deadline) -> Result[Conn, String] uses net, io, clock {
     let s = dial(a, dl)?
-    Ok(Conn(s, a, net.text(a), lim, parse.responses(lim), true, List.new(), 0, None))
+    Ok(Conn(s, a, net.text(a), lim, parse.responses(lim), true, List.new(), 0, None, None, None))
+}
+
+/// The TLS session on the new socket `s` when the connection is https; on failure the socket is closed.
+fn start_tls(s: i32, cn: Option[transport.Connector], dl: time.Deadline) -> Result[Option[transport.Secure], String] uses net, io, clock {
+    match cn {
+        None => Ok(None)
+        Some(f) => {
+            match f(s, dl) {
+                Ok(sec) => Ok(Some(sec))
+                Err(e) => {
+                    fd.close(s)
+                    Err(e)
+                }
+            }
+        }
+    }
 }
 
 fn dial(a: net.Addr, dl: time.Deadline) -> Result[i32, String] uses net, io, clock {
@@ -76,7 +100,7 @@ impl Conn {
     /// connection is closed. Off by default (a client that did not ask for it sees the bytes the
     /// server sent). The limit on the compressed body is the connection's `http.Limits`.
     fn with_decoding(self, lim: compression.Limits) -> Conn {
-        Conn(self.fd, self.addr, self.host, self.lim, self.parser, self.open, self.name, self.port, Some(lim))
+        Conn(self.fd, self.addr, self.host, self.lim, self.parser, self.open, self.name, self.port, Some(lim), self.connector, self.sec)
     }
 
     /// Sends `req` and reads its response (skipping 1xx interim responses), connecting
@@ -92,6 +116,7 @@ impl Conn {
             } else {
                 self.fd = dial(self.addr, dl)?
             }
+            self.sec = start_tls(self.fd, self.connector, dl)?
             self.parser = parse.responses(self.lim)
             self.open = true
         }
@@ -100,7 +125,7 @@ impl Conn {
             sent.set_header("Accept-Encoding", sys.lit("gzip, deflate, zstd"))
         }
         let wire = http.write_request(sent, self.host, req.keep_alive)?
-        if !sock.send_by(self.fd, wire, dl) {
+        if !self.transport().send_by(wire, dl) {
             self.close()
             return Err(String.from("send: deadline exceeded or connection closed"))
         }
@@ -141,8 +166,9 @@ impl Conn {
                 parse.Bad(st, why) => { return Err(bad(why)) }
                 parse.More => {}
             }
-            if !fd.wait_ready(self.fd, fd.READY_READ, dl)? { return Err(String.from("response: deadline exceeded")) }
-            match net.try_recv(self.fd, 65536)? {
+            let tr = self.transport()
+            if !tr.wait_readable(dl)? { return Err(String.from("response: deadline exceeded")) }
+            match tr.try_recv(65536)? {
                 Some(b) => {
                     if b.len() == 0 {
                         match self.parser.eof() {
@@ -159,10 +185,20 @@ impl Conn {
         Err(String.from("unreachable"))
     }
 
-    /// Closes the connection (idempotent).
+    /// The connection's bytes: the socket and, over https, its TLS session.
+    fn transport(self) -> transport.Transport { transport.Transport(self.fd, self.sec) }
+
+    /// Whether the connection that is up (or the next one) is https.
+    fn is_https(self) -> bool { self.connector.is_some() }
+
+    /// The ALPN protocol the TLS handshake chose on the connection that is up (empty: plain, or none).
+    fn alpn(self) -> List[u8] { self.transport().alpn() }
+
+    /// Closes the connection (idempotent); over https a close_notify is sent first (best effort).
     fn close(inout self) uses io {
         if self.open {
-            fd.close(self.fd)
+            self.transport().close_now()
+            self.sec = None
             self.open = false
         }
     }
@@ -214,13 +250,16 @@ pub fn valid_host(h: List[u8]) -> bool {
 type Dialed = { fd: i32, addr: net.Addr }
 
 /// The host as the Host header writes it: `name`, `name:port`, `[v6]:port`.
-fn host_header(name: List[u8], port: i32) -> List[u8] {
+fn host_header(name: List[u8], port: i32) -> List[u8] { host_header_for(name, port, 80) }
+
+/// `host_header` for a scheme whose default port is `dflt` (80 for http, 443 for https).
+pub fn host_header_for(name: List[u8], port: i32, dflt: i32) -> List[u8] {
     let mut out: List[u8] = List.new()
     let v6 = bytes.find_byte(name, 58, 0).is_some()
     if v6 { out.push(91) }
     bytes.append(inout out, name)
     if v6 { out.push(93) }
-    if port != 80 {
+    if port != dflt {
         out.push(58)
         bytes.append(inout out, bytes.from_u64(port as u64))
     }
@@ -277,7 +316,19 @@ pub fn connect_host_with(name: str, port: i32, lim: http.Limits, dl: time.Deadli
     let d = connect_name(n, port, dl)?
     // an address literal is reconnected without the resolver; a name is resolved again
     let literal = net.parse(n, port).is_ok()
-    Ok(Conn(d.fd, d.addr, host_header(n, port), lim, parse.responses(lim), true, if literal { List.new() } else { n }, port, None))
+    Ok(Conn(d.fd, d.addr, host_header(n, port), lim, parse.responses(lim), true, if literal { List.new() } else { n }, port, None, None, None))
+}
+
+/// `connect_host_with` over a host name given as bytes, and for https when `connector` is Some (http/secure
+/// calls this): the TCP connection is made as for http, then `connector` runs the TLS handshake on it (and
+/// on every reconnect) before the deadline `dl`, which covers both. The Host header omits the scheme's
+/// default port (80, or 443 over TLS).
+pub fn connect_bytes(name: List[u8], port: i32, lim: http.Limits, connector: Option[transport.Connector], dl: time.Deadline) -> Result[Conn, String] uses net, io, clock {
+    let d = connect_name(name, port, dl)?
+    let sec = start_tls(d.fd, connector, dl)?
+    let literal = net.parse(name, port).is_ok()
+    let dflt = if connector.is_some() { 443 } else { 80 }
+    Ok(Conn(d.fd, d.addr, host_header_for(name, port, dflt), lim, parse.responses(lim), true, if literal { List.new() } else { name }, port, None, connector, sec))
 }
 
 /// One request to `name:port` on a new connection, closed afterwards.

@@ -1,0 +1,97 @@
+// The Eider https client for tests/tls_interop.sh, against `openssl s_server`:
+//
+//   tls_interop_client <port> <roots.pem> <host> [target] [identity=<chain.pem>,<key.pem>] [insecure=1]
+//
+// Prints `status N`, `alpn P` and the first bytes of the body, or `error: <why>`; exit 0 on an answer, 2 on an error.
+
+import std.bytes
+import std.env
+import std.fs
+import std.io
+import std.net
+import std.strings
+import std.time
+import std.utf8
+import http
+import http.client
+import http.secure
+import tls.config
+
+fn arg(i: usize) -> String uses io {
+    let a = env.args()
+    if i < a.len() { return utf8.lossy(a[i].copy()) }
+    String.from("")
+}
+
+fn opt(name: str) -> Option[String] uses io {
+    let a = env.args()
+    let mut prefix = String.from(name)
+    prefix.push_str("=")
+    let mut i: usize = 4
+    while i < a.len() {
+        let s = utf8.lossy(a[i].copy())
+        if strings.starts_with(s, prefix) { return strings.strip_prefix(s, prefix) }
+        i += 1
+    }
+    None
+}
+
+fn main() uses io, net, clock, fs {
+    let port = strings.parse_i64(arg(1)).unwrap() as i32
+    let roots = fs.read(arg(2).bytes()).unwrap()
+    let host = arg(3)
+    let mut target = String.from("/")
+    if arg(4).len() > 0 && arg(4).byte(0) == 47 { target = arg(4) }
+    let mut tls = secure.client_roots_pem(roots).unwrap()
+    match opt("insecure") {
+        Some(v) => { tls = secure.client_insecure_skip_verify_for_tests() }
+        None => {}
+    }
+    match opt("identity") {
+        Some(v) => {
+            let parts = strings.split(v, ",")
+            let id = config.identity_from_files(parts[0].copy(), parts[1].copy()).unwrap()
+            tls = tls.with_identity(id)
+        }
+        None => {}
+    }
+    let dl = time.after_ms(15000)
+    let mut url = String.from("https://")
+    url.append(host)
+    url.push_str(":")
+    url.append(String.from_int(port as i64))
+    url.append(target.copy())
+    let mut c = match secure.connect_url(url.bytes(), tls, dl) {
+        Ok(c) => c
+        Err(e) => {
+            print(cat_err(e))
+            env.exit(2)
+            return
+        }
+    }
+    let mut q = http.request("GET", target.bytes())
+    q.keep_alive = false
+    match c.request(q, dl) {
+        Ok(r) => {
+            let mut t = String.from("status ")
+            t.append(String.from_int(r.status as i64))
+            print(t)
+            let mut a = String.from("alpn ")
+            a.append(utf8.lossy(c.alpn()))
+            print(a)
+            let n = if r.body.len() < 400 { r.body.len() } else { 400 }
+            print(utf8.lossy(bytes.slice(r.body, 0, n)))
+        }
+        Err(e) => {
+            print(cat_err(e))
+            env.exit(2)
+        }
+    }
+    c.close()
+}
+
+fn cat_err(e: String) -> String {
+    let mut t = String.from("error: ")
+    t.append(e)
+    t
+}

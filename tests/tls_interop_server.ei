@@ -1,0 +1,85 @@
+// The Eider https server for tests/tls_interop.sh, against `openssl s_client` and `curl`:
+//
+//   tls_interop_server <chain.pem> <key.pem> [clientca=<ca.pem>] [require=1]
+//
+// Serves GET /hello, GET /info (what TLS gave the handler), GET /stream (chunked, slow), GET /quit (stops
+// the server and exits). Prints `listening <port>` once it is up.
+
+import core.sys
+import std.bytes
+import std.env
+import std.fs
+import std.io
+import std.net
+import std.strings
+import std.task
+import std.time
+import std.utf8
+import http
+import http.router
+import http.server
+import http.secure
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn opt(name: str) -> Option[String] uses io {
+    let a = env.args()
+    let mut prefix = String.from(name)
+    prefix.push_str("=")
+    let mut i: usize = 3
+    while i < a.len() {
+        let s = utf8.lossy(a[i].copy())
+        if strings.starts_with(s, prefix) { return strings.strip_prefix(s, prefix) }
+        i += 1
+    }
+    None
+}
+
+fn main() uses io, net, clock, threads, fs {
+    let a = env.args()
+    let mut tls = secure.server_from_files(utf8.lossy(a[1].copy()), utf8.lossy(a[2].copy())).unwrap()
+    match opt("clientca") {
+        Some(p) => {
+            let ca = fs.read(p.bytes()).unwrap()
+            let need = opt("require").is_some()
+            tls = tls.with_client_auth_pem(ca, need).unwrap()
+        }
+        None => {}
+    }
+    let tok = task.root()
+    let mut r = router.new()
+    r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello tls") })
+    r.get("/info", |q: http.Request| -> http.Response {
+        let mut t = String.from("tls=")
+        t.append(sys.to_string(q.get_ctx("tls").unwrap_or(lit("-"))))
+        t.push_str(" cert=")
+        t.append(String.from_int(q.get_ctx("tls_client_cert").unwrap_or(List.new()).len() as i64 / 100))
+        t.push_str(" peer=")
+        t.append(sys.to_string(bytes.slice(q.peer, 0, 10)))
+        http.respond(200, "text/plain", t.bytes())
+    })
+    r.get("/stream", |q: http.Request| -> http.Response {
+        let mut resp = http.response(200)
+        resp.set_header("Content-Type", lit("text/plain"))
+        resp.stream = Some(http.Stream(|d: http.Duplex| -> () {
+            for i in 0..(20 as i32) {
+                let z = d.write(lit("0123456789abcdef0123456789abcdef\n"))
+                time.sleep(time.millis(25))
+            }
+        }, false))
+        resp
+    })
+    let t2 = tok
+    r.get("/quit", |q: http.Request| -> http.Response {
+        t2.cancel()
+        http.text(200, "bye")
+    })
+    let mut cfg = server.config()
+    cfg.secure = Some(tls.acceptor())
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let mut up = String.from("listening ")
+    up.append(String.from_int(srv.port() as i64))
+    io.outln(up.bytes())
+    let h = router.handler(r)
+    let s = srv.serve(h, tok).unwrap()
+}

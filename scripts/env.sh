@@ -26,7 +26,7 @@
 # $toolchain/.vendor/<name> (fetched there and hash-checked by its scripts/vendor.sh on first
 # use). A dependency with none of these is fetched from its repository (network).
 # DEPS: the git packages in this repository's dependency graph (transitive ones included).
-DEPS="json logging compression"
+DEPS="json logging compression tls"
 
 die() { echo "$(basename "$0"): $*" >&2; exit 2; }
 install_hint="install eider (gh release download --repo klxdev/eider-lang --pattern install.sh && sh install.sh --toolchain; eider-lang's docs/site/tooling/eider.md), or set EIDER_TOOLCHAIN to an Eider toolchain or an eider-lang checkout"
@@ -89,3 +89,7 @@ for d in $DEPS; do
   fi
 done
 export EIDER_PKG_OVERRIDE
+
+# crypto is the toolchain's own package (eider.toml's `[deps.crypto] toolchain = true`, Eider 0.7.6
+# and later: the toolchain's packages/crypto and its libeider_crypto backend): nothing to link.
+[ -d "$toolchain/packages/crypto" ] || die "$toolchain ($chosen) is Eider $theirs, which does not ship packages/crypto; eider-$pkg_name $mine needs Eider 0.7.6 or later (\`eider toolchain install 0.7\`)"

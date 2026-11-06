@@ -35,7 +35,10 @@
 //! vectors. Not here: permessage-deflate and other extensions, TLS (use a proxy).
 //!
 //! Client: `dial(addr, target, deadline)` performs the handshake over a client.Conn and returns a
-//! `Client` that masks what it sends; `send_text`, `send_binary`, `recv`, `close`.
+//! `Client` that masks what it sends; `send_text`, `send_binary`, `recv`, `close`. `dial_conn(c, ...)` does
+//! the same over a `client.Conn` already connected, which is how wss works: `secure.connect_url("https://...")`
+//! (http/secure) makes the Conn, and the frames then travel through its `Transport`, so the client code is the
+//! same over TLS. The server side needs nothing: a handler's `Duplex` is already the connection's transport.
 
 import core.sys
 import std.bytes
@@ -49,6 +52,7 @@ import std.time
 import std.utf8
 import http
 import http.client
+import http.transport
 
 // ---- SHA-1 (FIPS 180-4), in u64 arithmetic masked to 32 bits
 
@@ -536,15 +540,21 @@ pub fn accept(req: http.Request, opts: Options, run: fn(Conn)) -> http.Response 
 // ---- the client
 
 /// A client connection: it masks what it sends. Not thread-safe (one user at a time).
-pub type Client = { fd: i32, dec: Decoder, closed: bool, idle_ms: i64, protocol: List[u8] }
+pub type Client = { tr: transport.Transport, dec: Decoder, closed: bool, idle_ms: i64, protocol: List[u8] }
 
 /// Connects to `addr`, performs the handshake for `target` (with `protocols` offered) and returns
 /// the connection. Err: no connection, not a 101, or a wrong `Sec-WebSocket-Accept`.
 pub fn dial(addr: net.Addr, target: str, protocols: List[List[u8]], dl: time.Deadline) -> Result[Client, String] uses net, io, clock {
-    let mut c = client.connect(addr, dl)?
+    let c = client.connect(addr, dl)?
+    dial_conn(c, sys.lit(target), protocols, dl)
+}
+
+/// `dial` over `c`, a connection from `client.connect...` (plain or https, no request made yet).
+pub fn dial_conn(conn: client.Conn, target: List[u8], protocols: List[List[u8]], dl: time.Deadline) -> Result[Client, String] uses net, io, clock {
+    let mut c = conn.copy()
     let raw = random.bytes(16)?
     let key = encoding.base64(raw).bytes()
-    let mut req = http.request("GET", sys.lit(target))
+    let mut req = http.request("GET", target)
     req.set_header("Upgrade", sys.lit("websocket"))
     req.set_header("Connection", sys.lit("Upgrade"))
     req.set_header("Sec-WebSocket-Key", key)
@@ -562,13 +572,13 @@ pub fn dial(addr: net.Addr, target: str, protocols: List[List[u8]], dl: time.Dea
     // bytes the server sent after the 101 are in the client's parser
     let mut dec = decoder(false, 16777216)
     dec.feed(bytes.slice(c.parser.buf, c.parser.pos, c.parser.buf.len()))
-    Ok(Client(c.fd, dec, false, 20000, resp.header("sec-websocket-protocol").unwrap_or(List.new())))
+    Ok(Client(c.transport(), dec, false, 20000, resp.header("sec-websocket-protocol").unwrap_or(List.new())))
 }
 
 impl Client {
     fn send_frame(self, fin: bool, opcode: u8, payload: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock {
         let wire = encode_frame(fin, opcode, payload, mask_key())
-        if !send_bytes(self.fd, wire, dl) { return Err(String.from("send failed")) }
+        if !self.tr.send_by(wire, dl) { return Err(String.from("send failed")) }
         Ok(())
     }
 
@@ -596,7 +606,7 @@ impl Client {
                 Fail(code, why) => { return Err(why) }
                 NeedMore => {}
             }
-            match fd.read_by(self.fd, 65536, dl) {
+            match self.tr.read_by(65536, dl) {
                 Ok(Some(b)) => {
                     if b.len() == 0 { return Err(String.from("closed")) }
                     self.dec.feed(b)
@@ -610,23 +620,6 @@ impl Client {
 
     /// Closes the socket.
     fn drop_connection(self) uses io {
-        let z = fd.close(self.fd)
+        self.tr.close_now()
     }
-}
-
-/// Sends all of `data` before `dl` (the client's socket is blocking-compatible: non-blocking and waited on).
-fn send_bytes(s: i32, data: List[u8], dl: time.Deadline) -> bool uses net, io, clock {
-    let mut rest = data.copy()
-    while rest.len() > 0 {
-        match fd.wait_ready(s, fd.READY_WRITE, dl) {
-            Ok(true) => {}
-            Ok(false) => { return false }
-            Err(e) => { return false }
-        }
-        match net.send(s, rest) {
-            Ok(n) => { rest = bytes.slice(rest, n as usize, rest.len()) }
-            Err(e) => { return false }
-        }
-    }
-    true
 }

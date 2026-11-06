@@ -1,0 +1,622 @@
+// https end to end over loopback (127.0.0.1, ephemeral ports, every wait with a deadline): the
+// Eider server and the Eider client over TLS 1.3 with the test PKI in tests/pki (copied from
+// eider-tls/tests/pki; valid to 2036), keep-alive, a large response and a large request body,
+// chunked streaming, wss, a client that sends its records in dribbles, a connection cut without
+// close_notify, the refusals (host name, untrusted root, expired, client certificates), certificate
+// reload, and hostile clients (garbage, a stalled handshake, oversized records) that must not hold a
+// worker beyond the handshake deadline. tests/tls_interop.sh runs the same server against
+// openssl s_client and curl, and the client against openssl s_server.
+
+import core.sys
+import std.bytes
+import std.fs
+import std.io
+import std.net
+import std.stream
+import std.sync
+import std.task
+import std.time
+import http
+import http.router
+import http.server
+import http.client
+import http.secure
+import http.service
+import http.transport
+import http.ws
+import compression
+import tls.config
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn cat(a: str, b: String) -> String {
+    let mut t = String.from(a)
+    t.append(b)
+    t
+}
+
+fn num(n: i64) -> String { String.from_int(n) }
+
+fn pattern(n: usize) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for i in 0..n { out.push(((i * 7 + i / 251) % 256) as u8) }
+    out
+}
+
+fn sum(b: List[u8]) -> i64 {
+    let mut s: i64 = 0
+    for c in b { s = (s * 31 + (c as i64)) % 1000000007 }
+    s
+}
+
+fn app() -> router.Router uses clock {
+    let mut r = router.new()
+    r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello tls") })
+    r.get("/info", |q: http.Request| -> http.Response {
+        let mut t = String.from("tls=")
+        t.append(sys.to_string(q.get_ctx("tls").unwrap_or(lit("-"))))
+        t.push_str(" peer=")
+        t.append(sys.to_string(bytes.slice(q.peer, 0, 10)))
+        t.push_str(" cert=")
+        t.append(num(q.get_ctx("tls_client_cert").unwrap_or(List.new()).len() as i64 / 100))
+        http.respond(200, "text/plain", t.bytes())
+    })
+    r.get("/text", |q: http.Request| -> http.Response {
+        let mut b: List[u8] = List.new()
+        for i in 0..(5000 as i32) { b.push(97 + ((i % 7) as u8)) }
+        http.respond(200, "text/plain", b)
+    })
+    r.get("/big", |q: http.Request| -> http.Response { http.respond(200, "application/octet-stream", pattern(3000000)) })
+    r.post("/echo", |q: http.Request| -> http.Response { http.respond(200, "application/octet-stream", q.body) })
+    r.get("/stream", |q: http.Request| -> http.Response {
+        let mut resp = http.response(200)
+        resp.set_header("Content-Type", lit("application/octet-stream"))
+        resp.stream = Some(http.Stream(|d: http.Duplex| -> () {
+            for i in 0..(40 as i32) {
+                let z = d.write(pattern(1000))
+                if i % 10 == 9 { time.sleep(time.millis(20)) }
+            }
+        }, false))
+        resp
+    })
+    r.get("/chat", |q: http.Request| -> http.Response {
+        ws.accept(q, ws.options(), |c: ws.Conn| -> () {
+            while true {
+                match c.recv() {
+                    Ok(ws.Text(t)) => {
+                        let z = c.send_text(t)
+                    }
+                    Ok(ws.Binary(b)) => {
+                        let z = c.send_binary(b)
+                    }
+                    Ok(ws.Closed(code, why)) => { return }
+                    Err(e) => { return }
+                }
+            }
+        })
+    })
+    r
+}
+
+type Rig = { srv: server.Server, tok: task.Token, th: Task[server.Stats], port: i32 }
+
+fn start(cfg: server.Config, addr: net.Addr) -> Rig uses io, net, clock, threads {
+    let srv = server.listen(addr, cfg).unwrap()
+    let h = router.handler(app())
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+    Rig(srv, tok, th, srv.port())
+}
+
+fn stop(r: Rig) -> server.Stats uses io {
+    r.tok.cancel()
+    r.th.join()
+}
+
+fn tls_config(tls: secure.ServerTls) -> server.Config uses io, clock {
+    let mut cfg = server.config()
+    cfg.workers = 16
+    cfg.limits.max_body = 2000000
+    cfg.secure = Some(tls.acceptor())
+    cfg
+}
+
+fn ed() -> secure.ServerTls uses fs {
+    secure.server_from_files(String.from("tests/pki/edchain.pem"), String.from("tests/pki/ed.key")).unwrap()
+}
+
+fn trust(root: str) -> secure.ClientTls uses fs {
+    secure.client_roots_pem(fs.read(sys.lit(root)).unwrap()).unwrap()
+}
+
+fn loopback() -> net.Addr { net.ipv4(127, 0, 0, 1, 0) }
+
+fn show(r: Result[http.Response, String]) -> String {
+    match r {
+        Ok(x) => {
+            let mut t = String.from_int(x.status as i64)
+            t.push_str(" ")
+            t.append(sys.to_string(x.body))
+            t
+        }
+        Err(e) => cat("error: ", e)
+    }
+}
+
+fn get(c: client.Conn, target: str, dl: time.Deadline) -> Result[http.Response, String] uses net, io, clock {
+    // one-shot: Connection: close, and the connection is closed afterwards
+    let mut cc = c.copy()
+    let mut q = http.request("GET", lit(target))
+    q.keep_alive = false
+    let r = cc.request(q, dl)
+    cc.close()
+    r
+}
+
+fn url_for(scheme: str, host: str, port: i32, path: str) -> List[u8] {
+    let mut u = String.from(scheme)
+    u.push_str("://")
+    u.push_str(host)
+    u.push_str(":")
+    u.append(num(port as i64))
+    u.push_str(path)
+    u.bytes()
+}
+
+// ---- the happy paths
+
+fn basics() uses io, net, clock, threads, fs {
+    print("-- https: keep-alive, a large response, a large request body, streaming")
+    let rig = start(tls_config(ed()), loopback())
+    let tls = trust("tests/pki/root.pem")
+    let dl = time.after_ms(60000)
+    let mut lim = http.limits()
+    lim.max_body = 4000000
+    let mut c = secure.connect_host_with("127.0.0.1", rig.port, tls, lim, dl).unwrap()
+    print(c.is_https())
+    print(sys.to_string(c.alpn()))
+    print(show(c.request(http.request("GET", lit("/hello")), dl)))
+    print(show(c.request(http.request("GET", lit("/hello")), dl)))
+    print(show(c.request(http.request("GET", lit("/info")), dl)))
+    let bigr = c.request(http.request("GET", lit("/big")), dl)
+    if bigr.is_err() { print(show(bigr)) }
+    let big = bigr.unwrap()
+    print(big.body.len())
+    print(sum(big.body) == sum(pattern(3000000)))
+    let mut post = http.request("POST", lit("/echo"))
+    post.body = pattern(1500000)
+    let echoed = c.request(post, dl).unwrap()
+    print(echoed.body.len())
+    print(sum(echoed.body) == sum(pattern(1500000)))
+    let st = c.request(http.request("GET", lit("/stream")), dl).unwrap()
+    print(cat("transfer-encoding: ", sys.to_string(st.header("transfer-encoding").unwrap_or(lit("-")))))
+    print(st.body.len())
+    let mut expect: List[u8] = List.new()
+    for i in 0..(40 as i32) { bytes.append(inout expect, pattern(1000)) }
+    print(sum(st.body) == sum(expect))
+    print(c.open)
+    // Connection: close ends the connection; the next request opens a new TLS session
+    let mut last = http.request("GET", lit("/hello"))
+    last.keep_alive = false
+    print(show(c.request(last, dl)))
+    print(c.open)
+    print(show(c.request(http.request("GET", lit("/hello")), dl)))
+    print(c.open)
+    c.close()
+    let stats = stop(rig)
+    print(cat("connections: ", num(stats.connections)))
+    print(cat("requests: ", num(stats.requests)))
+    print(cat("tls failed: ", num(stats.tls_failed)))
+}
+
+fn wss() uses io, net, clock, threads, fs {
+    print("-- wss echo")
+    let rig = start(tls_config(ed()), loopback())
+    let tls = trust("tests/pki/root.pem")
+    let dl = time.after_ms(60000)
+    let mut c = secure.dial_ws(url_for("wss", "127.0.0.1", rig.port, "/chat"), tls, List.new(), dl).unwrap()
+    print(c.tr.is_secure())
+    c.send_text(String.from("héllo over tls"), dl).unwrap()
+    match c.recv_frame(dl) {
+        Ok(f) => print(sys.to_string(f.payload))
+        Err(e) => print(cat("error: ", e))
+    }
+    let big = pattern(60000)
+    c.send_binary(big, dl).unwrap()
+    match c.recv_frame(dl) {
+        Ok(f) => print(sum(f.payload) == sum(pattern(60000)))
+        Err(e) => print(cat("error: ", e))
+    }
+    c.ping(lit("p"), dl).unwrap()
+    match c.recv_frame(dl) {
+        Ok(f) => print(f.opcode as i64)
+        Err(e) => print(cat("error: ", e))
+    }
+    c.close(1000, "bye", dl).unwrap()
+    match c.recv_frame(dl) {
+        Ok(f) => print(f.opcode as i64)
+        Err(e) => print(cat("error: ", e))
+    }
+    c.drop_connection()
+    // the same URL scheme over plain TCP is refused by a TLS server: no 101 ever
+    let mut p = secure.dial_ws(url_for("ws", "127.0.0.1", rig.port, "/chat"), tls, List.new(), time.after_ms(1500))
+    print(p.is_err())
+    let stats = stop(rig)
+    print(cat("tls failed: ", num(stats.tls_failed)))
+}
+
+fn refusals() uses io, net, clock, threads, fs {
+    print("-- refusals: host name, untrusted root, expired, insecure mode")
+    let dl = time.after_ms(30000)
+    let rig = start(tls_config(ed()), net.ipv4(0, 0, 0, 0, 0))
+    let good = trust("tests/pki/root.pem")
+    // 127.0.0.2 reaches the same server but is not in the certificate
+    print(show(secure.connect_host("127.0.0.2", rig.port, good, dl).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/hello", dl) })))
+    print(show(secure.connect_host("127.0.0.1", rig.port, trust("tests/pki/other-root.pem"), dl).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/hello", dl) })))
+    // the host name check is on the name: localhost is in the certificate
+    print(show(secure.connect_host("localhost", rig.port, good, dl).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/hello", dl) })))
+    // verification off (tests only): the wrong name and no roots at all are accepted
+    let insecure = secure.client_insecure_skip_verify_for_tests()
+    print(show(secure.connect_host("127.0.0.2", rig.port, insecure, dl).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/hello", dl) })))
+    let s1 = stop(rig)
+    print(cat("tls failed: ", num(s1.tls_failed)))
+    let old = start(tls_config(secure.server_from_files(String.from("tests/pki/expired.pem"), String.from("tests/pki/expired.key")).unwrap()), loopback())
+    print(show(secure.connect_host("127.0.0.1", old.port, good, dl).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/hello", dl) })))
+    let s2 = stop(old)
+    print(cat("tls failed: ", num(s2.tls_failed)))
+    // a plain client against a TLS port, and a TLS client against a plain port
+    let tlsrig = start(tls_config(ed()), loopback())
+    let mut a = tlsrig.srv.addr()
+    let mut pc = client.connect(a, dl).unwrap()
+    print(cat("plain client to https: ", status_text(pc.request(http.request("GET", lit("/hello")), time.after_ms(3000)))))
+    let plain = start(server.config(), loopback())
+    print(cat("https client to plain: ", status_text(secure.connect_host("127.0.0.1", plain.port, good, time.after_ms(3000)).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/hello", dl) }))))
+    let s3 = stop(tlsrig)
+    print(cat("tls failed: ", num(s3.tls_failed)))
+    let s4 = stop(plain)
+    print(cat("plain requests: ", num(s4.requests)))
+}
+
+fn status_text(r: Result[http.Response, String]) -> String {
+    match r {
+        Ok(x) => num(x.status as i64)
+        Err(e) => String.from("error")
+    }
+}
+
+fn client_certs() uses io, net, clock, threads, fs {
+    print("-- client certificates")
+    let dl = time.after_ms(30000)
+    let root = fs.read(sys.lit("tests/pki/root.pem")).unwrap()
+    let id = config.identity_from_files(String.from("tests/pki/client.pem"), String.from("tests/pki/client.key")).unwrap()
+    let good = trust("tests/pki/root.pem")
+    let required = start(tls_config(ed().with_client_auth_pem(root, true).unwrap()), loopback())
+    print(cat("required, none sent: ", status_text(secure.connect_host("127.0.0.1", required.port, good, dl).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/info", dl) }))))
+    print(cat("required, sent: ", show(secure.connect_host("127.0.0.1", required.port, good.with_identity(id), dl).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/info", dl) }))))
+    let s1 = stop(required)
+    print(cat("tls failed: ", num(s1.tls_failed)))
+    let asked = start(tls_config(ed().with_client_auth_pem(root, false).unwrap()), loopback())
+    print(cat("requested, none sent: ", show(secure.connect_host("127.0.0.1", asked.port, good, dl).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/info", dl) }))))
+    let s2 = stop(asked)
+    print(cat("tls failed: ", num(s2.tls_failed)))
+}
+
+fn reload() uses io, net, clock, threads, fs {
+    print("-- certificate reload")
+    let dl = time.after_ms(30000)
+    let tls = secure.server_from_files(String.from("tests/pki/ec.pem"), String.from("tests/pki/ec.key")).unwrap()
+    let acc = tls.acceptor()
+    let mut cfg = server.config()
+    cfg.secure = Some(acc)
+    let rig = start(cfg, loopback())
+    let good = trust("tests/pki/root.pem")
+    let mut c1 = secure.connect_host("127.0.0.1", rig.port, good, dl).unwrap()
+    print(show(c1.request(http.request("GET", lit("/hello")), dl)))
+    let leaf1 = c1.sec.unwrap().peer_certs[0].copy()
+    // a pair that does not go together changes nothing
+    print(secure.reload_files(acc, String.from("tests/pki/ed.pem"), String.from("tests/pki/ec.key")).is_err())
+    print(secure.reload_files(acc, String.from("tests/pki/edchain.pem"), String.from("tests/pki/ed.key")).is_ok())
+    // the open connection goes on; a new one gets the new certificate
+    print(show(c1.request(http.request("GET", lit("/hello")), dl)))
+    let mut c2 = secure.connect_host("127.0.0.1", rig.port, good, dl).unwrap()
+    print(show(c2.request(http.request("GET", lit("/hello")), dl)))
+    let leaf2 = c2.sec.unwrap().peer_certs[0].copy()
+    print(bytes.eq(leaf1, leaf2))
+    c1.close()
+    c2.close()
+    let s = stop(rig)
+    print(cat("connections: ", num(s.connections)))
+}
+
+// ---- hostile clients
+
+fn raw(port: i32) -> stream.Fd uses net, io, clock {
+    stream.connect_by(net.ipv4(127, 0, 0, 1, port), time.after_ms(5000)).unwrap()
+}
+
+fn send(f: stream.Fd, data: List[u8]) uses io, clock {
+    let mut g = f.copy()
+    let z = stream.write_all_by(inout g, data, time.after_ms(5000))
+}
+
+/// What the server does with `f` within `ms`: "open", or "closed" (with the first byte if it sent
+/// something: an alert record starts with 21, an HTTP answer with 72).
+fn watch(f: stream.Fd, ms: i64) -> String uses io, clock {
+    let mut g = f.copy()
+    let dl = time.after_ms(ms)
+    let mut first: i64 = -1
+    let mut state = String.from("open")
+    let mut going = true
+    while going {
+        match g.read_by(4096, dl) {
+            Ok(b) => {
+                if b.len() == 0 {
+                    state = String.from("closed")
+                    going = false
+                } else if first < 0 {
+                    first = b[0] as i64
+                }
+            }
+            Err(e) => {
+                if e.kind != stream.TimedOut { state = String.from("closed") }
+                going = false
+            }
+        }
+    }
+    if first == 72 { state.push_str(" (an HTTP answer!)") }
+    state
+}
+
+fn hostile() uses io, net, clock, threads, fs {
+    print("-- hostile clients")
+    let dl = time.after_ms(30000)
+    let good = trust("tests/pki/root.pem")
+    let mut cfg = tls_config(ed().with_handshake_timeout(time.millis(500)))
+    cfg.workers = 1
+    cfg.read_timeout = time.millis(500)
+    let rig = start(cfg, loopback())
+    // a stalled handshake holds the only worker for the deadline and not longer
+    let stall = raw(rig.port)
+    print(cat("stalled, 100 ms: ", watch(stall, 100)))
+    let started = secure.connect_host("127.0.0.1", rig.port, good, dl).and_then(|c: client.Conn| -> Result[http.Response, String] { get(c, "/hello", dl) })
+    print(cat("a client behind it: ", show(started)))
+    print(cat("stalled, after: ", watch(stall, 100)))
+    // a partial record header, then nothing
+    let part = raw(rig.port)
+    let mut ph: List[u8] = List.new()
+    for x in [22, 3, 1, 0, 240, 1] { ph.push(x as u8) }
+    send(part, ph)
+    print(cat("partial record: ", watch(part, 2000)))
+    // garbage that is not a record, an HTTP request in the clear, an oversized record, a bad ClientHello
+    let g1 = raw(rig.port)
+    send(g1, pattern(300))
+    print(cat("garbage: ", watch(g1, 2000)))
+    let g2 = raw(rig.port)
+    send(g2, lit("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n"))
+    print(cat("http in the clear: ", watch(g2, 2000)))
+    let g3 = raw(rig.port)
+    let mut big: List[u8] = List.new()
+    for x in [22, 3, 3, 255, 255] { big.push(x as u8) }
+    bytes.append(inout big, pattern(70000))
+    send(g3, big)
+    print(cat("oversized record: ", watch(g3, 2000)))
+    let g4 = raw(rig.port)
+    let mut hello: List[u8] = List.new()
+    for x in [22, 3, 1, 0, 40, 1, 0, 0, 36, 3, 3] { hello.push(x as u8) }
+    bytes.append(inout hello, pattern(33))
+    send(g4, hello)
+    print(cat("bad ClientHello: ", watch(g4, 2000)))
+    let g5 = raw(rig.port)
+    send(g5, List.new())
+    let z = net.shutdown(g5.fd, net.SHUT_WRITE)
+    print(cat("closed without a byte: ", watch(g5, 2000)))
+    // after a finished handshake, a request that stalls is answered 408 within read_timeout
+    let c = secure.connect_host("127.0.0.1", rig.port, good, dl).unwrap()
+    let tr = c.transport()
+    print(tr.send_by(lit("GET /hello HT"), dl))
+    let mut head: List[u8] = List.new()
+    let mut waiting = true
+    while waiting {
+        match tr.read_by(4096, time.after_ms(3000)) {
+            Ok(Some(b)) => {
+                if b.len() == 0 { waiting = false } else { bytes.append(inout head, b) }
+            }
+            Ok(None) => { waiting = false }
+            Err(e) => { waiting = false }
+        }
+    }
+    print(sys.to_string(bytes.slice(head, 0, 12)))
+    tr.close_now()
+    // the server is still fine and every failed handshake was counted
+    print(show(secure.connect_host("127.0.0.1", rig.port, good, dl).and_then(|c2: client.Conn| -> Result[http.Response, String] { get(c2, "/hello", dl) })))
+    let s = stop(rig)
+    print(cat("tls failed: ", num(s.tls_failed)))
+    print(cat("requests: ", num(s.requests)))
+    print(cat("timeouts: ", num(s.timeouts)))
+
+    print("-- a bound on concurrent handshakes")
+    let mut cfg2 = tls_config(ed().with_handshake_timeout(time.millis(500)).with_max_handshakes(1))
+    cfg2.workers = 16
+    let rig2 = start(cfg2, loopback())
+    let a = raw(rig2.port)
+    let b = raw(rig2.port)
+    print(cat("first: ", watch(a, 100)))
+    print(cat("second: ", watch(b, 100)))
+    print(cat("first, later: ", watch(a, 2000)))
+    print(cat("second, later: ", watch(b, 2000)))
+    print(show(secure.connect_host("127.0.0.1", rig2.port, good, dl).and_then(|c2: client.Conn| -> Result[http.Response, String] { get(c2, "/hello", dl) })))
+    let s2 = stop(rig2)
+    print(cat("tls failed: ", num(s2.tls_failed)))
+}
+
+// ---- transport details
+
+fn pump(src: stream.Fd, dst: stream.Fd, dribble: bool, limit: usize) -> i32 uses net, io, clock {
+    let mut s = src.copy()
+    let mut d = dst.copy()
+    let mut sent: usize = 0
+    let mut going = true
+    let mut cut = false
+    while going {
+        match s.read_by(4096, time.after_ms(20000)) {
+            Ok(b) => {
+                if b.len() == 0 {
+                    going = false
+                } else {
+                    sent += b.len()
+                    if dribble {
+                        for x in b {
+                            let mut one: List[u8] = List.new()
+                            one.push(x)
+                            let z = stream.write_all_by(inout d, one, time.after_ms(5000))
+                            time.sleep_ms(1)
+                        }
+                    } else {
+                        let z = stream.write_all_by(inout d, b, time.after_ms(5000))
+                    }
+                    if limit > 0 && sent >= limit {
+                        cut = true
+                        going = false
+                    }
+                }
+            }
+            Err(e) => { going = false }
+        }
+    }
+    if cut {
+        // no close_notify, no goodbye: both sockets are shut at once
+        let a = net.shutdown(src.fd, net.SHUT_BOTH)
+        let b = net.shutdown(dst.fd, net.SHUT_BOTH)
+    } else {
+        let z = net.shutdown(dst.fd, net.SHUT_WRITE)
+    }
+    0
+}
+
+/// One connection through a relay on the loopback: what the client sends reaches the server one
+/// byte at a time (`dribble`), and the connection is cut when `cut_after` bytes have come back (0: never).
+fn relay(target: net.Addr, dribble: bool, cut_after: usize) -> (i32, Task[i32]) uses net, io, clock, threads {
+    let ls = net.listener(net.ipv4(127, 0, 0, 1, 0), true).unwrap()
+    let port = net.local_addr(ls).unwrap().port
+    let th = spawn(|| -> i32 {
+        let conn = stream.accept_by(ls, time.after_ms(20000)).unwrap()
+        let up = conn.fd
+        let down = stream.connect_by(target, time.after_ms(5000)).unwrap()
+        let t2 = spawn(|| -> i32 { pump(down, up, false, cut_after) })
+        let r = pump(up, down, dribble, 0)
+        let z = t2.join()
+        let c1 = up.close()
+        let c2 = down.close()
+        let c3 = down.close()
+        0
+    })
+    (port, th)
+}
+
+fn transport_details() uses io, net, clock, threads, fs {
+    print("-- records that arrive a byte at a time, a connection cut without close_notify, close_notify")
+    let dl = time.after_ms(60000)
+    let good = trust("tests/pki/root.pem")
+    let rig = start(tls_config(ed()), loopback())
+    let (dport, dth) = relay(rig.srv.addr(), true, 0)
+    let mut c = secure.connect_host("127.0.0.1", dport, good, dl).unwrap()
+    print(show(c.request(http.request("GET", lit("/hello")), dl)))
+    let mut post = http.request("POST", lit("/echo"))
+    post.body = pattern(3000)
+    let echoed = c.request(post, dl).unwrap()
+    print(sum(echoed.body) == sum(pattern(3000)))
+    c.close()
+    let z = dth.join()
+    // cut after 100000 bytes of a 3 MB answer
+    let mut lim = http.limits()
+    lim.max_body = 4000000
+    let (cport, cth) = relay(rig.srv.addr(), false, 100000)
+    let mut c2 = secure.connect_host_with("127.0.0.1", cport, good, lim, dl).unwrap()
+    let r = c2.request(http.request("GET", lit("/big")), dl)
+    print(show(r))
+    print(c2.open)
+    let z2 = cth.join()
+    // an idle keep-alive connection when the server stops: a close_notify, which is a clean end
+    let mut c3 = secure.connect_host("127.0.0.1", rig.port, good, dl).unwrap()
+    print(show(c3.request(http.request("GET", lit("/hello")), dl)))
+    let tr = c3.transport()
+    let s = stop(rig)
+    match tr.read_by(100, dl) {
+        Ok(Some(b)) => print(cat("after the stop: end of stream, bytes ", num(b.len() as i64)))
+        Ok(None) => print("after the stop: still open")
+        Err(e) => print(cat("after the stop: ", e))
+    }
+    c3.close()
+    print(cat("connections: ", num(s.connections)))
+}
+
+// ---- the service layers over TLS
+
+fn service_part() uses io, net, clock, threads, fs {
+    print("-- service.options().with_tls")
+    let dl = time.after_ms(30000)
+    let good = trust("tests/pki/root.pem")
+    let o = service.options().with_tls(ed().acceptor()).without_logs().no_rate_limit().with_drain_delay(time.millis(0))
+    let srv = server.listen(loopback(), o.server).unwrap()
+    let h = service.handler(app(), o)
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { service.serve(srv, h, o, t).unwrap() })
+    let mut c = secure.connect_host("127.0.0.1", srv.port(), good, dl).unwrap()
+    print(show(c.request(http.request("GET", lit("/healthz")), dl)))
+    print(show(c.request(http.request("GET", lit("/hello")), dl)))
+    // response compression and content decoding over the same TLS connection
+    let mut raw = http.request("GET", lit("/text"))
+    raw.set_header("Accept-Encoding", lit("gzip"))
+    let packed = c.request(raw, dl).unwrap()
+    print(cat("content-encoding: ", sys.to_string(packed.header("content-encoding").unwrap_or(lit("-")))))
+    print(packed.body.len() < 1000)
+    let mut d = c.with_decoding(compression.limit_output(100000))
+    let plain = d.request(http.request("GET", lit("/text")), dl).unwrap()
+    print(plain.body.len())
+    print(plain.header("content-encoding").is_none())
+    let m = d.request(http.request("GET", lit("/metrics")), dl).unwrap()
+    print(strings_contains(m.body, "http_server_tls_handshake_failures_total"))
+    d.close()
+    tok.cancel()
+    let s = th.join()
+    print(cat("requests: ", num(s.requests)))
+}
+
+fn strings_contains(b: List[u8], what: str) -> bool {
+    bytes.find(b, lit(what), 0).is_some()
+}
+
+fn urls() uses io {
+    print("-- urls")
+    for u in ["https://example.org/", "https://example.org:8443/a/b?c=d", "http://[::1]:8080", "wss://h.test/chat", "ws://127.0.0.1:9/", "ftp://x/", "https://u@h/", "https://h:99999/", "https://h:/", "https://ex ample/"] {
+        match secure.parse_url(lit(u)) {
+            Ok(x) => {
+                let mut t = String.from(u)
+                t.push_str(" -> ")
+                t.push_str(if x.secure { "tls " } else { "plain " })
+                t.push_str(if x.ws { "ws " } else { "http " })
+                t.append(sys.to_string(x.host))
+                t.push_str(" ")
+                t.append(num(x.port as i64))
+                t.push_str(" ")
+                t.append(sys.to_string(x.target))
+                print(t)
+            }
+            Err(e) => print(cat("refused: ", e))
+        }
+    }
+}
+
+fn main() uses io, net, clock, threads, fs {
+    basics()
+    wss()
+    refusals()
+    client_certs()
+    reload()
+    hostile()
+    transport_details()
+    service_part()
+    urls()
+}

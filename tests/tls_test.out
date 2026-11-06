@@ -1,0 +1,106 @@
+-- https: keep-alive, a large response, a large request body, streaming
+true
+http/1.1
+200 hello tls
+200 hello tls
+200 tls=TLS_AES_128_GCM_SHA256 peer=127.0.0.1: cert=0
+3000000
+true
+1500000
+true
+transfer-encoding: chunked
+40000
+true
+true
+200 hello tls
+false
+200 hello tls
+true
+connections: 2
+requests: 8
+tls failed: 0
+-- wss echo
+true
+héllo over tls
+true
+10
+8
+true
+tls failed: 1
+-- refusals: host name, untrusted root, expired, insecure mode
+error: tls: certificate is not valid for the host name (sent alert bad_certificate)
+error: tls: unable to find a trusted issuer (sent alert unknown_ca)
+200 hello tls
+200 hello tls
+tls failed: 2
+error: tls: certificate has expired (sent alert certificate_expired)
+tls failed: 1
+plain client to https: error
+https client to plain: error
+tls failed: 1
+plain requests: 0
+-- client certificates
+required, none sent: error
+required, sent: 200 tls=TLS_AES_128_GCM_SHA256 peer=127.0.0.1: cert=3
+tls failed: 1
+requested, none sent: 200 tls=TLS_AES_128_GCM_SHA256 peer=127.0.0.1: cert=0
+tls failed: 0
+-- certificate reload
+200 hello tls
+true
+true
+200 hello tls
+200 hello tls
+false
+connections: 2
+-- hostile clients
+stalled, 100 ms: open
+a client behind it: 200 hello tls
+stalled, after: closed
+partial record: closed
+garbage: closed
+http in the clear: closed
+oversized record: closed
+bad ClientHello: closed
+closed without a byte: closed
+true
+HTTP/1.1 408
+200 hello tls
+tls failed: 7
+requests: 2
+timeouts: 1
+-- a bound on concurrent handshakes
+first: open
+second: open
+first, later: closed
+second, later: closed
+200 hello tls
+tls failed: 2
+-- records that arrive a byte at a time, a connection cut without close_notify, close_notify
+200 hello tls
+true
+error: tls: connection closed without close_notify
+false
+200 hello tls
+after the stop: end of stream, bytes 0
+connections: 3
+-- service.options().with_tls
+200 {"status":"ok"}
+200 hello tls
+content-encoding: gzip
+true
+5000
+true
+true
+requests: 5
+-- urls
+https://example.org/ -> tls http example.org 443 /
+https://example.org:8443/a/b?c=d -> tls http example.org 8443 /a/b?c=d
+http://[::1]:8080 -> plain http ::1 8080 /
+wss://h.test/chat -> tls ws h.test 443 /chat
+ws://127.0.0.1:9/ -> plain ws 127.0.0.1 9 /
+refused: secure: the URL must start with http://, https://, ws:// or wss://
+refused: secure: user info in a URL is not supported
+refused: secure: bad port in the URL
+refused: secure: bad port in the URL
+refused: secure: not a valid host in the URL

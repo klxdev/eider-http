@@ -55,7 +55,9 @@ the step-by-step guide to both ("Building services").
 | `http/proxy` | the client address behind trusted proxies: `trust_none().allow("10.0.0.0/8")`, `.use_forwarded()`, `middleware(trust, h)`, strict IP and CIDR parsing | none |
 | `http/ratelimit` | GCRA rate limiting per client address (or any key), a bounded table, 429 + `Retry-After` | `clock` for `middleware` |
 | `http/sse` | server-sent events over a chunked response: `response(run)`, `Stream.event/data/comment/retry`, `format_event` | none |
-| `http/ws` | WebSockets (RFC 6455): `accept` (the handshake and the upgrade), `Conn.recv/send_text/send_binary/ping/close`, the frame codec, SHA-1, a test client (`dial`) | `clock` for `recv`, `dial` needs `net, io, clock` |
+| `http/ws` | WebSockets (RFC 6455): `accept` (the handshake and the upgrade), `Conn.recv/send_text/send_binary/ping/close`, the frame codec, SHA-1, a test client (`dial`, `dial_conn` over any `client.Conn`, so wss) | `clock` for `recv`, `dial` needs `net, io, clock` |
+| `http/transport` | the bytes under a connection, plain or TLS: `Transport`, `Secure`, `Acceptor`, `Connector`; every read, write, wait and close of the server, the client and `ws.Client` goes through it. Imports no TLS | `net, io, clock` |
+| `http/secure` | https: `server_from_files/pem/der(...)` + `with_client_auth_pem`, `with_handshake_timeout`, `with_max_handshakes`, `acceptor()`, `reload`; `client_system()`, `client_roots_pem(pem)`, `client_insecure_skip_verify_for_tests()`, `connect_host`, `connect_url`, `get_url`, `dial_ws` (`wss://`); the only module that imports eider-tls (docs "TLS") | `net, io, clock, fs` |
 | `http/sock` | sending before a deadline, lingering close | `net, io, clock` |
 | `http/profiling` | profiler labels per route, `/debug/profile` and `/debug/heap` (eider-lang's docs/site/tooling/profiler.md) | `fs, clock` for the endpoints |
 
@@ -215,6 +217,7 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
 | Chunk size | 15 hex digits | parse.ei | 400 |
 | A decoded request body (`Transfer-Encoding: gzip, chunked`) | the route's body limit, and 1100 times the compressed size above 4 MiB | `Config.decode_max` (0: the route's limit) | 413 (bomb), 400 (corrupt, cut short), 501 (other codings) |
 | Empty lines before a request line | 4 | parse.ei | 400 |
+| TLS handshake (https) | 10 s from taking a worker slot; 128 at once | `ServerTls.with_handshake_timeout`, `with_max_handshakes` | closed, `Stats.tls_failed` |
 | Idle connection | 5 s | `Config.idle_timeout` | closed |
 | Reading one request | 10 s from its first byte | `Config.read_timeout` | 408, closed |
 | Writing one response | 10 s | `Config.write_timeout` | dropped |
@@ -224,11 +227,13 @@ let app = middleware.request_id(ids, middleware.access_log(log, m.wrap(inner)))
 
 ## Security posture
 
-- **TLS: run behind a TLS-terminating proxy** (decision C3). The server speaks plain HTTP;
-  bind it to loopback or a private interface and let the proxy (nginx, HAProxy, Envoy, a
-  cloud load balancer) terminate TLS. TLS 1.3 written in Eider over the libcrypto backend is
-  roadmap P1.4. The server does not interpret `Forwarded` / `X-Forwarded-*` by itself:
-  `Request.peer` is the connection's address. `http/proxy` (below) replaces it with the client's
+- **TLS: in the process (`http/secure`, section "TLS" below) or at a proxy.** The server speaks
+  plain HTTP unless it is given an acceptor (`service.options().with_tls(...)`); then it serves
+  https only on that port, TLS 1.3, by eider-tls. Either is a supported deployment: terminate at a
+  proxy (nginx, HAProxy, Envoy, a cloud load balancer; bind the server to loopback or a private
+  interface) or in the process; the section "TLS" says who terminates what and how it meets the
+  forwarded headers. The server does not interpret `Forwarded` / `X-Forwarded-*` by itself:
+  `Request.peer` is the connection's address (over TLS too: the TCP peer). `http/proxy` (below) replaces it with the client's
   from those headers, only for connections from proxies the service lists.
 - **Request smuggling** (C42). The parser refuses, with 400: Content-Length together with
   Transfer-Encoding; two Content-Length fields (even equal), or one that isn't only digits;
@@ -399,7 +404,7 @@ Recorded rather than worked around; none blocks the design.
 | ~~N9~~ | Iterating a Map's keys | kvstore's `kv.keys` | done (eider-lang's docs/compiler.md "C8.20"): http/metrics and eider-openapi's examples/todo iterate their Maps; eider-rpc's kvstore keeps its key list, since `kv.keys` promises insertion order (C102) |
 | ~~N10~~ | Calling a function stored in a field (`(self.h)(x)`) | router | done: `self.h(x)`; a method of the same name wins (eider-lang's docs/compiler.md "C8.19") |
 | ~~N11~~ | Name resolution with a deadline | the client takes an `net.Addr` | done: `net.lookup_by` (Eider 0.7.1); `client.connect_host`, `get_host`, ... |
-| N12 | Connection information in the handler (peer address, TLS later) | logging, rate limiting | done: `Request.peer` (TLS information later) |
+| ~~N12~~ | Connection information in the handler (peer address, TLS) | logging, rate limiting | done: `Request.peer`, and over https the request context `tls` (the cipher suite) and `tls_client_cert` (the client's leaf certificate, DER) |
 | N13 | A method chain continued on the next line (a line starting with `.field(...)`, or ending with `.`; the first is done: eider-lang's docs/compiler.md "C8.25") | schema and operation builders | reassignments: `s = s.field(...)` |
 | N14 | Grants checked per imported module, not against everything the program loads of a package | eider-openapi is pure but programs load http/server | openapi grants http `net, io, clock, threads` |
 | N15 | Interrupting a handler (cancellation reaching blocked code; with N6) | `middleware.timeout` | 503 at the deadline; the handler finishes on its pool's worker, `req.deadline` for cooperation |
@@ -409,6 +414,9 @@ Recorded rather than worked around; none blocks the design.
 | N19 | Borrowing two fields of one record in a call (`s.d.feed(x, inout s.pending)` is E0301) | the streaming request decoder | copy the field out, call, store it back |
 | N20 | eider-compression's README says it needs no capability, but `compression.streams` names `io` and `clock`, and the grant is per package (N14), so http grants it both | eider.toml | `uses = ["io", "clock"]` |
 | N21 | Response compression happens at the handler (the whole body is held; deflate is 33 MB/s at level 6) | http/compress | `with_level(1)`; a cache or the proxy for hot responses; eider-compression's encoder has no way to hand out partial blocks early other than `flush` |
+| N22 | A `String` to `str` conversion (N18), and a list literal for `List[u8]` | http/secure: URLs, paths and host names that a program builds at run time (an ephemeral port in a URL) cannot be passed to a `str` parameter | `connect_url`, `get_url`, `dial_ws` and `parse_url` take `List[u8]` (`url.bytes()`); `server_from_files` takes `String` paths like eider-tls |
+| N23 | eider-tls: `identity_from_der`, a certificate chosen by SNI, an ALPN callback, a handshake that can be abandoned from outside, session resumption | http/secure | DER is re-encoded as PEM to reuse `identity_from_pem`'s key-matches-certificate check; one identity per server (`reload` swaps it); the stop signal cannot interrupt a handshake, so a shutdown waits at most `handshake_timeout` for the handshakes in flight; every reconnect is a full handshake |
+| N24 | A dependency that is only loaded by one module (eider-lang#60 again: eider-pkg resolves and grants per package) | http depends on eider-tls and the toolchain's crypto | a program that never imports `http.secure` still fetches eider-tls and needs Eider 0.7.6 (for `packages/crypto`); it loads, links and is granted nothing for them (the TLS section) |
 
 ## Next steps toward OpenAPI
 
@@ -430,7 +438,7 @@ Recorded rather than worked around; none blocks the design.
 5. **Concurrency:** move the worker loop onto stackless tasks over std/event when the
    compiler has them (C4), keeping `serve` and the handler type; per-connection pollers go
    away (N4).
-6. **TLS 1.3 in Eider** (P1.4), then HTTP/2 (P1.7) for gRPC.
+6. **TLS 1.3 in Eider** (P1.4): done (`http/secure`, section "TLS"). Then HTTP/2 (P1.7) for gRPC: the ALPN list is where `h2` would go.
 
 
 ## Production defaults (`http/health`, `http/service`)
@@ -448,6 +456,134 @@ requests a second per address with bursts of 2000, and exempts the probes and `/
 a balancer's health checks are never limited); behind a load balancer all clients share one
 bucket until `with_trust` names the balancer; profiling endpoints are off; readiness failures
 name the failed checks and never their error text.
+
+## TLS (`http/secure`, `http/transport`)
+
+https for the server, the client and WebSockets, TLS 1.3 by [eider-tls](https://github.com/klxdev/eider-tls)
+over the toolchain's `crypto` package (AWS-LC). Written for eider-lang#223 / #29.
+
+### Shape
+
+`http/transport` is the layer under every connection: a `Transport` is a socket and, for https, a `Secure` (five
+functions over the TLS session). `http/server` (every read, write, wait and close, about 25 call sites), `http/client`
+and `http/ws`'s client use only it, so the plain path is the same code as before (one `match` on an `Option`) and
+**nothing outside `http/secure` imports eider-tls**. `Config.secure` and `service.Options.with_tls` take an
+`Acceptor` (`ServerTls.acceptor()`), the client takes a `Connector`; both are function values, which is what lets
+`http/server` stay free of TLS.
+
+### Server
+
+```eider,ignore
+let tls = secure.server_from_files(String.from("chain.pem"), String.from("key.pem")).unwrap()
+    .with_client_auth_pem(ca_pem, true).unwrap()                       // optional: mTLS
+    .with_handshake_timeout(time.seconds(5)).with_max_handshakes(64)
+let acc = tls.acceptor()
+let o = service.options().with_tls(acc)                                // or: let mut cfg = server.config(); cfg.secure = Some(acc)
+service.run(net.ipv4(0, 0, 0, 0, 8443), router, o)
+```
+
+- **Certificate and key**: a chain (leaf first) and a private key from PEM files or text, or from DER
+  (`server_from_der(chain, key_der)`). Ed25519, P-256, P-384 and RSA (2048 to 8192 bits; PKCS#8, SEC1, PKCS#1) keys. The key
+  must belong to the first certificate or the call is an Err. One identity per server (no choice by SNI).
+- **Protocol**: TLS 1.3 only (eider-tls refuses 1.2 and below with `protocol_version`; there is no setting to lower it),
+  ALPN `http/1.1` (a client that offers ALPN without it is refused with `no_application_protocol`; one that does not offer ALPN
+  is served HTTP/1.1), suites AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305, X25519, P-256 and P-384.
+- **Client certificates**: `with_client_auth_pem(ca_pem, required)`: asked for (`required` false: a client may send none) or
+  required (none: the handshake fails). The chain is verified against the CA roots; **authorization is the application's**: the
+  handler sees the leaf certificate as the request context `tls_client_cert` (DER) and decides who it is.
+- **What a handler sees**: `Request.peer` is the TCP peer, as over plain HTTP. `q.get_ctx("tls")` is the cipher suite name (absent
+  over plain HTTP: the way to tell https from http, for `Secure` cookies and redirects), `tls_client_cert` the above.
+- **Handshake deadline and bound** (slowloris): a connection takes a worker slot (`workers`) as before, then runs the handshake
+  *in its own task* before `handshake_timeout` (10 s) measured from that moment; at most `max_handshakes` (128) run at once and
+  the others wait for a place within the same deadline. A handshake that is stalled, trickled byte by byte, malformed or refused is
+  closed at the latest at the deadline (immediately for garbage, an oversized record, a plain-HTTP request or a closed
+  connection: eider-tls answers with an alert and the server closes) and counted in `Stats.tls_failed` /
+  `http_server_tls_handshake_failures_total`; it holds its worker and its handshake place no longer than that. The acceptor never
+  blocks the accepting task. A shutdown does not interrupt a handshake: it waits at most `handshake_timeout` for those in flight.
+  When the queue is full a plain port answers `503`; a TLS port just closes (the client expects a ServerHello, not an HTTP
+  response). `idle_timeout`, `read_timeout` (a stalled request after the handshake is answered `408`), `write_timeout` and
+  `max_requests` apply as before, counted from the end of the handshake.
+- **Closing**: a close after a response is a TLS `close_notify`, then the half-close and drain of a lingering close; an idle
+  keep-alive connection closed by a shutdown gets a `close_notify` too, so the client sees a clean end of stream. A client that
+  vanishes without one is a read error on the server (the connection is dropped) and `Truncated` on a client.
+- **Keep-alive, chunked and streamed responses, SSE, request bodies and WebSocket (wss)** work as over TCP: they are written
+  against the transport. A WebSocket handler may send from one thread while another receives: the session is behind a lock held only
+  for one send or one non-blocking read.
+- **Reload without restart**: `secure.reload(acc, chain_pem, key_pem)` or `reload_files(acc, chain_path, key_path)` swap the
+  identity for the connections accepted afterwards (open connections keep theirs); a pair that does not go together is an Err
+  and changes nothing. Triggering it (SIGHUP, a timer on the file's mtime) is the program's.
+- **Also**: the metrics source gains the failure counter; `server.Stats` the field.
+
+### Client
+
+```eider,ignore
+let tls = secure.client_system().unwrap()                              // the OS CA bundle, read once
+let mut c = secure.connect_url("https://example.org/".bytes(), tls, dl).unwrap()
+let r = c.request(http.request("GET", "/".bytes()), dl)               // keep-alive, content decoding: as over http
+```
+
+- **Verification is on**: `client_system()` (the system bundle by the path discovery of eider-tls: `/etc/pki/tls/certs/ca-bundle.crt`,
+  `/etc/ssl/certs/ca-certificates.crt`, `/etc/ssl/cert.pem`, ...) or `client_roots_pem(pem)` (exactly those roots). The chain, its
+  validity, key usage and the host name (SAN `dNSName` with a leading `*` label, or `iPAddress`; **no** CN fallback) are checked for the
+  host of the URL, which is also the SNI. RSA (PKCS#1 v1.5 and PSS) and P-384 chains verify; SHA-1 signed chains do not.
+  `client_insecure_skip_verify_for_tests()` verifies nothing and is the only way to turn it off; `with_identity(id)` sends a client
+  certificate when the server asks.
+- `connect_host`, `connect_host_with(.., limits, ..)`, `connect_url` (`http`, `https`, `ws`, `wss`; ports default to 80/443; IPv6 as
+  `[::1]`), `get_url`, `dial_ws` (a `ws.Client` over TLS for `wss`). The returned `client.Conn` is the same type: it reconnects
+  and **runs the handshake again** whenever the connection ended, the `Host` header omits port 443, `with_decoding(...)` works
+  unchanged, and `c.alpn()` says what was negotiated. One `Conn` is one host: reuse is keep-alive on it (there is no pool).
+- **Redirects are not followed** (the client follows none, to http or https); a `3xx` is returned as it is.
+- Time: the deadline you pass covers the TCP connection and the handshake together.
+
+### Who terminates what, and the proxy
+
+With `with_tls`, **this process terminates TLS** (eider-tls, in Eider; the primitives are AWS-LC); the parser, the handlers and the
+middleware see plaintext only after decryption, and nothing in the stack changes. Behind a proxy there are two layouts:
+
+1. The proxy terminates TLS and speaks plain HTTP to the service (`with_tls` unused): `Request.peer` is the proxy,
+   `http/proxy` (`with_trust`) recovers the client from `X-Forwarded-For` / `Forwarded`. The service does not read
+   `X-Forwarded-Proto`; `get_ctx("tls")` is absent (it describes this hop, not the client's).
+2. The proxy re-encrypts to the service (`with_tls`): the same, over TLS; the proxy's address is the peer and trust applies as in 1. Do
+   not require client certificates from the end user in this layout (the proxy holds the connection).
+
+Without a proxy `Request.peer` is the client and the rate limiter keys on it as before. TLS does not make the forwarded headers
+trustworthy: a client that reaches the service directly can still send `X-Forwarded-For`; `with_trust` names the proxies for that
+reason, and the service should not be reachable by clients except through them.
+
+### Security notes
+
+- eider-tls has had no outside audit (its README: "Not done"); secrets live in ordinary lists and are not zeroed; no resumption, no 0-RTT
+  (a reconnect is a full handshake: the CPU cost of a handshake is the case for `max_handshakes`), no OCSP or CRL, no certificate
+  transparency, no name constraints.
+- The server sends no `Strict-Transport-Security`; add it in a middleware if you want it.
+- The handshake runs in the connection's task: the bound on its CPU is `max_handshakes` and `workers`, not a rate. Put a rate
+  limit at the network edge for floods of connections.
+- `client_insecure_skip_verify_for_tests()` accepts anyone, including a man in the middle. Its name is the warning; nothing else
+  reaches it.
+
+### Capabilities and dependencies
+
+`eider.toml` declares `[deps.tls]` (eider-tls, granted `net io clock fs`) and `[deps.crypto] toolchain = true` (granted `io`). A
+program that never imports `http.secure` (`http.server`, `http.client`, `http.service`, ... are TLS-free: `http.transport` has no TLS)
+loads no TLS or crypto code, links no crypto backend and needs **no grant for tls or crypto and no new grant for http**. It still has them in
+its lock (eider-pkg resolves per package, N24) and so needs Eider 0.7.6 or later, whose toolchain ships `packages/crypto`. A program that imports
+`http.secure` needs nothing more either: http's own grants to tls and crypto are in http's manifest; it grants http what
+`secure.ei` uses, `net io clock fs`, which are the capabilities http already needed (`fs` for `http/profiling` and `http/service`).
+Tested with a program that depends on http by path and imports `http.service` with and without `http.secure`: no E0204, and the
+backend is linked only with it.
+
+### Tests
+
+`tests/tls_test.ei` (also under TSan): the happy paths above over TLS (3 MB response, 1.5 MB request body, chunked stream, keep-alive,
+`Connection: close` and reconnect, wss with 60 KB frames), a client whose records reach the server a byte at a time, a connection cut
+without `close_notify`, the clean end after a stop, the refusals (host name, untrusted root, expired, a plain client on a TLS port and the
+reverse, required client certificate missing), reload, hostile clients (garbage, plain HTTP, an oversized record, a bad ClientHello,
+a partial record, a stalled handshake behind `workers = 1`, two stalled handshakes under `max_handshakes = 1`, a stalled request after the
+handshake), `service.Options.with_tls` with the metrics. `tests/tls_interop.sh` (in `scripts/test.sh`): `openssl s_client`
+(ALPN, a request in two records, keep-alive, chunked stream, TLS 1.2 and the wrong ALPN refused, RSA and P-384 certificates, client
+certificates), `curl --cacert` (when installed) and the Eider client against `openssl s_server -www` (Ed25519, P-256, RSA, P-384 leaves,
+name, IP, wrong name, wrong root, expired, EKU, TLS 1.2-only, client certificates). The PKI is `tests/pki` (copied from eider-tls,
+valid to 2036).
 
 ## Tracing and per-route metrics
 
@@ -587,5 +723,7 @@ Sends are whole frames under a lock, so several threads may send. The codec (`en
 `Decoder`), SHA-1 and the accept key are public and tested against the RFC's examples and FIPS 180's
 vectors; SHA-1 is written here (a few lines, no dependency on packages/crypto, which would need a
 libcrypto at link time). Handlers that call `recv` need `uses clock` on the function that builds them.
-`ws.dial` is a masking client for tests and tools. Not done: permessage-deflate and other
-extensions, TLS (put a proxy in front), backpressure beyond the write deadline.
+`ws.dial` is a masking client for tests and tools; `ws.dial_conn(c, ...)` does the handshake over a `client.Conn`
+that is already connected, which is how `secure.dial_ws("wss://...")` works. The server side needs
+nothing for wss: a handler's `Duplex` is the connection's transport, plain or TLS. Not done: permessage-deflate and
+other extensions, backpressure beyond the write deadline.

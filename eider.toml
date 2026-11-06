@@ -23,3 +23,17 @@ uses = ["io", "clock"]
 git = "https://github.com/klxdev/eider-compression.git"
 version = "0.7.0"
 uses = ["io", "clock"]
+
+# TLS 1.3 for the server, the client and WebSocket (secure.ei, the only module that imports it). A release of eider-tls whose
+# own crypto dependency is the toolchain's (Eider 0.7.6 and later). It reads key and CA files (fs) and drives sockets (net, io,
+# clock). Programs that do not import http.secure load none of it and need no grant for it (docs/services.md "TLS").
+[deps.tls]
+git = "https://github.com/klxdev/eider-tls.git"
+version = "0.7.1"
+uses = ["net", "io", "clock", "fs"]
+
+# the primitives under eider-tls, the toolchain's own package (Eider 0.7.6 and later ship packages/crypto and its backend);
+# it is declared here too so that a git consumer of eider-http needs only an installed toolchain
+[deps.crypto]
+toolchain = true
+uses = ["io"]

@@ -43,10 +43,12 @@ fn main() uses io, net, clock, threads {
 | `http/trace` | W3C traceparent propagation and a span per request |
 | `http/problem` | `ApiError`, written as RFC 9457 problem+json |
 | `http/profiling` | profiler labels per route, `/debug/profile`, `/debug/heap` |
+| `http/transport` | the bytes under a connection, plain or TLS (the server, the client and `ws` use only it; it imports no TLS) |
+| `http/secure` | https: `server_from_files(...)`, `service.options().with_tls(tls.acceptor())`, `client_system()`, `connect_url("https://...")`, `dial_ws("wss://...")`, client certificates, certificate reload (eider-tls, TLS 1.3) |
 | `http/sock` | sending before a deadline, lingering close |
 
 [docs/services.md](docs/services.md) is the design: the concurrency model, every limit and
-default, the security posture (run it behind a TLS-terminating proxy), the tests and the
+default, the security posture, TLS (in the process or behind a proxy), the tests and the
 known gaps. JSON-RPC 2.0 over this package is
 [eider-rpc](https://github.com/klxdev/eider-rpc); OpenAPI 3.1 services are
 [eider-openapi](https://github.com/klxdev/eider-openapi). eider-lang's site has the
@@ -74,6 +76,24 @@ uses = ["net", "io", "clock", "threads"]   # add "fs" for http/profiling's endpo
 then `eider fetch` and `import http`,
 `import http.server`, ... A program grants http what the modules it loads use (the
 compiler checks it: E0204).
+
+### https
+
+```eider,ignore
+import http.secure
+import http.service
+
+let tls = secure.server_from_files(String.from("chain.pem"), String.from("key.pem")).unwrap()
+let stats = service.run(net.ipv4(0, 0, 0, 0, 8443), r, service.options().with_tls(tls.acceptor())).unwrap()
+```
+
+TLS 1.3 only, ALPN `http/1.1`, optional client certificates, a deadline and a bound on handshakes, certificate reload without a restart;
+the client verifies against the system CA bundle (`secure.client_system()`) or explicit roots, with host name checks and SNI
+(docs/services.md "TLS"). **Capabilities**: a program that never imports `http.secure` loads no TLS or crypto code and needs no grant for
+them, and none beyond what http needed before; `http.secure` itself uses `net, io, clock, fs`, which http's grant already covers
+(`fs` for `http/service`). The package depends on eider-tls and on the toolchain's `crypto`
+(`[deps.crypto] toolchain = true`), so even a plain-HTTP program fetches eider-tls and needs Eider 0.7.6 or later (eider-pkg
+resolves per package, eider-lang#60); it links the crypto backend only when it imports `http.secure`.
 
 ### Testing handlers
 
@@ -108,12 +128,14 @@ MAJOR.MINOR (the `eider` field of `eider.toml`), else they stop with exit 2 and 
 release to use. eiderc and eider-pkg run through `eider` (`eider eiderc ...`, `eider eider-pkg
 ...`, with that toolchain), or directly when `eider` is not on the PATH.
 
-The dependencies, eider-json, eider-logging and eider-compression, are git packages. To build offline or against a checkout with
+The dependencies, eider-json, eider-logging, eider-compression and eider-tls (crypto is the toolchain's), are git packages. To build offline or against a checkout with
 uncommitted changes, eider-pkg's `EIDER_PKG_OVERRIDE=json=<dir>` takes it from a local
 directory; `scripts/env.sh` sets it for you to `$EIDER_JSON`, else `../eider-json` when that
 checkout exists, else the pinned release `.vendor/json` of an eider-lang checkout used as the toolchain
 (fetched there and hash-checked on first use by its `scripts/vendor.sh`), else its repository
-(network). eider.lock keeps the git source either way (a library doesn't commit its lock).
+(network). eider.lock keeps the git source either way (a library doesn't commit its lock). eider-tls is taken from `../eider-tls` until its
+next release (the v0.7.1 tag does not yet have the toolchain's crypto in its manifest); `crypto` needs a toolchain of Eider 0.7.6 or later
+(an eider-lang checkout with `packages/crypto` works). `scripts/test.sh` also runs `tests/tls_interop.sh` (openssl, curl; `skip` without them).
 
 eider-lang's `scripts/verify.sh` builds and tests this repository against its own checkout
 when it is next to it (`scripts/check-tools.sh`).
