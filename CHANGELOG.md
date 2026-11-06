@@ -3,7 +3,7 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.4
 
 - **https: TLS 1.3 for the server, the client and WebSocket, over eider-tls** (eider-lang#223, acceptance criterion 4 of #29; for Eider 0.7.6). Docs: docs/services.md "TLS".
   - **`http/transport`** (new): `Transport` (a socket and, for https, a `Secure` session), `Acceptor`, `Connector`. Every read, write, wait and close of `http/server`, `http/client` and the `http/ws` client now goes through it; plain connections take the same calls as before (one `match`; the in-process throughput benchmark, 8 keep-alive connections x 6000 requests, is within noise of 0.7.3: 713-776 ms against 721-775 ms for 48,000 requests, best of five rounds, twice) and **it imports no TLS**.

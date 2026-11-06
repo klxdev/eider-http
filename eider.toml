@@ -1,6 +1,6 @@
 [package]
 name = "http"
-version = "0.7.3"
+version = "0.7.4"
 eider = "0.7"
 description = "HTTP/1.1: a strict incremental parser, a server with deadlines and graceful shutdown, a blocking client, a router, middleware, metrics, problem+json and profiling endpoints (docs/services.md)"
 
@@ -29,7 +29,7 @@ uses = ["io", "clock"]
 # clock). Programs that do not import http.secure load none of it and need no grant for it (docs/services.md "TLS").
 [deps.tls]
 git = "https://github.com/klxdev/eider-tls.git"
-version = "0.7.1"
+version = "0.7.2"
 uses = ["net", "io", "clock", "fs"]
 
 # the primitives under eider-tls, the toolchain's own package (Eider 0.7.6 and later ship packages/crypto and its backend);
