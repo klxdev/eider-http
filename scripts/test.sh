@@ -44,8 +44,9 @@ fi
 if [ -n "$TSAN" ]; then
   T=$(mktemp -d)
   trap 'rm -rf "$T"' EXIT
-  printf 'int main(void) { return 0; }\n' > "$T/probe.c"
-  if ${CC:-cc} -fsanitize=thread -o "$T/probe" "$T/probe.c" 2>/dev/null && "$T/probe"; then
+  # (the probe uses longjmp, which traps rely on: a TSan that cannot follow it, as on glibc 2.4x, is skipped)
+  printf '#include <setjmp.h>\nstatic jmp_buf j;\nstatic void jump(void) { longjmp(j, 1); }\nint main(void) { if (setjmp(j) == 0) jump(); return 0; }\n' > "$T/probe.c"
+  if ${CC:-cc} -fsanitize=thread -o "$T/probe" "$T/probe.c" 2>/dev/null && "$T/probe" >/dev/null 2>&1; then
     for f in $TSAN; do
       if ! (EIDER_CACHE=off EIDER_CFLAGS="-fsanitize=thread -g"; export EIDER_CACHE EIDER_CFLAGS; ei build "$f" -o "$T/t") > "$T/log" 2>&1; then
         echo "FAIL $f (tsan): build"; cat "$T/log"; fail=1; continue
