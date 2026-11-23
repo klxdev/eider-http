@@ -52,8 +52,8 @@ true
 -- the middleware
 200
 200
-429 retry-after=1
-429 retry-after=1
+429 retry-after=3600
+429 retry-after=3600
 200
 200
 429
