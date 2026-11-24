@@ -93,3 +93,6 @@ export EIDER_PKG_OVERRIDE
 # crypto is the toolchain's own package (eider.toml's `[deps.crypto] toolchain = true`, Eider 0.7.6
 # and later: the toolchain's packages/crypto and its libeider_crypto backend): nothing to link.
 [ -d "$toolchain/packages/crypto" ] || die "$toolchain ($chosen) is Eider $theirs, which does not ship packages/crypto; eider-$pkg_name $mine needs Eider 0.7.6 or later (\`eider toolchain install 0.7\`)"
+# the server waits on a connection's socket and its own parker (`fd.wait_ready_or_unpark`) and the socket writer sends with
+# `net.try_send`: both are Eider 0.7.8's std (eider-http 0.7.5 and later)
+grep -q "wait_ready_or_unpark" "$toolchain/std/fd.ei" 2>/dev/null && grep -q "try_send" "$toolchain/std/net.ei" 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs, whose std has no fd.wait_ready_or_unpark and net.try_send; eider-$pkg_name $mine needs Eider 0.7.8 or later (\`eider toolchain install 0.7\`)"

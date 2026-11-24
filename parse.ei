@@ -407,35 +407,67 @@ fn scan_head(inout p: Parser) -> Option[Step] {
 /// The head is buf[pos..=end] (end is the LF of its empty line): parse it and choose the
 /// framing.
 fn head_done(inout p: Parser, end: usize) -> Option[Step] {
-    let mut lines: List[List[u8]] = List.new()
+    // buf[pos..end-1) is the head's lines, each ended by CR LF: the first is the start line, the
+    // rest are fields, each parsed in place (no list of lines)
+    let mut first = true
     let mut s = p.pos.copy()
     let mut i = p.pos.copy()
+    p.pos = end + 1
     while i < end - 1 {
         if p.buf[i] == 10 {
-            lines.push(bytes.slice(p.buf, s, i - 1))
+            if first {
+                first = false
+                let line = bytes.slice(p.buf, s, i - 1)
+                if p.response {
+                    match status_line(inout p, line) {
+                        Some(st) => { return Some(st) }
+                        None => {}
+                    }
+                } else {
+                    match request_line(inout p, line) {
+                        Some(st) => { return Some(st) }
+                        None => {}
+                    }
+                }
+            } else {
+                match field_at(p.buf, s, i - 1) {
+                    Ok(h) => p.m.headers.push(h)
+                    Err(w) => { return Some(fail(inout p, 400, w)) }
+                }
+            }
             s = i + 1
         }
         i += 1
     }
-    p.pos = end + 1
-    if p.response {
-        match status_line(inout p, lines[0]) {
-            Some(st) => { return Some(st) }
-            None => {}
-        }
-    } else {
-        match request_line(inout p, lines[0]) {
-            Some(st) => { return Some(st) }
-            None => {}
-        }
-    }
-    for k in 1..lines.len() {
-        match field(lines[k]) {
-            Ok(h) => p.m.headers.push(h)
-            Err(w) => { return Some(fail(inout p, 400, w)) }
-        }
-    }
     framing(inout p)
+}
+
+/// The field in buf[s..e) (no CR LF): `name: value`, name lowercased, value without surrounding
+/// whitespace; the same checks as `field`, made in place.
+fn field_at(buf: List[u8], s: usize, e: usize) -> Result[http.Header, str] {
+    if buf[s] == 32 || buf[s] == 9 { return Err("obsolete line folding") }
+    let mut colon = s.copy()
+    while colon < e && buf[colon] != 58 { colon += 1 }
+    if colon >= e { return Err("header field without a colon") }
+    if colon == s { return Err("invalid header field name") }
+    let mut name = bytes.slice(buf, s, colon)
+    let mut k: usize = 0
+    while k < name.len() {
+        let c = name[k]
+        if !http.is_tchar(c) { return Err("invalid header field name") }
+        if c >= 65 && c <= 90 { name[k] = c + 32 }
+        k += 1
+    }
+    let mut a = colon + 1
+    let mut z = e.copy()
+    while a < z && (buf[a] == 32 || buf[a] == 9) { a += 1 }
+    while z > a && (buf[z - 1] == 32 || buf[z - 1] == 9) { z -= 1 }
+    let mut j = a.copy()
+    while j < z {
+        if !http.is_value_byte(buf[j]) { return Err("invalid character in a header value") }
+        j += 1
+    }
+    Ok(http.Header(name, bytes.slice(buf, a, z)))
 }
 
 /// `name: value` (name lowercased, value without surrounding whitespace).
@@ -454,7 +486,7 @@ fn field(line: List[u8]) -> Result[http.Header, str] {
 
 /// 11 for "HTTP/1.1", 10 for "HTTP/1.0", 0 for another "HTTP/d.d", -1 for anything else.
 fn version(v: List[u8]) -> i32 {
-    if v.len() != 8 || !bytes.starts_with(v, sys.lit("HTTP/")) || v[6] != 46 { return -1 }
+    if v.len() != 8 || v[0] != 72 || v[1] != 84 || v[2] != 84 || v[3] != 80 || v[4] != 47 || v[6] != 46 { return -1 }
     if !bytes.is_digit(v[5]) || !bytes.is_digit(v[7]) { return -1 }
     if v[5] == 49 && v[7] == 49 { return 11 }
     if v[5] == 49 && v[7] == 48 { return 10 }
@@ -511,24 +543,21 @@ fn status_line(inout p: Parser, line: List[u8]) -> Option[Step] {
 
 /// The codings http/compress decodes (gzip, x-gzip, deflate, zstd).
 fn known_coding(c: List[u8]) -> bool {
-    for n in ["gzip", "x-gzip", "deflate", "zstd"] {
-        if http.eq_ci(c, sys.lit(n)) { return true }
-    }
-    false
+    http.eq_ci_s(c, "gzip") || http.eq_ci_s(c, "x-gzip") || http.eq_ci_s(c, "deflate") || http.eq_ci_s(c, "zstd")
 }
 
 fn framing(inout p: Parser) -> Option[Step] {
     let hs = p.m.headers
-    let te_n = http.count(hs, sys.lit("transfer-encoding"))
-    let cl_n = http.count(hs, sys.lit("content-length"))
+    let te_n = http.count_s(hs, "transfer-encoding")
+    let cl_n = http.count_s(hs, "content-length")
     let v = p.m.version
     if v == 11 {
-        p.m.keep_alive = !http.has_token(hs, sys.lit("connection"), sys.lit("close"))
+        p.m.keep_alive = !http.has_token_s(hs, "connection", "close")
     } else {
-        p.m.keep_alive = http.has_token(hs, sys.lit("connection"), sys.lit("keep-alive")) && !http.has_token(hs, sys.lit("connection"), sys.lit("close"))
+        p.m.keep_alive = http.has_token_s(hs, "connection", "keep-alive") && !http.has_token_s(hs, "connection", "close")
     }
     if !p.response {
-        let hosts = http.count(hs, sys.lit("host"))
+        let hosts = http.count_s(hs, "host")
         if v == 11 && hosts != 1 { return Some(fail(inout p, 400, "an HTTP/1.1 request needs exactly one Host")) }
         if hosts > 1 { return Some(fail(inout p, 400, "more than one Host")) }
     }
@@ -537,7 +566,7 @@ fn framing(inout p: Parser) -> Option[Step] {
     if te_n > 0 && cl_n > 0 { return Some(fail(inout p, 400, "both Content-Length and Transfer-Encoding")) }
     if te_n > 1 { return Some(fail(inout p, 400, "more than one Transfer-Encoding")) }
     if cl_n > 1 { return Some(fail(inout p, 400, "more than one Content-Length")) }
-    if cl_n == 1 && bytes.parse_u64(http.find(hs, sys.lit("content-length")).unwrap()).is_none() {
+    if cl_n == 1 && bytes.parse_u64(http.find_s(hs, "content-length").unwrap()).is_none() {
         return Some(fail(inout p, 400, "invalid Content-Length"))
     }
     if p.response && (p.no_body || http.bodyless(p.m.status)) { return Some(finish(inout p)) }
@@ -551,9 +580,9 @@ fn framing(inout p: Parser) -> Option[Step] {
     }
     if te_n > 0 {
         if v == 10 && !p.response { return Some(fail(inout p, 400, "Transfer-Encoding in an HTTP/1.0 request")) }
-        let codings = http.list_items(http.find(hs, sys.lit("transfer-encoding")).unwrap())
+        let codings = http.list_items(http.find_s(hs, "transfer-encoding").unwrap())
         let n = codings.len()
-        let chunked_last = n > 0 && http.eq_ci(codings[n - 1], sys.lit("chunked"))
+        let chunked_last = n > 0 && http.eq_ci_s(codings[n - 1], "chunked")
         if !chunked_last {
             if p.response {
                 p.phase = UNTIL_EOF
@@ -569,7 +598,7 @@ fn framing(inout p: Parser) -> Option[Step] {
         return stream_head(inout p)
     }
     if cl_n > 0 {
-        let len = bytes.parse_u64(http.find(hs, sys.lit("content-length")).unwrap()).unwrap()
+        let len = bytes.parse_u64(http.find_s(hs, "content-length").unwrap()).unwrap()
         if len > (p.max as u64) { return Some(fail(inout p, 413, "body too large")) }
         if len == 0 { return Some(finish(inout p)) }
         p.left = len as usize
@@ -595,7 +624,7 @@ fn stream_head(inout p: Parser) -> Option[Step] {
 }
 
 fn expect(inout p: Parser) {
-    if !p.response && p.m.version == 11 && http.has_token(p.m.headers, sys.lit("expect"), sys.lit("100-continue")) {
+    if !p.response && p.m.version == 11 && http.has_token_s(p.m.headers, "expect", "100-continue") {
         p.continue_wanted = p.pos >= p.buf.len()
     }
 }

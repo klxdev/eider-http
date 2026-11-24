@@ -5,9 +5,12 @@
 //! lightweight tasks, decision C830 of eider-lang). The acceptor starts a task for each
 //! connection; the task serves it, request after request, with blocking-style code that parks
 //! when it waits: it waits on the connection's socket and the server's stop signal together
-//! (`fd.wait_ready2`, no poller per connection) with a deadline, parses incrementally
-//! (parse.ei), calls the handler, and writes the response before its write deadline. No
-//! shared mutable state except one Lock of counters. `workers` is the number of connections
+//! (`fd.wait_ready_or_unpark` on the connection's own parker, which the stop unparks: no poller
+//! per connection, and one registration with the runtime's poller per wait) with a deadline,
+//! parses incrementally (parse.ei), calls the handler, and writes the response before its write
+//! deadline (sending first, and waiting for writability only when the buffer is full). No
+//! shared mutable state except one Lock of rarely changed counters; the per-request counters and
+//! the stop flag are atomics. `workers` is the number of connections
 //! served at once (default 10,000) and `queue` the number allowed to wait for a slot.
 //!
 //! - Back-pressure: accepted connections wait for a slot (at most `queue` of them); when that
@@ -62,6 +65,7 @@ import std.time
 import std.task
 import std.chan
 import std.sync
+import std.atomic
 import logging
 import std.utf8
 import http
@@ -114,17 +118,32 @@ fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) 
 /// connections whose TLS handshake failed or timed out (they were closed; never counted in `requests`).
 pub type Stats = { connections: i64, rejected: i64, requests: i64, bad: i64, timeouts: i64, traps: i64, tls_failed: i64 }
 
-pub type Shared = { stats: Stats, waiting: i64 }
+pub type Shared = { stats: Stats }
+
+/// What the server shares between its tasks without a lock on the per-request path: the stop flag
+/// (set once, read with one atomic load), the two counters a request touches (handled, and
+/// connections waiting for a slot), and the parkers of the live connections, which the stop
+/// unparks so that a connection parked in a wait wakes at once (`fd.wait_ready_or_unpark`: one
+/// registration with the poller per wait, where a waker descriptor for the stop would be two).
+type Live = { flag: atomic.Atomic, reqs: atomic.Atomic, waiting: atomic.Atomic, pks: sync.Lock[Map[i64, sync.Parker]] }
+
+fn live() -> Live { Live(atomic.new(0), atomic.new(0), atomic.new(0), sync.lock(Map.new())) }
+
+/// The counters and the connection registry, as the tasks hold them.
+type Hub = { lock: sync.Lock[Shared], live: Live }
+
+/// What one connection sees of the stop: the flag, and its own parker.
+type Sig = { flag: atomic.Atomic, pk: sync.Parker }
 
 /// A listening server (bound, not yet serving).
-pub type Server = { ls: i32, addr: net.Addr, cfg: Config, sh: sync.Lock[Shared] }
+pub type Server = { ls: i32, addr: net.Addr, cfg: Config, sh: Hub }
 
 /// Binds and listens on `a` (port 0: any free port; `addr()` says which).
 pub fn listen(a: net.Addr, cfg: Config) -> Result[Server, String] uses net, io {
     if cfg.workers == 0 || cfg.queue == 0 { return Err(String.from("server: workers and queue must be at least 1")) }
     let ls = net.listener(a, true)?
     match net.local_addr(ls) {
-        Ok(la) => Ok(Server(ls, la, cfg, sync.lock(Shared(Stats(0, 0, 0, 0, 0, 0, 0), 0))))
+        Ok(la) => Ok(Server(ls, la, cfg, Hub(sync.lock(Shared(Stats(0, 0, 0, 0, 0, 0, 0))), live())))
         Err(e) => {
             fd.close(ls)
             Err(e)
@@ -132,21 +151,57 @@ pub fn listen(a: net.Addr, cfg: Config) -> Result[Server, String] uses net, io {
     }
 }
 
-fn bump(sh: sync.Lock[Shared], what: i32) {
-    sh.modify(|inout t: Shared| -> () {
+fn bump(sh: Hub, what: i32) {
+    if what == 2 {
+        let n = sh.live.reqs.add(1, atomic.Relaxed)
+        return
+    }
+    if what == 5 {
+        let n = sh.live.waiting.add(1, atomic.Relaxed)
+        return
+    }
+    if what == 6 {
+        let n = sh.live.waiting.sub(1, atomic.Relaxed)
+        return
+    }
+    sh.lock.modify(|inout t: Shared| -> () {
         if what == 0 { t.stats.connections += 1 }
         if what == 1 { t.stats.rejected += 1 }
-        if what == 2 { t.stats.requests += 1 }
         if what == 3 { t.stats.bad += 1 }
         if what == 4 { t.stats.timeouts += 1 }
-        if what == 5 { t.waiting += 1 }
-        if what == 6 { t.waiting -= 1 }
         if what == 7 { t.stats.traps += 1 }
         if what == 8 { t.stats.tls_failed += 1 }
     })
 }
 
-fn waiting(sh: sync.Lock[Shared]) -> i64 { sh.modify(|inout s: Shared| -> i64 s.waiting) }
+fn waiting(sh: Hub) -> i64 { sh.live.waiting.load(atomic.Relaxed) }
+
+/// The counts so far.
+fn snapshot(sh: Hub) -> Stats {
+    let mut st = sh.lock.get().stats
+    st.requests = sh.live.reqs.load(atomic.Relaxed)
+    st
+}
+
+/// Registers a connection's parker with the stop; a connection that starts after the stop is woken at once.
+fn live_join(lv: Live, id: i64, pk: sync.Parker) uses io {
+    lv.pks.modify(|inout m: Map[i64, sync.Parker]| -> () {
+        m.insert(id, pk)
+        if lv.flag.load(atomic.Acquire) != 0 { pk.unpark() }
+    })
+}
+
+fn live_leave(lv: Live, id: i64) {
+    lv.pks.modify(|inout m: Map[i64, sync.Parker]| -> () { let gone = m.remove(id) })
+}
+
+/// The stop: sets the flag, then wakes every connection parked in a wait.
+fn live_stop(lv: Live) uses io {
+    lv.flag.store(1, atomic.Release)
+    lv.pks.modify(|inout m: Map[i64, sync.Parker]| -> () {
+        for pk in m.values() { pk.unpark() }
+    })
+}
 
 impl Server {
     /// The address the server listens on (with the real port when it was 0).
@@ -155,10 +210,10 @@ impl Server {
     fn port(self) -> i32 { self.addr.port }
 
     /// The counts so far (while serving, or after).
-    fn stats(self) -> Stats { self.sh.get().stats }
+    fn stats(self) -> Stats { snapshot(self.sh) }
 
     /// Connections waiting for a slot now.
-    fn waiting(self) -> i64 { self.sh.get().waiting }
+    fn waiting(self) -> i64 { waiting(self.sh) }
 
     /// Adds the server's counters to `m`'s exposition: `http_server_connections_total`,
     /// `http_server_connections_rejected_total` (503), `http_server_requests_handled_total`,
@@ -196,17 +251,20 @@ impl Server {
                 return Err(e)
             }
         }
-        // the stop signal: a waker that is woken once and never drained, so every wait
-        // that watches it (the acceptor's and each connection's) sees it from then on
+        // the stop signal: for the acceptor a waker that is woken once and never drained, so its
+        // wait sees it from then on; for the connections `Live` (a flag, and a parker each: a
+        // connection is woken out of its wait by `unpark`, and sees the flag between requests)
         let stopper = tok.child()
         let st = stopper
         let sw = stop
+        let sh = self.sh
+        let lv = sh.live
         let watcher = spawn(|| -> i32 {
             st.wait(time.never())
+            live_stop(lv)
             poll.wake(sw)
             0
         })
-        let sh = self.sh
         // `workers` slots: a connection holds one while it is served
         let slots: chan.Channel[bool] = chan.bounded(cfg.workers)
         for i in 0..cfg.workers { let z = slots.try_send(true) }
@@ -235,7 +293,9 @@ impl Server {
         let z = watcher.join()
         tok.detach(stopper)
         poll.close_waker(stop)
-        Ok(sh.get().stats)
+        // (the atomic cells of `Live` are not freed: `stats()` and `waiting()` read them after `serve`
+        // returns, and a Server is made once per process, a few bytes)
+        Ok(snapshot(sh))
     }
 }
 
@@ -262,7 +322,7 @@ fn reap(done: chan.Channel[i64], inout conns: Map[i64, Task[i32]]) uses io {
 /// Accepts what is pending (at most 64 at a time, so a flood can't starve the stop check) and
 /// starts a task for each connection: with a slot if one is free, else waiting for one if fewer
 /// than `queue` connections wait, else answering 503.
-fn accept_some(ls: i32, stop: poll.Waker, h: http.Handler, cfg: Config, sh: sync.Lock[Shared], slots: chan.Channel[bool], done: chan.Channel[i64], inout conns: Map[i64, Task[i32]], inout next: i64) uses net, io, clock, threads {
+fn accept_some(ls: i32, stop: poll.Waker, h: http.Handler, cfg: Config, sh: Hub, slots: chan.Channel[bool], done: chan.Channel[i64], inout conns: Map[i64, Task[i32]], inout next: i64) uses net, io, clock, threads {
     reap(done, inout conns)
     for k in 0..64 {
         match net.accept(ls, true) {
@@ -284,7 +344,7 @@ fn accept_some(ls: i32, stop: poll.Waker, h: http.Handler, cfg: Config, sh: sync
                     let id = next
                     next += 1
                     let t = spawn(|| -> i32 {
-                        serve_conn(c, peer, h, cfg, stop, sh, slots, admitted, done, id)
+                        serve_conn(c, peer, h, cfg, sh, slots, admitted, done, id)
                         0
                     })
                     conns.insert(id, t)
@@ -324,45 +384,29 @@ fn date_of(cfg: Config) -> List[u8] uses clock {
     http.imf_date(time.unix_seconds())
 }
 
-/// Whether the stop signal has come (its waker is readable, and stays so), without waiting.
-fn stop_signalled(stop: poll.Waker) -> bool uses io, clock {
-    fd.wait_ready(stop.r, fd.READY_READ, time.now()).unwrap_or(false)
-}
+/// Whether the stop has come: one atomic load (no system call; a request checks it).
+fn stop_signalled(sig: Sig) -> bool { sig.flag.load(atomic.Acquire) != 0 }
 
 /// What a wait on a connection ended with.
 type Wake = | Readable | TimedOut | Stopped | Failed
 
 /// Waits for the connection `t` to be readable (over TLS: or to hold decrypted bytes already), the stop
-/// signal (while `watch` says to watch it: once seen it stays readable, so it is dropped), or `dl`.
-fn wait_conn(t: transport.Transport, stop: poll.Waker, watch: sync.Lock[bool], dl: time.Deadline) -> Wake uses io, clock {
-    let watching = watch.modify(|inout w: bool| -> bool w)
-    let c = t.fd
+/// (the connection's parker is unparked: `Stopped`, and the flag is set), or `dl`. The stop is one
+/// unpark and its permit is taken by the wait that sees it, so a caller that goes on waiting is
+/// not woken again for it (it reads `stop_signalled` when it needs to know).
+fn wait_conn(t: transport.Transport, sig: Sig, dl: time.Deadline) -> Wake uses io, clock {
     if t.is_secure() && t.ready_to_read() {
-        // decrypted bytes are waiting: the socket may be quiet; the stop still comes first
-        if watching && stop_signalled(stop) { return Stopped }
+        // decrypted bytes are waiting: the socket may be quiet; the stop is seen at the next wait
+        // and by the check before the handler
         return Readable
     }
-    if watching {
-        match fd.wait_ready2(c, fd.READY_READ, stop.r, fd.READY_READ, dl) {
-            Ok(r) => {
-                // the stop comes first: the caller then reads with stopping set
-                if r.second != 0 { return Stopped }
-                if r.first != 0 { return Readable }
-                return TimedOut
-            }
-            Err(e) => { return Failed }
-        }
-    }
-    match fd.wait_ready(c, fd.READY_READ, dl) {
-        Ok(ready) => {
-            if ready { return Readable }
-            TimedOut
-        }
+    match fd.wait_ready_or_unpark(t.fd, fd.READY_READ, sig.pk, dl) {
+        Ok(fd.FdReady) => Readable
+        Ok(fd.Unparked) => Stopped
+        Ok(fd.DeadlinePassed) => TimedOut
         Err(e) => Failed
     }
 }
-
-fn unwatch(watch: sync.Lock[bool]) { watch.modify(|inout w: bool| -> () { w = false }) }
 
 /// Answers a refused request (the connection is closed after it).
 fn refuse(t: transport.Transport, status: i32, cfg: Config) uses net, io, clock {
@@ -385,14 +429,12 @@ fn log_trap(cfg: Config, method: List[u8], path: List[u8], why: String) uses io,
 type Answer = { resp: http.Response, trapped: bool }
 
 /// Calls `h` with a trap contained: a trap is a 500 with the standard text, logged and counted.
-fn guarded(h: http.Handler, req: http.Request, cfg: Config, sh: sync.Lock[Shared]) -> Answer uses io, clock {
-    let method = req.method.copy()
-    let path = req.path.copy()
+fn guarded(h: http.Handler, req: http.Request, cfg: Config, sh: Hub) -> Answer uses io, clock {
     match task.catch(|| -> http.Response { h(req) }) {
         Ok(r) => Answer(r, false)
         Err(why) => {
             bump(sh, 7)
-            log_trap(cfg, method, path, why)
+            log_trap(cfg, req.method, req.path, why)
             Answer(http.error_response(500), true)
         }
     }
@@ -423,7 +465,7 @@ fn earlier(a: time.Deadline, b: time.Deadline) -> time.Deadline {
 /// The next bytes of a streamed request body, at most `max`, waiting for the client no longer
 /// than `dl` and `read_timeout` (empty: the body is complete). Holds the connection's parser
 /// (`l`); reads the socket when the parser has nothing to give.
-fn pull_once(inout l: Link, max: usize, dl: time.Deadline, t: transport.Transport, watch: sync.Lock[bool], cfg: Config, stop: poll.Waker) -> Result[List[u8], stream.Error] uses net, io, clock {
+fn pull_once(inout l: Link, max: usize, dl: time.Deadline, t: transport.Transport, sig: Sig, cfg: Config) -> Result[List[u8], stream.Error] uses net, io, clock {
     let limit = earlier(dl, time.after(cfg.read_timeout))
     while true {
         match l.parser.body_next(max) {
@@ -438,7 +480,7 @@ fn pull_once(inout l: Link, max: usize, dl: time.Deadline, t: transport.Transpor
                     let cont = sys.lit("HTTP/1.1 100 Continue\r\n\r\n")
                     if !t.send_by(cont, time.after(cfg.write_timeout)) { return Err(stream.error(stream.BrokenPipe, "the client went away")) }
                 }
-                match wait_conn(t, stop, watch, limit) {
+                match wait_conn(t, sig, limit) {
                     Readable => {
                         match t.try_recv(65536) {
                             Ok(Some(b)) => {
@@ -454,7 +496,7 @@ fn pull_once(inout l: Link, max: usize, dl: time.Deadline, t: transport.Transpor
                     }
                     TimedOut => { return Err(stream.error(stream.TimedOut, "timed out waiting for the request body")) }
                     // the server is stopping: the body already on its way is still read
-                    Stopped => { unwatch(watch) }
+                    Stopped => {}
                     Failed => { return Err(stream.error(stream.Other, "poll failed")) }
                 }
             }
@@ -463,17 +505,17 @@ fn pull_once(inout l: Link, max: usize, dl: time.Deadline, t: transport.Transpor
     Err(stream.error(stream.Other, "unreachable"))
 }
 
-fn body_pull(link: sync.Lock[Link], t: transport.Transport, watch: sync.Lock[bool], cfg: Config, stop: poll.Waker) -> http.Pull uses net, io, clock {
+fn body_pull(link: sync.Lock[Link], t: transport.Transport, sig: Sig, cfg: Config) -> http.Pull uses net, io, clock {
     |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
-        link.modify(|inout l: Link| -> Result[List[u8], stream.Error] { pull_once(inout l, max, dl, t, watch, cfg, stop) })
+        link.modify(|inout l: Link| -> Result[List[u8], stream.Error] { pull_once(inout l, max, dl, t, sig, cfg) })
     }
 }
 
 /// Reads and drops the rest of a streamed body: whether it ended cleanly.
-fn drain_body(link: sync.Lock[Link], t: transport.Transport, watch: sync.Lock[bool], cfg: Config, stop: poll.Waker) -> bool uses net, io, clock {
+fn drain_body(link: sync.Lock[Link], t: transport.Transport, sig: Sig, cfg: Config) -> bool uses net, io, clock {
     link.modify(|inout l: Link| -> bool {
         while true {
-            match pull_once(inout l, 65536, time.after(cfg.read_timeout), t, watch, cfg, stop) {
+            match pull_once(inout l, 65536, time.after(cfg.read_timeout), t, sig, cfg) {
                 Ok(b) => {
                     if b.len() == 0 { return true }
                 }
@@ -490,7 +532,7 @@ fn closed_err() -> stream.Error { stream.error(stream.BrokenPipe, "the connectio
 /// connection. Returns what ends the connection (0 keep serving, 1 lingering close, 2 close now).
 /// `left` is what the parser read beyond the request (for an upgrade: the first bytes the
 /// client sent after its handshake).
-fn run_stream(t: transport.Transport, watch: sync.Lock[bool], resp: http.Response, stm: http.Stream, keep: bool, left: List[u8], cfg: Config, stop: poll.Waker, sh: sync.Lock[Shared], method: List[u8], path: List[u8]) -> i32 uses net, io, clock {
+fn run_stream(t: transport.Transport, sig: Sig, resp: http.Response, stm: http.Stream, keep: bool, left: List[u8], cfg: Config, sh: Hub, method: List[u8], path: List[u8]) -> i32 uses net, io, clock {
     let head = match http.write_stream_head(resp, stm.raw, keep, date_of(cfg)) {
         Ok(b) => b
         Err(e) => { return 2 }
@@ -509,7 +551,7 @@ fn run_stream(t: transport.Transport, watch: sync.Lock[bool], resp: http.Respons
         if early.len() > 0 { return Ok(early) }
         if !raw { return Err(stream.error(stream.Unsupported, "a chunked response has nothing to read")) }
         while true {
-            match wait_conn(t, stop, watch, dl) {
+            match wait_conn(t, sig, dl) {
                 Readable => {
                     match t.try_recv(max as i64) {
                         Ok(Some(b)) => { return Ok(b) }
@@ -519,7 +561,6 @@ fn run_stream(t: transport.Transport, watch: sync.Lock[bool], resp: http.Respons
                 }
                 TimedOut => { return Err(stream.error(stream.TimedOut, "timed out")) }
                 Stopped => {
-                    unwatch(watch)
                     return Err(stream.error(stream.Interrupted, "the server is stopping"))
                 }
                 Failed => { return Err(stream.error(stream.Other, "poll failed")) }
@@ -533,7 +574,7 @@ fn run_stream(t: transport.Transport, watch: sync.Lock[bool], resp: http.Respons
         if t.send_by(wire, time.after(cfg.write_timeout)) { return Ok(()) }
         Err(closed_err())
     }
-    let stopping = || -> bool { stop_signalled(stop) }
+    let stopping = || -> bool { stop_signalled(sig) }
     let run = stm.run
     let dx = http.Duplex(recv, send, stopping)
     match task.catch(|| -> () { run(dx) }) {
@@ -553,21 +594,25 @@ fn run_stream(t: transport.Transport, watch: sync.Lock[bool], resp: http.Respons
 
 /// A connection's task: waits for a slot if it was accepted without one, serves the connection,
 /// gives the slot back and tells the acceptor it is done (so its Task can be joined).
-fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.Waker, sh: sync.Lock[Shared], slots: chan.Channel[bool], admitted: bool, done: chan.Channel[i64], id: i64) uses net, io, clock {
+fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, sh: Hub, slots: chan.Channel[bool], admitted: bool, done: chan.Channel[i64], id: i64) uses net, io, clock {
     if !admitted {
         // accepted while every slot was taken: wait for one (the acceptor counted this
         // connection as waiting, so at most `queue` of them are parked here)
         let got = slots.recv(time.never())
         bump(sh, 6)
     }
+    // the connection's parker: the stop unparks it (`Live`); it is in no list once it left
+    let pk = sync.parker()
+    live_join(sh.live, id, pk)
+    let sig = Sig(sh.live.flag, pk)
     match cfg.secure {
-        None => { serve_slot(transport.plain(c), peer, h, cfg, stop, sh) }
+        None => { serve_slot(transport.plain(c), peer, h, cfg, sig, sh) }
         Some(acc) => {
             // the TLS handshake: it holds this slot (so a connection that stalls in it is bounded by the
             // acceptor's deadline) and blocks this task only
             let go = acc.accept
             match go(c) {
-                Ok(t) => { serve_slot(t, peer, h, cfg, stop, sh) }
+                Ok(t) => { serve_slot(t, peer, h, cfg, sig, sh) }
                 Err(why) => {
                     bump(sh, 8)
                     fd.close(c)
@@ -575,19 +620,23 @@ fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.W
             }
         }
     }
+    live_leave(sh.live, id)
+    pk.close()
     let back = slots.try_send(true)
     let fin = done.try_send(id)
 }
 
 /// One connection, request after request (see the module comment), with its slot held. Owns
 /// `c`; `peer` is the client's address as text (it goes in every Request).
-fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Config, stop: poll.Waker, sh: sync.Lock[Shared]) uses net, io, clock {
-    let watch = sync.lock(true)
+fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Config, sig: Sig, sh: Hub) uses net, io, clock {
     let mut ok = true
     let mut stopping = false
     let mut parser = parse.requests(cfg.limits)
     parser.set_plan(cfg.plan)
     let mut served: u32 = 0
+    // the Date header text, made again when the second changes
+    let mut date_at: i64 = -1
+    let mut date_txt: List[u8] = List.new()
     // what ends the connection: 0 keep going, 1 close after a response (a lingering
     // close), 2 close now
     let mut end = 0
@@ -625,7 +674,7 @@ fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Conf
                             dl = time.after(cfg.read_timeout)
                         }
                     } else if end == 0 {
-                        match wait_conn(t, stop, watch, dl) {
+                        match wait_conn(t, sig, dl) {
                             Readable => {
                                 match t.try_recv(65536) {
                                     Ok(Some(b)) => {
@@ -667,8 +716,7 @@ fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Conf
                             }
                             Stopped => {
                                 stopping = true
-                                unwatch(watch)
-                            }
+                                        }
                             Failed => { end = 2 }
                         }
                     }
@@ -700,16 +748,19 @@ fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Conf
         // rest of this request was read (a wait that saw only data, then a read that got the
         // bytes sent after the stop too), so the signal is checked again here: a request in
         // flight at the stop is answered with `Connection: close`
-        if !stopping && stop_signalled(stop) { stopping = true }
+        if !stopping && stop_signalled(sig) { stopping = true }
         let mut keep = req.keep_alive && served < cfg.max_requests && !stopping && waiting(sh) == 0
         let mut resp = http.response(500)
         // a transfer coding (`gzip, chunked`) is undone before the handler sees the request
         let mut refused: Option[http.Response] = None
-        match compress.decode_request(req, true, decode_limits(cfg, req)) {
-            Ok(r) => { req = r }
-            Err(r) => {
-                refused = Some(r)
-                bump(sh, 3)
+        // (only a transfer coding is undone here, so a request without a Transfer-Encoding is as it is)
+        if http.find_s(req.headers, "transfer-encoding").is_some() {
+            match compress.decode_request(req, true, decode_limits(cfg, req)) {
+                Ok(r) => { req = r }
+                Err(r) => {
+                    refused = Some(r)
+                    bump(sh, 3)
+                }
             }
         }
         if refused.is_some() {
@@ -718,7 +769,7 @@ fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Conf
         } else if streaming_req {
             // the body is read by the handler as it goes: the parser is shared with the reader
             let link = sync.lock(Link(parser.copy()))
-            req.stream = Some(http.Body(body_pull(link, t, watch, cfg, stop)))
+            req.stream = Some(http.Body(body_pull(link, t, sig, cfg)))
             let ans = guarded(h, req, cfg, sh)
             resp = ans.resp
             trapped = ans.trapped
@@ -729,7 +780,7 @@ fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Conf
             } else {
                 // what the handler left unread is read and dropped; a body that can't be
                 // finished ends the connection after the response
-                if !drain_body(link, t, watch, cfg, stop) { keep = false }
+                if !drain_body(link, t, sig, cfg) { keep = false }
                 parser = link.get().parser.copy()
             }
         } else {
@@ -747,7 +798,7 @@ fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Conf
                     resp = hr
                 } else {
                     let left = bytes.slice(parser.buf, parser.pos, parser.buf.len())
-                    end = run_stream(t, watch, resp, stm, keep, left, cfg, stop, sh, call_method, call_path)
+                    end = run_stream(t, sig, resp, stm, keep, left, cfg, sh, call_method, call_path)
                     if end == 0 { resp.keep_alive = true }
                     if end != 0 { break }
                     continue
@@ -755,9 +806,16 @@ fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Conf
             }
             None => {}
         }
-        let out = match http.write_response(resp, head_only, keep, date_of(cfg)) {
+        if cfg.date {
+            let now_s = time.unix_seconds()
+            if now_s != date_at {
+                date_at = now_s
+                date_txt = http.imf_date(now_s)
+            }
+        }
+        let out = match http.write_response(resp, head_only, keep, date_txt) {
             Ok(b) => b
-            Err(e) => http.write_response(http.error_response(500), head_only, false, date_of(cfg)).unwrap()
+            Err(e) => http.write_response(http.error_response(500), head_only, false, date_txt).unwrap()
         }
         if !t.send_by(out, time.after(cfg.write_timeout)) {
             bump(sh, 4)

@@ -185,6 +185,26 @@ pub fn eq_ci(a: List[u8], b: List[u8]) -> bool {
     true
 }
 
+/// Equality with a literal (nothing is allocated for the literal).
+pub fn eq_s(a: List[u8], b: str) -> bool {
+    let n = b.len()
+    if a.len() != n { return false }
+    for i in 0..n {
+        if a[i] != b.byte(i) { return false }
+    }
+    true
+}
+
+/// ASCII case-insensitive equality with a literal (nothing is allocated for the literal).
+pub fn eq_ci_s(a: List[u8], b: str) -> bool {
+    let n = b.len()
+    if a.len() != n { return false }
+    for i in 0..n {
+        if lower_byte(a[i]) != lower_byte(b.byte(i)) { return false }
+    }
+    true
+}
+
 /// `s` without leading and trailing SP and HTAB (OWS).
 pub fn trim_ows(s: List[u8]) -> List[u8] {
     let mut a: usize = 0
@@ -242,6 +262,23 @@ pub fn count(hs: List[Header], name: List[u8]) -> usize {
     n
 }
 
+/// The value of the first header called `name`, a literal (case-insensitive).
+pub fn find_s(hs: List[Header], name: str) -> Option[List[u8]] {
+    for h in hs {
+        if eq_ci_s(h.name, name) { return Some(h.value) }
+    }
+    None
+}
+
+/// How many headers are called `name`, a literal.
+pub fn count_s(hs: List[Header], name: str) -> usize {
+    let mut n: usize = 0
+    for h in hs {
+        if eq_ci_s(h.name, name) { n += 1 }
+    }
+    n
+}
+
 /// `hs` without the headers called `name`.
 pub fn without(hs: List[Header], name: List[u8]) -> List[Header] {
     let mut out: List[Header] = List.new()
@@ -258,6 +295,18 @@ pub fn has_token(hs: List[Header], name: List[u8], token: List[u8]) -> bool {
         if eq_ci(h.name, name) {
             for t in list_items(h.value) {
                 if eq_ci(t, token) { return true }
+            }
+        }
+    }
+    false
+}
+
+/// `has_token` with literals for the name and the token.
+pub fn has_token_s(hs: List[Header], name: str, token: str) -> bool {
+    for h in hs {
+        if eq_ci_s(h.name, name) {
+            for t in list_items(h.value) {
+                if eq_ci_s(t, token) { return true }
             }
         }
     }
@@ -376,6 +425,13 @@ pub fn error_response(status: i32) -> Response {
 /// "http://host/a?b" is ("/a", "b") too (RFC 9112 3.2.2); anything else ("*", an authority)
 /// is (target, "").
 pub fn split_target(t: List[u8]) -> (List[u8], List[u8]) {
+    if t.len() > 0 && t[0] == 47 {
+        // origin-form, the usual one: nothing to rebuild
+        match bytes.find_byte(t, 63, 0) {
+            Some(i) => { return (bytes.slice(t, 0, i), bytes.slice(t, i + 1, t.len())) }
+            None => { return (t, List.new()) }
+        }
+    }
     let mut s = t.copy()
     if s.len() > 0 && s[0] != 47 {
         // absolute-form: scheme "://" authority path-abempty [ "?" query ]
@@ -414,6 +470,15 @@ fn hexval(c: u8) -> i32 {
 
 /// `s` with `%XX` decoded (and `+` as a space when `plus`); None for a malformed escape.
 pub fn pct_decode(s: List[u8], plus: bool) -> Option[List[u8]] {
+    // nothing to decode (the usual segment or value): the text itself
+    let mut plain = true
+    for c in s {
+        if c == 37 || (plus && c == 43) {
+            plain = false
+            break
+        }
+    }
+    if plain { return Some(s) }
     let mut out: List[u8] = List.new()
     let mut i: usize = 0
     while i < s.len() {
@@ -460,8 +525,11 @@ pub fn pct_encode(s: List[u8]) -> List[u8] {
 // ---- status codes
 
 /// The reason phrase of a status code ("" for an unknown one).
-pub fn reason(status: i32) -> List[u8] {
-    let r = match status {
+pub fn reason(status: i32) -> List[u8] { sys.lit(reason_str(status)) }
+
+/// The reason phrase of a status code as a literal ("" for an unknown one).
+pub fn reason_str(status: i32) -> str {
+    match status {
         100 => "Continue"
         101 => "Switching Protocols"
         200 => "OK"
@@ -501,7 +569,6 @@ pub fn reason(status: i32) -> List[u8] {
         505 => "HTTP Version Not Supported"
         _ => ""
     }
-    sys.lit(r)
 }
 
 /// Whether a response with this status never has a body (1xx, 204, 304).
@@ -544,14 +611,43 @@ fn json_ish(s: List[u8]) -> List[u8] {
 }
 
 fn is_framing(name: List[u8]) -> bool {
-    eq_ci(name, sys.lit("content-length")) || eq_ci(name, sys.lit("transfer-encoding")) || eq_ci(name, sys.lit("connection"))
+    eq_ci_s(name, "content-length") || eq_ci_s(name, "transfer-encoding") || eq_ci_s(name, "connection")
 }
 
 fn put_header(inout out: List[u8], name: List[u8], value: List[u8]) {
-    bytes.append(inout out, name)
-    bytes.append(inout out, sys.lit(": "))
-    bytes.append(inout out, value)
-    bytes.append(inout out, sys.lit("\r\n"))
+    out.extend(name)
+    out.push(58)
+    out.push(32)
+    out.extend(value)
+    out.push(13)
+    out.push(10)
+}
+
+/// Appends a literal's bytes (no list is made for it).
+fn put_s(inout out: List[u8], s: str) {
+    for i in 0..s.len() { out.push(s.byte(i)) }
+}
+
+/// `name: value` with a literal name.
+fn put_header_s(inout out: List[u8], name: str, value: List[u8]) {
+    put_s(inout out, name)
+    out.push(58)
+    out.push(32)
+    out.extend(value)
+    out.push(13)
+    out.push(10)
+}
+
+/// The decimal digits of `n`.
+fn put_u64(inout out: List[u8], n: u64) {
+    let mut div: u64 = 1
+    while n / div >= 10 { div = div * 10 }
+    let mut rest = n.copy()
+    while div > 0 {
+        out.push((rest / div) as u8 + 48)
+        rest = rest % div
+        div = div / 10
+    }
 }
 
 /// A response as bytes: the status line, the program's headers (minus framing headers),
@@ -562,21 +658,29 @@ fn put_header(inout out: List[u8], name: List[u8], value: List[u8]) {
 pub fn write_response(r: Response, head_only: bool, keep_alive: bool, date: List[u8]) -> Result[List[u8], String] {
     check_headers(r.headers)?
     if r.status < 100 || r.status > 999 { return Err(String.from("invalid status code")) }
-    let mut out = sys.lit("HTTP/1.1 ")
-    bytes.append(inout out, bytes.from_u64(r.status as u64))
+    // the head of a typical response fits in 192 bytes: one buffer, grown only past that
+    let mut out: List[u8] = List.filled(0, 192)
+    out.truncate(0)
+    put_s(inout out, "HTTP/1.1 ")
+    put_u64(inout out, r.status as u64)
     out.push(32)
-    bytes.append(inout out, reason(r.status))
-    bytes.append(inout out, sys.lit("\r\n"))
+    put_s(inout out, reason_str(r.status))
+    out.push(13)
+    out.push(10)
     for h in r.headers {
         if !is_framing(h.name) { put_header(inout out, h.name, h.value) }
     }
-    if date.len() > 0 && count(r.headers, sys.lit("date")) == 0 { put_header(inout out, sys.lit("Date"), date) }
+    if date.len() > 0 && count_s(r.headers, "date") == 0 { put_header_s(inout out, "Date", date) }
     if !((r.status >= 100 && r.status < 200) || r.status == 204) {
-        put_header(inout out, sys.lit("Content-Length"), bytes.from_u64(r.body.len() as u64))
+        put_s(inout out, "Content-Length: ")
+        put_u64(inout out, r.body.len() as u64)
+        out.push(13)
+        out.push(10)
     }
-    if !keep_alive { put_header(inout out, sys.lit("Connection"), sys.lit("close")) }
-    bytes.append(inout out, sys.lit("\r\n"))
-    if !head_only && !bodyless(r.status) { bytes.append(inout out, r.body) }
+    if !keep_alive { put_s(inout out, "Connection: close\r\n") }
+    out.push(13)
+    out.push(10)
+    if !head_only && !bodyless(r.status) { out.extend(r.body) }
     Ok(out)
 }
 

@@ -1,0 +1,161 @@
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Date: Mon, 23 Nov 2026 00:00:00 GMT
+Content-Length: 5
+
+hello
+--
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Date: Mon, 23 Nov 2026 00:00:00 GMT
+Content-Length: 5
+Connection: close
+
+hello
+--
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Length: 5
+
+
+--
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+Content-Length: 14
+
+404 Not Found
+
+--
+HTTP/1.1 431 Request Header Fields Too Large
+Content-Type: text/plain; charset=utf-8
+Date: x
+Content-Length: 36
+
+431 Request Header Fields Too Large
+
+--
+HTTP/1.1 204 No Content
+
+
+--
+HTTP/1.1 304 Not Modified
+Content-Length: 0
+
+
+--
+HTTP/1.1 101 Switching Protocols
+
+
+--
+HTTP/1.1 999 
+Content-Length: 0
+
+
+--
+HTTP/1.1 200 OK
+Content-Length: 0
+
+
+--
+HTTP/1.1 201 Created
+Content-Type: application/json
+X-One: 1
+Date: Tue, 01 Jan 2030 00:00:00 GMT
+Content-Length: 3
+
+a=1
+--
+big: 10083
+error: invalid header name "Bad Name"
+--
+error: invalid value for header X
+--
+error: invalid status code
+--
+0 11 true false
+GET
+/users/42
+host=a|
+
+--
+0 11 true false
+GET
+/users/42?x=1&y=%41
+host=a|
+user-agent=curl/8|
+accept=*/*|
+x-empty=|
+
+--
+0 11 true false
+POST
+/p
+host=a|
+content-length=3|
+abc
+--
+0 10 true false
+GET
+/
+host=a|
+connection=keep-alive|
+
+--
+0 11 false false
+GET
+/
+host=a|
+connection=Close|
+
+--
+bad 400: an HTTP/1.1 request needs exactly one Host
+--
+bad 400: an HTTP/1.1 request needs exactly one Host
+--
+bad 400: obsolete line folding
+--
+bad 400: header field without a colon
+--
+bad 400: invalid header field name
+--
+bad 400: invalid header field name
+--
+bad 400: invalid character in a header value
+--
+bad 400: both Content-Length and Transfer-Encoding
+--
+bad 505: unsupported HTTP version
+--
+bad 400: invalid HTTP version
+--
+bad 400: invalid HTTP version
+--
+0 11 true false
+GET
+http://h/x?q
+host=a|
+
+--
+0 11 true false
+POST
+/
+host=a|
+transfer-encoding=chunked|
+abc
+--
+0 11 true false
+POST
+/
+host=a|
+transfer-encoding=gzip, chunked|
+
+--
+bad 501: transfer codings other than chunked are not supported
+--
+0 11 true false
+GET
+/
+host=a|
+expect=100-continue|
+
+--

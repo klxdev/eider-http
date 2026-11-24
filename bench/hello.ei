@@ -1,0 +1,29 @@
+// Throughput benchmark target: the same routes as the axum server in the comparison
+//   GET /            -> "hello"
+//   GET /users/:id   -> the id
+// usage: hello [port]   (default 8080); build with `eider build --release bench/hello.ei -o hello`
+import core.sys
+import std.env
+import std.net
+import std.task
+import http
+import http.server
+import http.router
+
+fn main() uses io, net, clock, threads {
+    let args = env.args()
+    let mut port: i32 = 8080
+    if args.len() > 1 {
+        port = 0
+        for c in args[1] { port = port * 10 + (c as i32 - 48) }
+    }
+    let mut r = router.new()
+    r.get("/", |q: http.Request| -> http.Response { http.text(200, "hello") })
+    r.get("/users/:id", |q: http.Request| -> http.Response { http.respond(200, "text/plain; charset=utf-8", q.param("id").unwrap()) })
+    let mut cfg = server.config()
+    cfg.log = None
+    // axum has no per-connection request cap; the default (1000) forces a reconnect every 1000 requests
+    cfg.max_requests = 4294967295
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, port), cfg).unwrap()
+    let stats = srv.serve(router.handler(r), task.root()).unwrap()
+}

@@ -87,8 +87,9 @@ input gives the same steps whether fed whole, byte by byte or in random pieces.
 gets a task that serves it request after request with blocking-style code, parking when it waits: wait (with a
 deadline) on the connection and the stop signal, read, feed the parser, call the handler,
 write the response before its deadline. No shared mutable state except one Lock of counters, and the handler is ordinary code. A
-connection waits for its socket and the server's stop signal together (`fd.wait_ready2`, so
-there is no poller per connection); tens of thousands of connections are tens of thousands of
+connection waits for its socket and the server's stop signal together (`fd.wait_ready_or_unpark`
+on its own parker, which the stop unparks, so there is no poller per connection and a wait is one
+registration with the runtime's poller); tens of thousands of connections are tens of thousands of
 parked tasks. `workers` is the number of connections served at once (default 10,000) and
 `queue` the number that may wait for a slot; a handler that computes without waiting occupies
 a scheduler thread.
@@ -107,8 +108,9 @@ a scheduler thread.
   close, drain what the client still sends (up to 1 s or 64 KiB), close, so the client reads
   the response instead of a reset.
 - *Graceful shutdown (C49):* cancel the token passed to `serve`. A watcher thread blocked on
-  the token wakes a waker that is never drained, so every wait that watches it (the
-  acceptor's and each connection's) sees the stop from then on. The acceptor takes what is
+  the token sets the stop flag (one atomic load for a connection to read), unparks every
+  connection's parker, and wakes a waker that is never drained for the acceptor, so every wait
+  (the acceptor's and each connection's) sees the stop from then on. The acceptor takes what is
   already in the listen backlog and closes the listener; every worker finishes the request
   it is reading or handling and answers it with `Connection: close` (the stop is checked
   again when the response is written, so a request whose last bytes came after it is
@@ -396,7 +398,7 @@ Recorded rather than worked around; none blocks the design.
 | ~~N1~~ | Type aliases (`type Handler = fn(Request) -> Response`) | every handler signature | done: `http.Handler`, `http.Middleware`, `jsonrpc.Method` (eider-lang's docs/compiler.md "C8.18"; C104) |
 | ~~N2~~ | `\r`, `\xNN` and `\u{...}` string escapes, and literal concatenation | CRLF in messages, test corpora | done: messages are written with `\r\n` literals (eider-lang's docs/compiler.md "C8.17"); the tests keep `wire()`, where `\n` is CRLF, by choice (C104) |
 | N3 | `std/net`: a send that reports would-block (`try_send`, like `try_recv`) | sock.send_by | wait for writability before every send (correct: one writer per socket) |
-| N4 | Waiting on two descriptors with a deadline without a poller per connection (e.g. `fd.wait_any`, or one event.Loop per worker thread) | each connection waits on its socket and the stop signal | one epoll descriptor per connection (four system calls more per connection) |
+| N4 | Waiting on two descriptors with a deadline without a poller per connection (e.g. `fd.wait_any`, or one event.Loop per worker thread) | each connection waits on its socket and its own parker (`fd.wait_ready_or_unpark`; the stop unparks it) | one epoll descriptor per connection (four system calls more per connection) |
 | ~~N5~~ | Containing a trap: a handler's panic or overflow ends the process | server | done: `task.catch` (eider-lang C803) around every handler in `http/server`, and `middleware.recover` |
 | N6 | Stackless tasks (C4) | thread per connection being served | a fixed pool; `serve` keeps its API when tasks arrive |
 | N7 | References (8.6): reading a List out of a record copies it | the request path copies heads and bodies a few times | fine at these sizes, measured nothing yet |

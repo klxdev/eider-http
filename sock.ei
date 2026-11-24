@@ -7,18 +7,26 @@ import std.fd
 import std.net
 import std.time
 
-/// Sends all of `data` before `dl`: false if the deadline passed or the peer is gone.
+/// Sends all of `data` before `dl`: false if the deadline passed or the peer is gone. It sends first
+/// and waits for writability only when the send buffer is full (the common response fits at once:
+/// one system call, where waiting first is a registration with the poller and a park for a socket
+/// that is nearly always writable).
 pub fn send_by(c: i32, data: List[u8], dl: time.Deadline) -> bool uses net, io, clock {
-    let mut rest = data.copy()
-    while rest.len() > 0 {
-        // writable means the next send takes at least one byte (no other thread writes `c`)
-        match fd.wait_ready(c, fd.READY_WRITE, dl) {
-            Ok(true) => {}
-            Ok(false) => { return false }
-            Err(e) => { return false }
-        }
-        match net.send(c, rest) {
-            Ok(n) => { rest = bytes.slice(rest, n as usize, rest.len()) }
+    let total = data.len()
+    let mut sent: usize = 0
+    while sent < total {
+        let rest = if sent == 0 { data } else { bytes.slice(data, sent, total) }
+        match net.try_send(c, rest) {
+            Ok(Some(n)) => { sent += n as usize }
+            Ok(None) => {
+                // the buffer is full: wait until the next send takes at least one byte (no other
+                // thread writes `c`)
+                match fd.wait_ready(c, fd.READY_WRITE, dl) {
+                    Ok(true) => {}
+                    Ok(false) => { return false }
+                    Err(e) => { return false }
+                }
+            }
             Err(e) => { return false }
         }
     }

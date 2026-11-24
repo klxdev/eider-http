@@ -1,0 +1,95 @@
+// The bytes http.write_response makes, and the parser's reading of a head: pinned exactly (the
+// writer and the head parser are built for speed: no list per literal, one pass over the head).
+// Covers: status lines (known and unknown reasons, 1xx/204/304 with no body, HEAD), the framing
+// headers a program sets being replaced, Date (given, set by the server, absent), keep-alive
+// and close, a body, rejected headers, and heads with odd but legal spacing and case.
+
+import core.sys
+import std.bytes
+import std.io
+import http
+import http.parse
+
+fn show(b: List[u8]) uses io { io.outln(b) }
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn write(r: http.Response, head_only: bool, keep: bool, date: str) uses io {
+    match http.write_response(r, head_only, keep, lit(date)) {
+        Ok(b) => show(b)
+        Err(e) => print("error: {e}")
+    }
+    print("--")
+}
+
+fn parsed(raw: str) uses io {
+    let mut p = parse.requests(http.limits())
+    p.feed(lit(raw))
+    match p.next() {
+        parse.Done(m) => {
+            print("{m.status} {m.version} {m.keep_alive} {m.streaming}")
+            show(m.method)
+            show(m.target)
+            for h in m.headers { show(bytes.concat(bytes.concat(h.name, lit("=")), bytes.concat(h.value, lit("|")))) }
+            show(m.body)
+        }
+        parse.Bad(st, why) => { print("bad {st}: {sys.to_string(why)}") }
+        parse.More => print("more")
+    }
+    print("--")
+}
+
+fn main() uses io {
+    write(http.text(200, "hello"), false, true, "Mon, 23 Nov 2026 00:00:00 GMT")
+    write(http.text(200, "hello"), false, false, "Mon, 23 Nov 2026 00:00:00 GMT")
+    write(http.text(200, "hello"), true, true, "")
+    write(http.error_response(404), false, true, "")
+    write(http.error_response(431), false, true, "x")
+    write(http.response(204), false, true, "")
+    write(http.response(304), false, true, "")
+    write(http.response(101), false, true, "")
+    write(http.response(999), false, true, "")
+    write(http.response(200), false, true, "")
+    let mut r = http.respond(201, "application/json", lit("a=1"))
+    r.set_header("Content-Length", lit("999"))
+    r.set_header("Connection", lit("keep-alive"))
+    r.set_header("Transfer-Encoding", lit("chunked"))
+    r.set_header("X-One", lit("1"))
+    r.set_header("Date", lit("Tue, 01 Jan 2030 00:00:00 GMT"))
+    write(r, false, true, "Mon, 23 Nov 2026 00:00:00 GMT")
+    let mut big = http.respond(200, "text/plain", List.filled(120, 10000))
+    big.set_header("A", lit("b"))
+    match http.write_response(big, false, true, lit("d")) {
+        Ok(b) => print("big: {b.len()}")
+        Err(e) => print(e)
+    }
+    let mut bad = http.response(200)
+    bad.headers.push(http.Header(lit("Bad Name"), lit("v")))
+    write(bad, false, true, "")
+    let mut bad2 = http.response(200)
+    bad2.headers.push(http.Header(lit("X"), lit("a\r\nb: c")))
+    write(bad2, false, true, "")
+    write(http.response(1000), false, true, "")
+
+    parsed("GET /users/42 HTTP/1.1\r\nHost: a\r\n\r\n")
+    parsed("GET /users/42?x=1&y=%41 HTTP/1.1\r\nHost: a\r\nUser-Agent:   curl/8  \r\nACCEPT:*/*\r\nX-Empty:\r\n\r\n")
+    parsed("POST /p HTTP/1.1\r\nhost: a\r\nContent-Length: 3\r\n\r\nabc")
+    parsed("GET / HTTP/1.0\r\nHost: a\r\nConnection: keep-alive\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\nHost: a\r\nConnection: Close\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\nHost: a\r\nno colon\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\nHost: a\r\n: v\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\nHost: a\r\nBad Name: v\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\nHost: a\r\nX: a\x01b\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n")
+    parsed("GET / HTTP/2.0\r\nHost: a\r\n\r\n")
+    parsed("GET / HTTX/1.1\r\nHost: a\r\n\r\n")
+    parsed("GET /a b HTTP/1.1\r\nHost: a\r\n\r\n")
+    parsed("GET http://h/x?q HTTP/1.1\r\nHost: a\r\n\r\n")
+    parsed("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")
+    parsed("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n")
+    parsed("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: br, chunked\r\n\r\n")
+    parsed("GET / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\r\n")
+}
