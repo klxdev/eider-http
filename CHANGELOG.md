@@ -3,6 +3,15 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.7.5
+
+Throughput: on the bench/ hello-world (`GET /users/:id`, keep-alive, 8 CPUs, idle machine) from 33% to 112% (64 connections) and 104% (256) of axum's on the same machine (`bash bench/run.sh`); CPU per request from 47 to 14 µs (axum 13). **Needs Eider 0.7.8 or later** (`fd.wait_ready_or_unpark`, `net.try_send`; eider-lang's CHANGELOG): `scripts/env.sh` refuses an older toolchain with that message. No change to the public API, to the defaults or to what the server accepts and refuses.
+
+- **One registration per wait, one system call per send.** A connection waits for its socket and for the server's stop with `fd.wait_ready_or_unpark` on its own parker (the stop sets a flag and unparks every connection's parker: `server.Live`) instead of `wait_ready2` on the socket and a waker descriptor (two `epoll_ctl` per wait, and a `poll` per request to ask whether the stop had come: now one atomic load). `sock.send_by` sends first and waits for writability only when the send buffer is full (it waited first: a registration and a park for a socket that is nearly always writable).
+- **No lock on the per-request path.** The handled-requests counter and the waiting gauge are atomics (`Stats` and `Server.waiting()` read them as before, also after `serve` returns); the `Date` header text is made once per second per connection; the parser, the response writer and the router no longer build a list for each literal they compare or write (`http.eq_ci_s`, `eq_s`, `count_s`, `find_s`, `has_token_s`, `reason_str`: additive), parse a head in one pass (`parse.field_at`) instead of splitting it into lines and then fields, and do nothing for a target or path segment that has nothing to decode; the route's pattern text is made once at registration; `decode_request` is skipped for a request with no `Transfer-Encoding`; the handler call no longer copies the method and the path.
+- Every check is as before: the same header-name, value and framing validation (the head parser's errors and their order are unchanged, tests/parse_test and tests/fuzz_test), the same limits, deadlines, 408/413/431 answers and graceful shutdown (tests/server_test).
+- **bench/** (new): `hello.ei`, the same routes in axum (`bench/axum`), a keep-alive load generator (`bench/loadgen`, std only) and `bench/run.sh`, which pins the servers and the load generator to different CPUs and prints req/s and the server's CPU time per request, the number to trust on a busy machine. `hello.ei` raises `max_requests` (the default of 1000 makes a connection reconnect every 1000 requests; axum has no such cap).
+
 ## 0.7.4
 
 - **https: TLS 1.3 for the server, the client and WebSocket, over eider-tls** (eider-lang#223, acceptance criterion 4 of #29; for Eider 0.7.6). Docs: docs/services.md "TLS".
