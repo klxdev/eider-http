@@ -96,3 +96,7 @@ export EIDER_PKG_OVERRIDE
 # the server waits on a connection's socket and its own parker (`fd.wait_ready_or_unpark`) and the socket writer sends with
 # `net.try_send`: both are Eider 0.7.8's std (eider-http 0.7.5 and later)
 grep -q "wait_ready_or_unpark" "$toolchain/std/fd.ei" 2>/dev/null && grep -q "try_send" "$toolchain/std/net.ei" 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs, whose std has no fd.wait_ready_or_unpark and net.try_send; eider-$pkg_name $mine needs Eider 0.7.8 or later (\`eider toolchain install 0.7\`)"
+# a toolchain before 0.7.9 can crash a server (a use-after-free of task stacks in the runtime: a finished task's stack was cached
+# before its pages were discarded, so a new task's live frames could be zeroed; present in 0.7.7 and 0.7.8, far likelier with
+# 0.7.8's faster task turnover; eider-http 0.7.6 and later)
+[ "${theirs##*.}" -ge 9 ] 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs, whose runtime can crash programs that start and end many tasks (a use-after-free of task stacks, fixed in 0.7.9); eider-$pkg_name $mine needs Eider 0.7.9 or later (\`eider toolchain install 0.7\`)"

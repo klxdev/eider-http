@@ -3,6 +3,12 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.7.6
+
+Needs Eider 0.7.9 or later (`scripts/env.sh` refuses an older toolchain). No code changes.
+
+- **Eider 0.7.7 and 0.7.8 can crash a server built with this library.** A finished task's stack was put in the runtime's stack cache before its unused pages were discarded; another worker could take the stack for a new task in between, and the late discard zeroed that task's live frames (a parked task's wait record, return addresses): intermittent SIGSEGV in programs that start and end many tasks, which a server does. 0.7.8's faster task turnover made it far likelier (eider-http's own `tests/server_test.ei` crashed in 14 of 20 unoptimized runs on 0.7.8 and 5 of 20 on 0.7.7; 0 of 40 on 0.7.9). Fixed in Eider 0.7.9; earlier toolchains can crash.
+
 ## 0.7.5
 
 Throughput: on the bench/ hello-world (`GET /users/:id`, keep-alive, 8 CPUs, idle machine) from 33% to 112% (64 connections) and 104% (256) of axum's on the same machine (`bash bench/run.sh`); CPU per request from 47 to 14 µs (axum 13). **Needs Eider 0.7.8 or later** (`fd.wait_ready_or_unpark`, `net.try_send`; eider-lang's CHANGELOG): `scripts/env.sh` refuses an older toolchain with that message. No change to the public API, to the defaults or to what the server accepts and refuses.
