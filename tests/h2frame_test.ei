@@ -1,0 +1,155 @@
+// http/h2frame: every frame type round-trips, input fed one byte at a time gives the same frames as
+// the whole input, padding and priority fields are taken off, and a corpus of malformed frames is
+// refused with the error code the RFC names.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import http.h2frame
+
+fn say(s: String) uses io { io.outln(s.bytes()) }
+
+fn msg(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+fn hx(b: List[u8]) -> String { encoding.hex(b) }
+
+fn unhex(s: str) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut hi: i32 = -1
+    for c in sys.lit(s) {
+        let v: i32 = if c >= 48 && c <= 57 { (c as i32) - 48 } else if c >= 97 && c <= 102 { (c as i32) - 87 } else { -1 }
+        if v < 0 { continue }
+        if hi < 0 {
+            hi = v
+        } else {
+            out.push((hi * 16 + v) as u8)
+            hi = -1
+        }
+    }
+    out
+}
+
+fn show(f: h2frame.Frame) -> String {
+    let mut l = h2frame.kind_name(f.kind)
+    l.push_str(" flags=")
+    l.append(f.flags.to_string())
+    l.push_str(" stream=")
+    l.append(f.stream.to_string())
+    l.push_str(" padded=")
+    l.append(f.padded.to_string())
+    l.push_str(" payload=")
+    l.append(hx(f.payload))
+    l
+}
+
+/// Every frame in `input`, fed in pieces of `piece` bytes (0: whole).
+fn run(input: List[u8], piece: usize, max: usize) -> List[String] {
+    let mut d = h2frame.decoder(max)
+    let mut out: List[String] = List.new()
+    let step = if piece == 0 { input.len() + 1 } else { piece }
+    let mut i: usize = 0
+    let mut stop = false
+    while !stop {
+        if i < input.len() {
+            let end = if i + step < input.len() { i + step } else { input.len() }
+            d.feed(input.slice(i, end))
+            i = end
+        } else {
+            stop = true
+        }
+        let mut more = true
+        while more {
+            match d.next() {
+                h2frame.NeedMore => { more = false }
+                h2frame.Got(f) => { out.push(show(f)) }
+                h2frame.Fail(code, why) => {
+                    out.push(msg("FAIL ", h2frame.code_name(code)))
+                    out.push(why)
+                    more = false
+                    stop = true
+                }
+            }
+        }
+    }
+    out
+}
+
+fn check(label: str, input: List[u8], max: usize) uses io {
+    say(String.from(label))
+    let whole = run(input, 0, max)
+    for l in whole { say(msg("  ", l)) }
+    if run(input, 1, max) != whole { say(String.from("  MISMATCH fed byte by byte")) }
+    if run(input, 3, max) != whole { say(String.from("  MISMATCH fed 3 bytes at a time")) }
+}
+
+fn main() uses io {
+    say(msg("preface ", hx(h2frame.preface())))
+    check("-- round trips", {
+        let mut b: List[u8] = List.new()
+        b.extend(h2frame.data(1, sys.lit("hello"), false))
+        b.extend(h2frame.data(1, List.new(), true))
+        b.extend(h2frame.headers(3, sys.lit("block"), true, 16384))
+        b.extend(h2frame.rst_stream(5, h2frame.CANCEL))
+        b.extend(h2frame.window_update(0, 65535))
+        b.extend(h2frame.window_update(7, 1))
+        b.extend(h2frame.ping(sys.lit("12345678"), false))
+        b.extend(h2frame.ping(sys.lit("12345678"), true))
+        b.extend(h2frame.goaway(9, h2frame.ENHANCE_YOUR_CALM, sys.lit("slow down")))
+        let mut s: List[h2frame.Setting] = List.new()
+        s.push(h2frame.Setting(h2frame.MAX_CONCURRENT_STREAMS, 100))
+        s.push(h2frame.Setting(h2frame.INITIAL_WINDOW_SIZE, 1048576))
+        b.extend(h2frame.settings(s))
+        b.extend(h2frame.settings_ack())
+        b
+    }, 16384)
+    check("-- a header block split into CONTINUATION frames", h2frame.headers(1, sys.lit("0123456789abcdefghij"), false, 8), 16384)
+    check("-- padding and priority", unhex("000006000800000001 03 6162 000000") , 16384)
+    check("-- HEADERS with PADDED and PRIORITY", unhex("00000b012c00000005 02 0000000310 616263 0000"), 16384)
+    check("-- an unknown frame type is returned", unhex("000003fa0000000000010203"), 16384)
+    check("-- the reserved bit of the stream id is cleared", unhex("000000000080000001"), 16384)
+    let s = h2frame.parse_settings(unhex("000300000064 000400100000 00050000ffff"))
+    for e in s {
+        say(msg("setting id=", e.id.to_string()))
+        say(msg("  value=", e.value.to_string()))
+    }
+    say(msg("goaway ", { let (l, c) = h2frame.parse_goaway(unhex("0000000900000001")); l.to_string() }))
+
+    say(String.from("-- refused"))
+    let bad = List[
+        "000000000000000000",
+        "000001040100000000",
+        "000000040100000001",
+        "000007040100000000 ",
+        "000000010000000000",
+        "000001050000000000",
+        "000005060000000000",
+        "000009060000000000 00000000000000000000",
+        "000003080000000000 000000",
+        "000003030000000001 000000",
+        "000004020000000001 00000000",
+        "000005020000000001 0000000100",
+        "000005000800000001 0500000000",
+        "00000708000000000100000000000000",
+        "000004070000000000 00000000",
+        "000001040000000001 00",
+        "000001010800000001 01",
+        "000002010800000001 0200",
+        "00000501200000000100000001 0a",
+        "000002000800000001 0505",
+        "00400100000000000100",
+    ]
+    for hex in bad {
+        let r = run(unhex(hex), 0, 16384)
+        let mut l = String.from("  ")
+        l.append(String.from(hex))
+        l.push_str(" => ")
+        l.append(if r.len() > 0 { r[0].copy() } else { String.from("(nothing)") })
+        say(l)
+    }
+    say(msg("max frame size: ", run(h2frame.data(1, List.filled(0 as u8, 100), false), 0, 99)[0].copy()))
+}

@@ -1,0 +1,304 @@
+//! http/h2frame: the HTTP/2 frame layer (RFC 9113 sections 4 to 7): the frame header, an
+//! incremental decoder that checks each frame type's size and stream rules before anything
+//! else sees it, the encoders for every frame type, SETTINGS, and the error codes. Pure Eider,
+//! no capability. http/h2 builds streams, flow control and the connection on it.
+//!
+//!     let mut d = h2frame.decoder(16384)
+//!     d.feed(bytes)
+//!     match d.next() {
+//!         h2frame.NeedMore => {}
+//!         h2frame.Got(f) => { ... f.kind, f.flags, f.stream, f.payload ... }
+//!         h2frame.Fail(code, why) => { ... a connection error: send GOAWAY(code) ... }
+//!     }
+//!
+//! What `Decoder.next` refuses, as a connection error with the code the RFC names: a frame
+//! longer than the receiver's SETTINGS_MAX_FRAME_SIZE (FRAME_SIZE_ERROR, from the header: the
+//! payload is never buffered), a frame of a fixed size with another size (PING 8, WINDOW_UPDATE 4,
+//! RST_STREAM 4, PRIORITY 5: FRAME_SIZE_ERROR; SETTINGS a multiple of 6 and empty when it
+//! acknowledges: FRAME_SIZE_ERROR; GOAWAY under 8), a frame on stream 0 that needs a stream (DATA,
+//! HEADERS, PRIORITY, RST_STREAM, CONTINUATION) or a frame on a stream that needs 0 (SETTINGS,
+//! PING, GOAWAY: PROTOCOL_ERROR), bad padding (PROTOCOL_ERROR), a HEADERS that makes a stream
+//! depend on itself (PROTOCOL_ERROR). Unknown frame types are returned as they are (the caller
+//! ignores them, RFC 9113 section 4.1). The reserved bit of the stream id is cleared.
+//!
+//! `Frame.payload` of DATA and HEADERS has the padding and (HEADERS) the priority fields already
+//! taken off; `Frame.padded` is the size of the padding, which counts against flow control.
+
+import std.bytes
+
+pub const DATA: u8 = 0
+pub const HEADERS: u8 = 1
+pub const PRIORITY: u8 = 2
+pub const RST_STREAM: u8 = 3
+pub const SETTINGS: u8 = 4
+pub const PUSH_PROMISE: u8 = 5
+pub const PING: u8 = 6
+pub const GOAWAY: u8 = 7
+pub const WINDOW_UPDATE: u8 = 8
+pub const CONTINUATION: u8 = 9
+
+pub const END_STREAM: u8 = 1
+pub const ACK: u8 = 1
+pub const END_HEADERS: u8 = 4
+pub const PADDED: u8 = 8
+pub const PRIORITY_FLAG: u8 = 32
+
+/// Error codes (RFC 9113 section 7).
+pub const NO_ERROR: u32 = 0
+pub const PROTOCOL_ERROR: u32 = 1
+pub const INTERNAL_ERROR: u32 = 2
+pub const FLOW_CONTROL_ERROR: u32 = 3
+pub const SETTINGS_TIMEOUT: u32 = 4
+pub const STREAM_CLOSED: u32 = 5
+pub const FRAME_SIZE_ERROR: u32 = 6
+pub const REFUSED_STREAM: u32 = 7
+pub const CANCEL: u32 = 8
+pub const COMPRESSION_ERROR: u32 = 9
+pub const CONNECT_ERROR: u32 = 10
+pub const ENHANCE_YOUR_CALM: u32 = 11
+pub const INADEQUATE_SECURITY: u32 = 12
+pub const HTTP_1_1_REQUIRED: u32 = 13
+
+/// SETTINGS identifiers.
+pub const HEADER_TABLE_SIZE: u16 = 1
+pub const ENABLE_PUSH: u16 = 2
+pub const MAX_CONCURRENT_STREAMS: u16 = 3
+pub const INITIAL_WINDOW_SIZE: u16 = 4
+pub const MAX_FRAME_SIZE: u16 = 5
+pub const MAX_HEADER_LIST_SIZE: u16 = 6
+pub const ENABLE_CONNECT_PROTOCOL: u16 = 8
+
+/// The limits of the protocol.
+pub const MAX_WINDOW: i64 = 2147483647
+pub const DEFAULT_WINDOW: i64 = 65535
+pub const DEFAULT_FRAME: usize = 16384
+pub const MAX_FRAME: usize = 16777215
+
+/// The client connection preface: the first 24 bytes a client sends (RFC 9113 section 3.4).
+pub fn preface() -> List[u8] { "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".bytes() }
+
+/// A frame: type, flags, stream id, payload (see the module comment for DATA and HEADERS).
+/// `priority` is whether a HEADERS frame carried the (ignored) priority fields.
+pub type Frame = { kind: u8, flags: u8, stream: u32, payload: List[u8], padded: usize }
+
+/// One SETTINGS entry.
+pub type Setting = { id: u16, value: u32 }
+
+pub type Step = | NeedMore | Got(f: Frame) | Fail(code: u32, why: String)
+
+/// The name of an error code, for messages and logs.
+pub fn code_name(c: u32) -> String {
+    let s = if c == 0 { "NO_ERROR" }
+        else if c == 1 { "PROTOCOL_ERROR" }
+        else if c == 2 { "INTERNAL_ERROR" }
+        else if c == 3 { "FLOW_CONTROL_ERROR" }
+        else if c == 4 { "SETTINGS_TIMEOUT" }
+        else if c == 5 { "STREAM_CLOSED" }
+        else if c == 6 { "FRAME_SIZE_ERROR" }
+        else if c == 7 { "REFUSED_STREAM" }
+        else if c == 8 { "CANCEL" }
+        else if c == 9 { "COMPRESSION_ERROR" }
+        else if c == 10 { "CONNECT_ERROR" }
+        else if c == 11 { "ENHANCE_YOUR_CALM" }
+        else if c == 12 { "INADEQUATE_SECURITY" }
+        else if c == 13 { "HTTP_1_1_REQUIRED" }
+        else { "UNKNOWN_ERROR" }
+    String.from(s)
+}
+
+/// The name of a frame type.
+pub fn kind_name(k: u8) -> String {
+    let s = if k == 0 { "DATA" }
+        else if k == 1 { "HEADERS" }
+        else if k == 2 { "PRIORITY" }
+        else if k == 3 { "RST_STREAM" }
+        else if k == 4 { "SETTINGS" }
+        else if k == 5 { "PUSH_PROMISE" }
+        else if k == 6 { "PING" }
+        else if k == 7 { "GOAWAY" }
+        else if k == 8 { "WINDOW_UPDATE" }
+        else if k == 9 { "CONTINUATION" }
+        else { "UNKNOWN" }
+    String.from(s)
+}
+
+fn fail(code: u32, why: str) -> Step { Fail(code, String.from(why)) }
+
+fn u32_at(b: List[u8], i: usize) -> u32 {
+    ((b[i] as u32) << (24 as u32)) | ((b[i + 1] as u32) << (16 as u32)) | ((b[i + 2] as u32) << (8 as u32)) | (b[i + 3] as u32)
+}
+
+fn put_u32(inout out: List[u8], v: u32) {
+    out.push(((v >> (24 as u32)) & 255) as u8)
+    out.push(((v >> (16 as u32)) & 255) as u8)
+    out.push(((v >> (8 as u32)) & 255) as u8)
+    out.push((v & 255) as u8)
+}
+
+/// An incremental frame decoder: `feed` bytes, call `next` until it says `NeedMore`.
+/// `max_frame` is the largest payload this side accepts (its own SETTINGS_MAX_FRAME_SIZE);
+/// a change takes effect for the frames after the one being read.
+pub type Decoder = { buf: List[u8], pos: usize, max_frame: usize }
+
+pub fn decoder(max_frame: usize) -> Decoder { Decoder(List.new(), 0, max_frame) }
+
+impl Decoder {
+    fn feed(inout self, data: List[u8]) {
+        if self.pos > 0 && self.pos == self.buf.len() {
+            self.buf.clear()
+            self.pos = 0
+        } else if self.pos > 65536 {
+            self.buf.remove_range(0, self.pos)
+            self.pos = 0
+        }
+        bytes.append(inout self.buf, data)
+    }
+
+    /// Bytes buffered and not yet consumed.
+    fn buffered(self) -> usize { self.buf.len() - self.pos }
+
+    /// The next frame, if the bytes so far hold one.
+    fn next(inout self) -> Step {
+        let b = self.buf
+        let p = self.pos
+        if b.len() - p < 9 { return NeedMore }
+        let len = ((b[p] as usize) << 16) | ((b[p + 1] as usize) << 8) | (b[p + 2] as usize)
+        let kind = b[p + 3]
+        let flags = b[p + 4]
+        let stream = u32_at(b, p + 5) & 2147483647
+        if len > self.max_frame { return fail(FRAME_SIZE_ERROR, "frame larger than SETTINGS_MAX_FRAME_SIZE") }
+        // the size and stream rules that need no payload
+        if kind == DATA || kind == HEADERS || kind == PRIORITY || kind == RST_STREAM || kind == CONTINUATION || kind == PUSH_PROMISE {
+            if stream == 0 { return fail(PROTOCOL_ERROR, "a frame that needs a stream was sent on stream 0") }
+        }
+        if kind == SETTINGS || kind == PING || kind == GOAWAY {
+            if stream != 0 { return fail(PROTOCOL_ERROR, "a connection frame was sent on a stream") }
+        }
+        if kind == PING && len != 8 { return fail(FRAME_SIZE_ERROR, "PING is 8 bytes") }
+        if kind == WINDOW_UPDATE && len != 4 { return fail(FRAME_SIZE_ERROR, "WINDOW_UPDATE is 4 bytes") }
+        if kind == RST_STREAM && len != 4 { return fail(FRAME_SIZE_ERROR, "RST_STREAM is 4 bytes") }
+        if kind == PRIORITY && len != 5 { return fail(FRAME_SIZE_ERROR, "PRIORITY is 5 bytes") }
+        if kind == SETTINGS {
+            if len % 6 != 0 { return fail(FRAME_SIZE_ERROR, "SETTINGS is a multiple of 6 bytes") }
+            if (flags & ACK) != 0 && len != 0 { return fail(FRAME_SIZE_ERROR, "a SETTINGS acknowledgement is empty") }
+        }
+        if kind == GOAWAY && len < 8 { return fail(FRAME_SIZE_ERROR, "GOAWAY is at least 8 bytes") }
+        if b.len() - p < 9 + len { return NeedMore }
+        let mut payload = b.slice(p + 9, p + 9 + len)
+        self.pos = p + 9 + len
+        let mut padded: usize = 0
+        if kind == DATA || kind == HEADERS {
+            if (flags & PADDED) != 0 {
+                if payload.len() < 1 { return fail(FRAME_SIZE_ERROR, "a padded frame has no pad length") }
+                let pad = payload[0] as usize
+                if pad >= payload.len() { return fail(PROTOCOL_ERROR, "padding is longer than the frame") }
+                padded = pad + 1
+                payload = payload.slice(1, payload.len() - pad)
+            }
+            if kind == HEADERS && (flags & PRIORITY_FLAG) != 0 {
+                if payload.len() < 5 { return fail(FRAME_SIZE_ERROR, "HEADERS is shorter than its priority fields") }
+                let dep = u32_at(payload, 0) & 2147483647
+                if dep == stream { return fail(PROTOCOL_ERROR, "a stream cannot depend on itself") }
+                payload = payload.slice(5, payload.len())
+            }
+        }
+        if kind == PRIORITY {
+            let dep = u32_at(payload, 0) & 2147483647
+            if dep == stream { return fail(PROTOCOL_ERROR, "a stream cannot depend on itself") }
+        }
+        Got(Frame(kind, flags, stream, payload, padded))
+    }
+}
+
+// ---- encoders ----
+
+/// A frame header and its payload.
+pub fn frame(kind: u8, flags: u8, stream: u32, payload: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let n = payload.len()
+    out.push(((n >> 16) & 255) as u8)
+    out.push(((n >> 8) & 255) as u8)
+    out.push((n & 255) as u8)
+    out.push(kind)
+    out.push(flags)
+    put_u32(inout out, stream & 2147483647)
+    out.extend(payload)
+    out
+}
+
+/// DATA carrying `data` (no padding).
+pub fn data(stream: u32, data: List[u8], end: bool) -> List[u8] {
+    frame(DATA, if end { END_STREAM } else { 0 }, stream, data)
+}
+
+/// A header block as HEADERS (and CONTINUATION frames when it is over `max_frame`), as one run of
+/// bytes: the frames of a block must not be interleaved with any other, so they travel together.
+pub fn headers(stream: u32, block: List[u8], end_stream: bool, max_frame: usize) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let es: u8 = if end_stream { END_STREAM } else { 0 }
+    if block.len() <= max_frame {
+        out.extend(frame(HEADERS, es | END_HEADERS, stream, block))
+        return out
+    }
+    out.extend(frame(HEADERS, es, stream, block.slice(0, max_frame)))
+    let mut at = max_frame
+    while at < block.len() {
+        let end = if at + max_frame < block.len() { at + max_frame } else { block.len() }
+        out.extend(frame(CONTINUATION, if end == block.len() { END_HEADERS } else { 0 }, stream, block.slice(at, end)))
+        at = end
+    }
+    out
+}
+
+pub fn rst_stream(stream: u32, code: u32) -> List[u8] {
+    let mut p: List[u8] = List.new()
+    put_u32(inout p, code)
+    frame(RST_STREAM, 0, stream, p)
+}
+
+pub fn window_update(stream: u32, increment: u32) -> List[u8] {
+    let mut p: List[u8] = List.new()
+    put_u32(inout p, increment)
+    frame(WINDOW_UPDATE, 0, stream, p)
+}
+
+/// PING with 8 bytes of `opaque`; `ack` for the answer.
+pub fn ping(opaque: List[u8], ack: bool) -> List[u8] { frame(PING, if ack { ACK } else { 0 }, 0, opaque) }
+
+/// GOAWAY: the last stream id this side processed, the error, and debug text.
+pub fn goaway(last: u32, code: u32, debug: List[u8]) -> List[u8] {
+    let mut p: List[u8] = List.new()
+    put_u32(inout p, last & 2147483647)
+    put_u32(inout p, code)
+    p.extend(debug)
+    frame(GOAWAY, 0, 0, p)
+}
+
+pub fn settings(entries: List[Setting]) -> List[u8] {
+    let mut p: List[u8] = List.new()
+    for e in entries {
+        p.push(((e.id >> (8 as u16)) & 255) as u8)
+        p.push((e.id & 255) as u8)
+        put_u32(inout p, e.value)
+    }
+    frame(SETTINGS, 0, 0, p)
+}
+
+pub fn settings_ack() -> List[u8] { frame(SETTINGS, ACK, 0, List.new()) }
+
+/// The entries of a SETTINGS payload (a multiple of 6 bytes, checked by the decoder).
+pub fn parse_settings(payload: List[u8]) -> List[Setting] {
+    let mut out: List[Setting] = List.new()
+    let mut i: usize = 0
+    while i + 6 <= payload.len() {
+        out.push(Setting(((payload[i] as u16) << (8 as u16)) | (payload[i + 1] as u16), u32_at(payload, i + 2)))
+        i += 6
+    }
+    out
+}
+
+/// The 31-bit value of a WINDOW_UPDATE, RST_STREAM code, or the first 4 bytes of a payload.
+pub fn u32_of(payload: List[u8], at: usize) -> u32 { u32_at(payload, at) }
+
+/// GOAWAY's last stream id and error code.
+pub fn parse_goaway(payload: List[u8]) -> (u32, u32) { (u32_at(payload, 0) & 2147483647, u32_at(payload, 4)) }
