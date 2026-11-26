@@ -106,7 +106,16 @@ pub fn wire_of_transport(t: transport.Transport) -> Wire uses net, io, clock {
         }
         let z = net.shutdown(t.fd, net.SHUT_WRITE)
     }
-    let rl = || -> () { sock.linger_close(t.fd, time.after_ms(1000)) }
+    // released once: a second `release` (a `Client.close` called twice) must not close a descriptor number that another connection now has
+    let released = sync.lock(false)
+    let rl = || -> () {
+        let first = released.modify(|inout r: bool| -> bool {
+            let was = r
+            r = true
+            !was
+        })
+        if first { sock.linger_close(t.fd, time.after_ms(1000)) }
+    }
     Wire(rd, wr, cl, rl)
 }
 
