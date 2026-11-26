@@ -59,6 +59,9 @@ if command -v curl >/dev/null 2>&1 && curl -V | grep -q nghttp2; then
   n=$(curl -sS --max-time 20 --http2-prior-knowledge "http://127.0.0.1:$port/stream" | wc -c)
   echo "streamed $n" > "$T/o"
   check "curl h2c: a streamed body (10 chunks)" "$T/o" "streamed 330"
+  curl -sS -N --max-time 20 --http2-prior-knowledge -D "$T/h" "http://127.0.0.1:$port/events" > "$T/o" 2>&1
+  check "curl h2c: server-sent events (5 events, text/event-stream, no content-length)" "$T/o" "event: tick" "data: 0" "data: 4" "id: 4"
+  grep -qi '^content-type: text/event-stream' "$T/h" && ! grep -qi '^content-length' "$T/h" && echo "ok   h2 interop: SSE head over HTTP/2" || { echo "FAIL h2 interop: SSE head"; cat "$T/h"; fail=1; }
   curl -sS --max-time 20 --http2-prior-knowledge -Z "http://127.0.0.1:$port/hello" "http://127.0.0.1:$port/hello" "http://127.0.0.1:$port/info" > "$T/o" 2>&1
   check "curl h2c: three requests at once" "$T/o" "hello h2" "protocol=h2"
   curl -sS --max-time 20 "http://127.0.0.1:$port/hello" > "$T/o" 2>&1

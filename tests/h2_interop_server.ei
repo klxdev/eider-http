@@ -4,7 +4,7 @@
 //   h2_interop_server [chain.pem key.pem]
 //   h2_interop_server h2only        a server that speaks only HTTP/2 (h2.serve_listener), for h2spec's preface test
 //
-// Serves GET /hello, POST /echo (the body back, upper-cased), GET /big (1 MiB), GET /stream (chunked, slow), GET /info
+// Serves GET /events (server-sent events), GET /hello, POST /echo (the body back, upper-cased), GET /big (1 MiB), GET /stream (chunked, slow), GET /info
 // (protocol and TLS facts), GET /quit (stops the server). With a chain and key it also serves https (ALPN h2 and
 // http/1.1) on a second port. Prints `listening <port> [<tls port>]` once it is up.
 
@@ -18,6 +18,8 @@ import std.time
 import std.utf8
 import http
 import http.router
+import http.sse
+import std.bytes
 import http.server
 import http.secure
 import http.h2
@@ -82,6 +84,16 @@ fn main() uses io, net, clock, threads, fs {
             }
         }, false))
         resp
+    })
+    r.get("/events", |q: http.Request| -> http.Response {
+        sse.response(|s: sse.Stream| -> () {
+            let mut n: i64 = 0
+            while !s.is_stopping() && n < 5 {
+                if s.event(lit("tick"), bytes.from_i64(n), bytes.from_i64(n)).is_err() { return }
+                n += 1
+                time.sleep(time.millis(100))
+            }
+        })
     })
     let t2 = tok
     r.get("/quit", |q: http.Request| -> http.Response {
