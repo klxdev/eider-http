@@ -1,0 +1,204 @@
+-- C.2 single fields
+C.2.1 literal with indexing
+  custom-key: custom-header
+  [1] (s=55) custom-key: custom-header
+  table size = 55
+C.2.2 literal without indexing
+  :path: /sample/path
+  table size = 0
+C.2.3 literal never indexed
+  password: secret
+  table size = 0
+C.2.4 indexed
+  :method: GET
+  table size = 0
+-- C.3 requests, no Huffman
+C.3.1
+  :method: GET
+  :scheme: http
+  :path: /
+  :authority: www.example.com
+  [1] (s=57) :authority: www.example.com
+  table size = 57
+C.3.2
+  :method: GET
+  :scheme: http
+  :path: /
+  :authority: www.example.com
+  cache-control: no-cache
+  [1] (s=53) cache-control: no-cache
+  [2] (s=57) :authority: www.example.com
+  table size = 110
+C.3.3
+  :method: GET
+  :scheme: https
+  :path: /index.html
+  :authority: www.example.com
+  custom-key: custom-value
+  [1] (s=54) custom-key: custom-value
+  [2] (s=53) cache-control: no-cache
+  [3] (s=57) :authority: www.example.com
+  table size = 164
+-- C.4 requests, Huffman
+C.4.1
+  :method: GET
+  :scheme: http
+  :path: /
+  :authority: www.example.com
+  [1] (s=57) :authority: www.example.com
+  table size = 57
+C.4.2
+  :method: GET
+  :scheme: http
+  :path: /
+  :authority: www.example.com
+  cache-control: no-cache
+  [1] (s=53) cache-control: no-cache
+  [2] (s=57) :authority: www.example.com
+  table size = 110
+C.4.3
+  :method: GET
+  :scheme: https
+  :path: /index.html
+  :authority: www.example.com
+  custom-key: custom-value
+  [1] (s=54) custom-key: custom-value
+  [2] (s=53) cache-control: no-cache
+  [3] (s=57) :authority: www.example.com
+  table size = 164
+-- C.5 responses, no Huffman, table 256
+C.5.1
+  :status: 302
+  cache-control: private
+  date: Mon, 21 Oct 2013 20:13:21 GMT
+  location: https://www.example.com
+  [1] (s=63) location: https://www.example.com
+  [2] (s=65) date: Mon, 21 Oct 2013 20:13:21 GMT
+  [3] (s=52) cache-control: private
+  [4] (s=42) :status: 302
+  table size = 222
+C.5.2
+  :status: 307
+  cache-control: private
+  date: Mon, 21 Oct 2013 20:13:21 GMT
+  location: https://www.example.com
+  [1] (s=42) :status: 307
+  [2] (s=63) location: https://www.example.com
+  [3] (s=65) date: Mon, 21 Oct 2013 20:13:21 GMT
+  [4] (s=52) cache-control: private
+  table size = 222
+C.5.3
+  :status: 200
+  cache-control: private
+  date: Mon, 21 Oct 2013 20:13:22 GMT
+  location: https://www.example.com
+  content-encoding: gzip
+  set-cookie: foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1
+  [1] (s=98) set-cookie: foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1
+  [2] (s=52) content-encoding: gzip
+  [3] (s=65) date: Mon, 21 Oct 2013 20:13:22 GMT
+  table size = 215
+-- C.6 responses, Huffman, table 256
+C.6.1
+  :status: 302
+  cache-control: private
+  date: Mon, 21 Oct 2013 20:13:21 GMT
+  location: https://www.example.com
+  [1] (s=63) location: https://www.example.com
+  [2] (s=65) date: Mon, 21 Oct 2013 20:13:21 GMT
+  [3] (s=52) cache-control: private
+  [4] (s=42) :status: 302
+  table size = 222
+C.6.2
+  :status: 307
+  cache-control: private
+  date: Mon, 21 Oct 2013 20:13:21 GMT
+  location: https://www.example.com
+  [1] (s=42) :status: 307
+  [2] (s=63) location: https://www.example.com
+  [3] (s=65) date: Mon, 21 Oct 2013 20:13:21 GMT
+  [4] (s=52) cache-control: private
+  table size = 222
+C.6.3
+  :status: 200
+  cache-control: private
+  date: Mon, 21 Oct 2013 20:13:22 GMT
+  location: https://www.example.com
+  content-encoding: gzip
+  set-cookie: foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1
+  [1] (s=98) set-cookie: foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1
+  [2] (s=52) content-encoding: gzip
+  [3] (s=65) date: Mon, 21 Oct 2013 20:13:22 GMT
+  table size = 215
+-- encoder reproduces C.4 and C.6
+828684418cf1e3c2e5f23a6ba0ab90f4ff
+828684be5886a8eb10649cbf
+828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf
+488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3
+4803333037c1c0bf
+88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab1f28ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007
+-- integers (C.1)
+0a
+1f9a0a
+2a
+ff00
+fe
+0ff1ffffff0f
+1337
+hpack: truncated integer
+hpack: truncated integer
+hpack: integer too large
+hpack: integer too large
+-- Huffman: every byte, and the strings of the RFC
+all 256 bytes round-trip
+f1e3c2e5f23a6ba0ab90f4ff
+a8eb10649cbf
+25a849e95ba97d7f
+25a849e95bb8e8b4bf
+hpack: bad Huffman padding
+hpack: EOS in a Huffman string
+hpack: EOS in a Huffman string
+hpack: EOS in a Huffman string
+  accepted as 1
+hpack: EOS in a Huffman string
+hpack: string too long
+-- malformed blocks
+  hpack: index out of range
+  hpack: index out of range
+  hpack: truncated string
+  hpack: table size update after a field
+  hpack: table size update over the limit
+  hpack: truncated string
+  hpack: truncated integer
+  hpack: truncated integer
+  hpack: truncated integer
+  hpack: truncated integer
+  hpack: truncated string
+-- size updates and eviction
+grow and fill
+  :method: GET
+  :scheme: http
+  :path: /
+  :authority: www.example.com
+  [1] (s=57) :authority: www.example.com
+  table size = 57
+update to 0 empties the table
+  :method: GET
+  table size = 0
+an entry over the table is not kept
+  custom-key: custom-header
+  table size = 0
+update to 100
+  table size = 0
+update over the limit
+  error: hpack: table size update over the limit
+too_large=true
+kept=0
+table still in step=57
+-- encoder
+1f0887ba51d85b141c641f1103613d624086f2b12d424f4f0176
+table after = 41
+20820086f2b12d424f4f0176
+table after shrink = 0
+-- round trips with changing tables
+round trip failures = 0

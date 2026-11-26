@@ -1,0 +1,64 @@
+// http/hpack against libnghttp2 (tests/hpack_oracle.c, tests/hpack_interop.sh). Reads stdin, writes stdout:
+//   decode: one hex line per header block -> the fields, "hex(name) hex(value)" per line, "--" after a block
+//   encode: those fields -> one hex line per block (the encoding http/hpack chose)
+// The decoder and the encoder keep their dynamic tables across blocks, as a connection does.
+// The mode is the first line of stdin.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import http
+import http.hpack
+
+fn unhex(b: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut hi: i32 = -1
+    for c in b {
+        let v: i32 = if c >= 48 && c <= 57 { (c as i32) - 48 } else if c >= 97 && c <= 102 { (c as i32) - 87 } else { -1 }
+        if v < 0 { continue }
+        if hi < 0 {
+            hi = v
+        } else {
+            out.push((hi * 16 + v) as u8)
+            hi = -1
+        }
+    }
+    out
+}
+
+fn main() uses io {
+    let all = io.read_all().unwrap()
+    let ls = bytes.lines(all)
+    let mode = ls[0]
+    if bytes.eq(mode, sys.lit("decode")) {
+        let mut d = hpack.decoder(4096)
+        for i in 1..ls.len() {
+            match d.decode(unhex(ls[i]), 100000000) {
+                Ok(r) => {
+                    for f in r.fields { io.outln(bytes.concat(bytes.concat(bytes.hex(f.name), sys.lit(" ")), bytes.hex(f.value))) }
+                    io.outln(sys.lit("--"))
+                }
+                Err(e) => {
+                    io.outln(e.bytes())
+                    return
+                }
+            }
+        }
+    } else {
+        let mut e = hpack.encoder(4096)
+        let mut fs: List[http.Header] = List.new()
+        for i in 1..ls.len() {
+            let l = ls[i]
+            if l.len() > 0 && l[0] == 45 {
+                let mut wire: List[u8] = List.new()
+                e.encode(fs, inout wire)
+                io.outln(bytes.hex(wire))
+                fs = List.new()
+            } else {
+                let sp = bytes.find_byte(l, 32, 0).unwrap()
+                fs.push(http.Header(unhex(l.slice(0, sp)), unhex(l.slice(sp + 1, l.len()))))
+            }
+        }
+    }
+}

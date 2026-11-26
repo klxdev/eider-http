@@ -1,0 +1,329 @@
+// http/hpack: the Appendix C examples of RFC 7541 (requests and responses, with and without Huffman
+// coding, the dynamic table and its eviction), the integer coding, every byte through the Huffman
+// code, and a corpus of malformed blocks.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import http
+import http.hpack
+
+fn unhex(s: str) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut hi: i32 = -1
+    for c in sys.lit(s) {
+        let v: i32 = if c >= 48 && c <= 57 { (c as i32) - 48 } else if c >= 97 && c <= 102 { (c as i32) - 87 } else { -1 }
+        if v < 0 { continue }
+        if hi < 0 {
+            hi = v
+        } else {
+            out.push((hi * 16 + v) as u8)
+            hi = -1
+        }
+    }
+    out
+}
+
+fn txt(b: List[u8]) -> String { sys.to_string(b) }
+
+fn msg(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+fn say(s: String) uses io { io.outln(s.bytes()) }
+
+fn show(fs: List[http.Header]) uses io {
+    for f in fs {
+        let mut l = String.from("  ")
+        l.append(txt(f.name))
+        l.push_str(": ")
+        l.append(txt(f.value))
+        say(l)
+    }
+}
+
+fn show_table(d: hpack.Decoder) uses io {
+    let es = d.entries()
+    let mut i: usize = 0
+    for e in es {
+        i += 1
+        let mut l = String.from("  [")
+        l.append(i.to_string())
+        l.push_str("] (s=")
+        l.append((e.name.len() + e.value.len() + 32).to_string())
+        l.push_str(") ")
+        l.append(txt(e.name))
+        l.push_str(": ")
+        l.append(txt(e.value))
+        say(l)
+    }
+    let mut t = String.from("  table size = ")
+    t.append(d.table_size().to_string())
+    say(t)
+}
+
+fn decode(inout d: hpack.Decoder, label: str, hex: str) uses io {
+    print(label)
+    match d.decode(unhex(hex), 100000) {
+        Ok(r) => {
+            show(r.fields)
+            show_table(d)
+        }
+        Err(e) => {
+            let mut l = String.from("  error: ")
+            l.append(e)
+            say(l)
+        }
+    }
+}
+
+fn hs(name: str, value: str) -> http.Header { http.Header(sys.lit(name), sys.lit(value)) }
+
+fn hexs(b: List[u8]) -> String { encoding.hex(b) }
+
+
+fn main() uses io {
+    print("-- C.2 single fields")
+    let mut d = hpack.decoder(4096)
+    decode(inout d, "C.2.1 literal with indexing", "400a637573746f6d2d6b65790d637573746f6d2d686561646572")
+    let mut d2 = hpack.decoder(4096)
+    decode(inout d2, "C.2.2 literal without indexing", "040c2f73616d706c652f70617468")
+    let mut d3 = hpack.decoder(4096)
+    decode(inout d3, "C.2.3 literal never indexed", "100870617373776f726406736563726574")
+    let mut d4 = hpack.decoder(4096)
+    decode(inout d4, "C.2.4 indexed", "82")
+
+    print("-- C.3 requests, no Huffman")
+    let mut r = hpack.decoder(4096)
+    decode(inout r, "C.3.1", "828684410f7777772e6578616d706c652e636f6d")
+    decode(inout r, "C.3.2", "828684be58086e6f2d6361636865")
+    decode(inout r, "C.3.3", "828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565")
+
+    print("-- C.4 requests, Huffman")
+    let mut rh = hpack.decoder(4096)
+    decode(inout rh, "C.4.1", "828684418cf1e3c2e5f23a6ba0ab90f4ff")
+    decode(inout rh, "C.4.2", "828684be5886a8eb10649cbf")
+    decode(inout rh, "C.4.3", "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf")
+
+    print("-- C.5 responses, no Huffman, table 256")
+    let mut s = hpack.decoder(256)
+    decode(inout s, "C.5.1", "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d")
+    decode(inout s, "C.5.2", "4803333037c1c0bf")
+    decode(inout s, "C.5.3", "88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076657273696f6e3d31")
+
+    print("-- C.6 responses, Huffman, table 256")
+    let mut sh = hpack.decoder(256)
+    decode(inout sh, "C.6.1", "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3")
+    decode(inout sh, "C.6.2", "4883640effc1c0bf")
+    decode(inout sh, "C.6.3", "88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007")
+
+    print("-- encoder reproduces C.4 and C.6")
+    let mut e = hpack.encoder(4096)
+    let mut b: List[u8] = List.new()
+    let mut q1: List[http.Header] = List.new()
+    q1.push(hs(":method", "GET"))
+    q1.push(hs(":scheme", "http"))
+    q1.push(hs(":path", "/"))
+    q1.push(hs(":authority", "www.example.com"))
+    e.encode(q1, inout b)
+    say(hexs(b))
+    b.clear()
+    let mut q2 = q1
+    q2.push(hs("cache-control", "no-cache"))
+    e.encode(q2, inout b)
+    say(hexs(b))
+    b.clear()
+    let mut q3: List[http.Header] = List.new()
+    q3.push(hs(":method", "GET"))
+    q3.push(hs(":scheme", "https"))
+    q3.push(hs(":path", "/index.html"))
+    q3.push(hs(":authority", "www.example.com"))
+    q3.push(hs("custom-key", "custom-value"))
+    e.encode(q3, inout b)
+    say(hexs(b))
+
+    let mut e2 = hpack.encoder(256)
+    let mut p1: List[http.Header] = List.new()
+    p1.push(hs(":status", "302"))
+    p1.push(hs("cache-control", "private"))
+    p1.push(hs("date", "Mon, 21 Oct 2013 20:13:21 GMT"))
+    p1.push(hs("location", "https://www.example.com"))
+    let mut c: List[u8] = List.new()
+    e2.encode(p1, inout c)
+    say(hexs(c))
+    c.clear()
+    let mut p2: List[http.Header] = List.new()
+    p2.push(hs(":status", "307"))
+    p2.push(hs("cache-control", "private"))
+    p2.push(hs("date", "Mon, 21 Oct 2013 20:13:21 GMT"))
+    p2.push(hs("location", "https://www.example.com"))
+    e2.encode(p2, inout c)
+    say(hexs(c))
+    c.clear()
+    let mut p3: List[http.Header] = List.new()
+    p3.push(hs(":status", "200"))
+    p3.push(hs("cache-control", "private"))
+    p3.push(hs("date", "Mon, 21 Oct 2013 20:13:22 GMT"))
+    p3.push(hs("location", "https://www.example.com"))
+    p3.push(hs("content-encoding", "gzip"))
+    p3.push(hs("set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"))
+    e2.encode(p3, inout c)
+    say(hexs(c))
+
+    print("-- integers (C.1)")
+    say(hexs(hpack.encode_int(5, 0, 10)))
+    say(hexs(hpack.encode_int(5, 0, 1337)))
+    say(hexs(hpack.encode_int(8, 0, 42)))
+    say(hexs(hpack.encode_int(7, 128, 127)))
+    say(hexs(hpack.encode_int(7, 128, 126)))
+    say(hexs(hpack.encode_int(4, 0, 4294967296)))
+    for v in List[0 as u64, 1, 30, 31, 32, 127, 128, 1337, 16383, 16384, 4294967295, 4294967296] {
+        let n: u64 = 5
+        match hpack.decode_int(hpack.encode_int(n, 0, v), n) {
+            Ok((x, used)) => { if x != v { say(String.from("  MISMATCH int")) } }
+            Err(e) => { say(String.from("  MISMATCH int error")) }
+        }
+    }
+    match hpack.decode_int(unhex("1f9a0a"), 5) {
+        Ok((x, used)) => { say(x.to_string()) }
+        Err(e) => { say(e) }
+    }
+    for bad in List["1f", "1f80", "1fffffffffff7f", "1fffffffffffffffffffff7f"] {
+        match hpack.decode_int(unhex(bad), 5) {
+            Ok((x, used)) => { say(msg("  accepted ", String.from(bad))) }
+            Err(e) => { say(e) }
+        }
+    }
+
+    print("-- Huffman: every byte, and the strings of the RFC")
+    let t = hpack.tables()
+    let mut all: List[u8] = List.new()
+    for i in 0..256 { all.push(i as u8) }
+    let packed = hpack.huffman_encode(t, all)
+    match hpack.huffman_decode(t, packed, 1000) {
+        Ok(back) => { if bytes.eq(back, all) { print("all 256 bytes round-trip") } else { print("MISMATCH huffman") } }
+        Err(e) => { say(e) }
+    }
+    for i in 0..256 {
+        let mut one: List[u8] = List.new()
+        one.push(i as u8)
+        one.push(i as u8)
+        match hpack.huffman_decode(t, hpack.huffman_encode(t, one), 10) {
+            Ok(back) => { if !bytes.eq(back, one) { say(msg("  MISMATCH byte ", i.to_string())) } }
+            Err(e) => { say(msg("  error at byte ", i.to_string())) }
+        }
+    }
+    say(hexs(hpack.huffman_encode(t, sys.lit("www.example.com"))))
+    say(hexs(hpack.huffman_encode(t, sys.lit("no-cache"))))
+    say(hexs(hpack.huffman_encode(t, sys.lit("custom-key"))))
+    say(hexs(hpack.huffman_encode(t, sys.lit("custom-value"))))
+    for bad in List["ff", "ffffffff", "fffffffc", "7fffffffff", "0f", "ffffffffffffff"] {
+        match hpack.huffman_decode(t, unhex(bad), 100) {
+            Ok(x) => { say(msg("  accepted as ", txt(x))) }
+            Err(e) => { say(e) }
+        }
+    }
+    match hpack.huffman_decode(t, packed, 10) {
+        Ok(x) => { print("accepted a long string") }
+        Err(e) => { say(e) }
+    }
+
+    print("-- malformed blocks")
+    for bad in List["80", "be", "400a63", "8220", "3fe21f", "4000", "0f", "7f", "ff", "40ff", "4001"] {
+        let mut m = hpack.decoder(4096)
+        match m.decode(unhex(bad), 1000) {
+            Ok(r) => { say(msg("  accepted ", String.from(bad))) }
+            Err(e) => { say(msg("  ", e)) }
+        }
+    }
+
+    print("-- size updates and eviction")
+    let mut u = hpack.decoder(4096)
+    decode(inout u, "grow and fill", "3fe11f828684410f7777772e6578616d706c652e636f6d")
+    decode(inout u, "update to 0 empties the table", "2082")
+    decode(inout u, "an entry over the table is not kept", "20400a637573746f6d2d6b65790d637573746f6d2d686561646572")
+    decode(inout u, "update to 100", "3f45")
+    let mut lim = hpack.decoder(100)
+    decode(inout lim, "update over the limit", "3f46")
+    let mut many = hpack.decoder(4096)
+    match many.decode(unhex("828684410f7777772e6578616d706c652e636f6d"), 40) {
+        Ok(r) => {
+            say(msg("too_large=", r.too_large.to_string()))
+            say(msg("kept=", r.fields.len().to_string()))
+            say(msg("table still in step=", many.table_size().to_string()))
+        }
+        Err(e) => { say(e) }
+    }
+
+    print("-- encoder")
+    let mut en = hpack.encoder(4096)
+    let mut blk: List[u8] = List.new()
+    let mut sec: List[http.Header] = List.new()
+    sec.push(hs("authorization", "Bearer abc"))
+    sec.push(hs("cookie", "a=b"))
+    sec.push(hs("x-custom", "v"))
+    en.encode(sec, inout blk)
+    say(hexs(blk))
+    say(msg("table after = ", en.table_size().to_string()))
+    blk.clear()
+    en.set_limit(0)
+    let mut one: List[http.Header] = List.new()
+    one.push(hs(":method", "GET"))
+    one.push(hs("x-custom", "v"))
+    en.encode(one, inout blk)
+    say(hexs(blk))
+    say(msg("table after shrink = ", en.table_size().to_string()))
+
+    print("-- round trips with changing tables")
+    let mut seed: u64 = 12345
+    let mut bad = 0
+    for cap in List[0 as usize, 64, 220, 4096] {
+        let mut a = hpack.encoder(cap)
+        let mut z = hpack.decoder(cap)
+        for round in 0..300 {
+            let mut fs: List[http.Header] = List.new()
+            seed = seed *% 6364136223846793005 +% 1442695040888963407
+            let k = ((seed >> (33 as u64)) % 7) as usize + 1
+            for j in 0..k {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407
+                let pick = (seed >> (33 as u64)) % 9
+                let mut v: List[u8] = List.new()
+                seed = seed *% 6364136223846793005 +% 1442695040888963407
+                let n = ((seed >> (33 as u64)) % 40) as usize
+                for q in 0..n {
+                    seed = seed *% 6364136223846793005 +% 1442695040888963407
+                    v.push(((seed >> (33 as u64)) % 256) as u8)
+                }
+                if pick == 0 { fs.push(http.Header(sys.lit(":method"), sys.lit("GET"))) }
+                else if pick == 1 { fs.push(http.Header(sys.lit("authorization"), v)) }
+                else if pick == 2 { fs.push(http.Header(sys.lit("cookie"), v)) }
+                else if pick == 3 { fs.push(http.Header(sys.lit("x-a"), v)) }
+                else if pick == 4 { fs.push(http.Header(sys.lit("x-b"), sys.lit("same"))) }
+                else if pick == 5 { fs.push(http.Header(sys.lit("content-type"), v)) }
+                else if pick == 6 { fs.push(http.Header(v, v)) }
+                else if pick == 7 { fs.push(http.Header(sys.lit(":path"), v)) }
+                else { fs.push(http.Header(sys.lit("x-long"), List.filled(97 as u8, 300))) }
+            }
+            if round == 100 { a.set_limit(cap / 2) }
+            if round == 101 { z.set_limit(cap / 2) }
+            let mut wire: List[u8] = List.new()
+            a.encode(fs, inout wire)
+            match z.decode(wire, 1000000) {
+                Ok(r) => {
+                    let mut same = r.fields.len() == fs.len()
+                    if same {
+                        for x in 0..fs.len() {
+                            if !bytes.eq(fs[x].name, r.fields[x].name) || !bytes.eq(fs[x].value, r.fields[x].value) { same = false }
+                        }
+                    }
+                    if !same || a.table_size() != z.table_size() { bad += 1 }
+                }
+                Err(e) => { bad += 1 }
+            }
+        }
+    }
+    say(msg("round trip failures = ", bad.to_string()))
+}

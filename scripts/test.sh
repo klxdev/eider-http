@@ -41,6 +41,14 @@ if command -v openssl >/dev/null 2>&1; then
 else
   echo "skip tls interop: no openssl on the PATH"
 fi
+# http/hpack against libnghttp2, both directions (tests/hpack_interop.sh; `skip` without libnghttp2)
+B=$(mktemp -d)
+if ei build tests/hpack_interop.ei -o "$B/hpack_interop" > "$B/log" 2>&1; then
+  sh tests/hpack_interop.sh "$B" || fail=1
+else
+  echo "FAIL hpack interop: build"; cat "$B/log"; fail=1
+fi
+rm -rf "$B"
 if [ -n "$TSAN" ]; then
   T=$(mktemp -d)
   trap 'rm -rf "$T"' EXIT
