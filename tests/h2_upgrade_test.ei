@@ -1,0 +1,216 @@
+// HTTP/2 over a connection that began as HTTP/1.1 and was upgraded (`Connection: Upgrade`, `Upgrade: h2c`),
+// the shape of Docker's BuildKit endpoints: `/grpc`, where the daemon (this server) is the HTTP/2 server and
+// the Docker CLI the client, and `/session`, where the roles are inverted: the CLI made the request but then
+// serves, and the daemon is the HTTP/2 client calling back into it over that connection. The CLI is played here
+// by plain sockets and http/h2 on them.
+//
+// Also: prior-knowledge h2c on the same listener as HTTP/1.1, and an Upgrade request that is not for h2c.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.net
+import std.task
+import std.time
+import http
+import http.client
+import http.h2
+import http.h2frame
+import http.router
+import http.server
+import http.transport
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn msg(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+fn hd(n: str, v: str) -> http.Header { http.Header(lit(n), lit(v)) }
+fn txt(b: List[u8]) -> String { sys.to_string(b) }
+
+fn request(path: str) -> List[http.Header] {
+    let mut r: List[http.Header] = List.new()
+    r.push(hd(":method", "POST"))
+    r.push(hd(":scheme", "http"))
+    r.push(hd(":path", path))
+    r.push(hd(":authority", "daemon"))
+    r
+}
+
+fn read_all(s: h2.Stream) -> Result[List[u8], h2.Error] uses io, clock {
+    let mut out: List[u8] = List.new()
+    while true {
+        let b = s.read(65536, time.after(time.seconds(10)))?
+        if b.len() == 0 { break }
+        out.extend(b)
+    }
+    Ok(out)
+}
+
+/// What the daemon serves on /grpc: a unary method that answers "hello <body>" with a trailer.
+fn grpc_handler(s: h2.Stream) uses io, clock {
+    let body = match read_all(s) {
+        Ok(b) => b
+        Err(e) => { return }
+    }
+    let mut hs: List[http.Header] = List.new()
+    hs.push(hd(":status", "200"))
+    hs.push(hd("content-type", "application/grpc"))
+    let z = s.send_headers(hs, false)
+    let mut out = lit("hello ")
+    out.extend(body)
+    let z2 = s.send(out, false, time.never())
+    let mut t: List[http.Header] = List.new()
+    t.push(hd("grpc-status", "0"))
+    let z3 = s.send_trailers(t)
+}
+
+/// Sends the upgrade request on a connected socket and reads the 101 (and what follows it).
+fn upgrade(fdn: i32, path: str) -> Result[List[u8], String] uses net, io, clock {
+    let t = transport.plain(fdn)
+    let mut req = String.from("POST ")
+    req.push_str(path)
+    req.push_str(" HTTP/1.1\r\nHost: daemon\r\nConnection: Upgrade\r\nUpgrade: h2c\r\nContent-Length: 0\r\n\r\n")
+    if !t.send_by(req.bytes(), time.after(time.seconds(5))) { return Err(String.from("send failed")) }
+    let mut got: List[u8] = List.new()
+    while true {
+        match bytes.find(got, lit("\r\n\r\n"), 0) {
+            Some(i) => {
+                let head = got.slice(0, i)
+                say(msg("response head: ", txt(bytes.split(head, 13)[0].copy())))
+                return Ok(got.slice(i + 4, got.len()))
+            }
+            None => {}
+        }
+        match t.read_by(4096, time.after(time.seconds(5)))? {
+            Some(b) => {
+                if b.len() == 0 { return Err(String.from("closed")) }
+                got.extend(b)
+            }
+            None => { return Err(String.from("timed out")) }
+        }
+    }
+    Err(String.from("unreachable"))
+}
+
+fn dial(port: i32) -> i32 uses net, io, clock {
+    let s = net.socket(net.IPV4, net.STREAM, false).unwrap()
+    let ok = net.connect(s, net.ipv4(127, 0, 0, 1, port)).unwrap()
+    let z = fd.set_nonblocking(s, true)
+    s
+}
+
+fn main() uses net, io, clock, threads {
+    let tok = task.root()
+    let mut r = router.new()
+    r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello h1") })
+    r.post("/grpc", |q: http.Request| -> http.Response {
+        h2.accept_server(q, h2.options(), |s: h2.Stream| -> () { grpc_handler(s) })
+    })
+    r.post("/session", |q: http.Request| -> http.Response {
+        h2.accept_client(q, h2.options(), |c: h2.Client| -> () {
+            // the daemon calls back into the CLI
+            for name in List["auth", "filesync"] {
+                match c.open(request("/callback"), false, time.after(time.seconds(5))) {
+                    Ok(st) => {
+                        let z = st.send(lit(name), true, time.never())
+                        match read_all(st) {
+                            Ok(b) => { say(msg("daemon got: ", txt(b))) }
+                            Err(e) => { say(msg("daemon read failed: ", e.why)) }
+                        }
+                        st.release()
+                    }
+                    Err(e) => { say(msg("daemon open failed: ", e.why)) }
+                }
+            }
+        })
+    })
+    let mut cfg = server.config()
+    cfg.h2 = Some(h2.options())
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let port = srv.port()
+    let h = router.handler(r)
+    let st = tok
+    let t = spawn(|| -> i32 {
+        let z = srv.serve(h, st)
+        0
+    })
+
+    say(String.from("-- /grpc: HTTP/1.1 Upgrade: h2c, then the CLI is the HTTP/2 client"))
+    let c1 = dial(port)
+    let left = upgrade(c1, "/grpc").unwrap()
+    let cli = h2.connect(h2.wire_with_prefix(h2.wire_of_transport(transport.plain(c1)), left), h2.options()).unwrap()
+    let s1 = cli.open(request("/control/Info"), false, time.never()).unwrap()
+    let z1 = s1.send(lit("world"), true, time.never())
+    let hh = s1.headers(time.after(time.seconds(5))).unwrap()
+    say(msg("status: ", txt(http.find_s(hh, ":status").unwrap())))
+    say(msg("body: ", txt(read_all(s1).unwrap())))
+    say(msg("trailers: ", txt(http.find_s(s1.trailers().unwrap(), "grpc-status").unwrap())))
+    s1.release()
+    cli.close()
+
+    say(String.from("-- /session: the CLI serves, the daemon is the HTTP/2 client"))
+    let c2 = dial(port)
+    let left2 = upgrade(c2, "/session").unwrap()
+    let wire2 = h2.wire_with_prefix(h2.wire_of_transport(transport.plain(c2)), left2)
+    let z2 = h2.serve(wire2, h2.options(), |s: h2.Stream| -> () {
+        let body = match read_all(s) {
+            Ok(b) => b
+            Err(e) => { return }
+        }
+        let mut hs: List[http.Header] = List.new()
+        hs.push(hd(":status", "200"))
+        let z = s.send_headers(hs, false)
+        let mut out = lit("cli answers ")
+        out.extend(body)
+        let z3 = s.send(out, true, time.never())
+    })
+    say(String.from("the CLI's connection ended"))
+
+    say(String.from("-- prior-knowledge h2c on the HTTP/1.1 listener"))
+    let c3 = dial(port)
+    let cli3 = h2.connect(h2.wire_of_transport(transport.plain(c3)), h2.options()).unwrap()
+    let s3 = cli3.open(request("/grpc"), false, time.never()).unwrap()
+    let z4 = s3.send(lit("x"), true, time.never())
+    let h3 = s3.headers(time.after(time.seconds(5))).unwrap()
+    say(msg("status: ", txt(http.find_s(h3, ":status").unwrap())))
+    s3.release()
+    cli3.close()
+
+    say(String.from("-- an Upgrade request that is not for h2c is refused with 426"))
+    let c4 = dial(port)
+    let t4 = transport.plain(c4)
+    let z5 = t4.send_by(lit("POST /grpc HTTP/1.1\r\nHost: d\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 0\r\n\r\n"), time.after(time.seconds(5)))
+    match t4.read_by(4096, time.after(time.seconds(5))) {
+        Ok(Some(b)) => { say(txt(bytes.split(b, 13)[0].copy())) }
+        Ok(None) => { say(String.from("timed out")) }
+        Err(e) => { say(msg("error ", e)) }
+    }
+    t4.close_now()
+
+    say(String.from("-- plain HTTP/1.1 still works"))
+    let c5 = dial(port)
+    let t5 = transport.plain(c5)
+    let z6 = t5.send_by(lit("GET /hello HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n"), time.after(time.seconds(5)))
+    let mut all: List[u8] = List.new()
+    while true {
+        match t5.read_by(4096, time.after(time.seconds(5))) {
+            Ok(Some(b)) => {
+                if b.len() == 0 { break }
+                all.extend(b)
+            }
+            Ok(None) => { break }
+            Err(e) => { break }
+        }
+    }
+    say(txt(bytes.split(all, 13)[0].copy()))
+    t5.close_now()
+    tok.cancel()
+    let z7 = t.join()
+    say(String.from("done"))
+}

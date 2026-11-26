@@ -40,6 +40,7 @@ fn main() uses io, net, clock, threads {
 | `http/metrics` | counters, an in-flight gauge and a latency histogram (Prometheus text), optionally per route |
 | `http/sse` | server-sent events |
 | `http/ws` | WebSockets (RFC 6455) with limits, a codec and a test client |
+| `http/h2`, `http/hpack`, `http/h2frame` | HTTP/2 (RFC 9113) and HPACK (RFC 7541): server and client over any connected duplex, streaming both ways, trailers, flow control, h2c and ALPN `h2`; for gRPC |
 | `http/trace` | W3C traceparent propagation and a span per request |
 | `http/problem` | `ApiError`, written as RFC 9457 problem+json |
 | `http/profiling` | profiler labels per route, `/debug/profile`, `/debug/heap` |

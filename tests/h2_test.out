@@ -1,0 +1,29 @@
+-- unary with trailers
+head: :status=200 content-type=text/plain 
+body: HELLO, H2
+trailers: x-len=9 
+-- an unknown path is a 404 with no body
+head: :status=404 
+body bytes: 0
+-- a bidirectional stream: each message is answered before the next is sent
+echo:one
+echo:two
+echo:three
+end of body: 0
+-- ping
+ping answered
+-- a request body of 700000 bytes through the default windows
+checksum from the server: 267157521
+checksum here:            267157521
+-- a response of 100000 bytes
+length: 100000
+content ok: true
+-- 20 concurrent calls
+failures: 0
+-- a reset ends the reader on the other side
+server: read failed with kind 2
+server: code CANCEL
+client: read failed with kind 2
+-- GOAWAY: the client shuts down, new streams are refused, the server returns
+open after close: kind 3
+done

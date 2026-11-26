@@ -1,0 +1,21 @@
+[package]
+name = "h2_rust_client"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# The `h2` crate (hyper's HTTP/2 implementation) as a client of the Eider server in tests/h2_interop_server.ei:
+# tests/h2_interop.sh builds and runs it when cargo is installed.
+[[bin]]
+name = "h2_rust_client"
+path = "src/main.rs"
+
+[[bin]]
+name = "h2_rust_server"
+path = "src/bin/h2_rust_server.rs"
+
+[dependencies]
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }

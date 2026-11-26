@@ -1,0 +1,153 @@
+// The Eider HTTP/2 client against another implementation (the Rust `h2` crate's server,
+// tests/h2_rust_client/src/bin/h2_rust_server.rs), prior-knowledge h2c:
+//   h2_interop_client <port>
+// A unary call with trailers, a bidirectional stream answered chunk by chunk, a 4 MiB upload through the flow-control
+// windows, a 1 MiB download, a status without a body, `Client.fetch`, and 50 calls at once on one connection.
+// Prints `ok   <case>` or `FAIL <case>` per line; exits 1 when one failed.
+
+import core.sys
+import std.bytes
+import std.env
+import std.io
+import std.task
+import std.time
+import std.utf8
+import http
+import http.h2
+
+fn say(s: String) uses io { io.outln(s.bytes()) }
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+fn hd(n: str, v: str) -> http.Header { http.Header(lit(n), lit(v)) }
+
+fn head(method: str, path: str, port: i32) -> List[http.Header] {
+    let mut r: List[http.Header] = List.new()
+    r.push(hd(":method", method))
+    r.push(hd(":scheme", "http"))
+    r.push(hd(":path", path))
+    let mut a = String.from("127.0.0.1:")
+    a.append(String.from_int(port as i64))
+    r.push(http.Header(lit(":authority"), a.bytes()))
+    r
+}
+
+fn read_all(s: h2.Stream) -> Result[List[u8], h2.Error] uses io, clock {
+    let mut out: List[u8] = List.new()
+    while true {
+        let b = s.read(65536, time.after(time.seconds(20)))?
+        if b.len() == 0 { break }
+        out.extend(b)
+    }
+    Ok(out)
+}
+
+fn check(name: str, ok: bool) -> i32 uses io {
+    let mut l = String.from(if ok { "ok   " } else { "FAIL " })
+    l.push_str(name)
+    say(l)
+    if ok { 0 } else { 1 }
+}
+
+fn main() uses net, io, clock, threads {
+    let a = env.args()
+    let port = bytes.parse_u64(a[1].copy()).unwrap() as i32
+    let dl = time.after(time.seconds(60))
+    let c = h2.dial("127.0.0.1", port, h2.options(), dl).unwrap()
+    let mut bad = 0
+
+    // unary with a trailer
+    {
+        let s = c.open(head("POST", "/echo", port), false, dl).unwrap()
+        let z = s.send(lit("hello from eider"), true, dl)
+        let h = s.headers(dl).unwrap()
+        let b = read_all(s).unwrap()
+        let t = s.trailers()
+        bad += check("unary POST /echo", http.eq_s(http.find_s(h, ":status").unwrap(), "200") && bytes.eq(b, lit("HELLO FROM EIDER")))
+        bad += check("trailer x-len", t.is_some() && http.eq_s(http.find_s(t.unwrap(), "x-len").unwrap(), "16"))
+        s.release()
+    }
+    // bidirectional
+    {
+        let s = c.open(head("POST", "/bidi", port), false, dl).unwrap()
+        let h = s.headers(dl).unwrap()
+        let mut got: List[List[u8]] = List.new()
+        for m in List["one", "two", "three"] {
+            let z = s.send(lit(m), false, dl)
+            got.push(s.read(100, dl).unwrap())
+        }
+        let z = s.finish()
+        let rest = read_all(s).unwrap()
+        let t = s.trailers()
+        let ok = got.len() == 3 && bytes.eq(got[0], lit("echo:one")) && bytes.eq(got[1], lit("echo:two")) && bytes.eq(got[2], lit("echo:three"))
+        bad += check("bidirectional /bidi", ok && rest.len() == 0 && t.is_some() && http.eq_s(http.find_s(t.unwrap(), "x-chunks").unwrap(), "3"))
+        s.release()
+    }
+    // 4 MiB upload through the windows
+    {
+        let mut data: List[u8] = List.new()
+        let mut want: u64 = 0
+        for i in 0..4194304 {
+            let v = (i % 253) as u8
+            data.push(v)
+            want += v as u64
+        }
+        let s = c.open(head("POST", "/sum", port), false, dl).unwrap()
+        let z = s.send(data, true, dl)
+        let h = s.headers(dl).unwrap()
+        let b = read_all(s).unwrap()
+        bad += check("4 MiB upload /sum", bytes.eq(b, bytes.from_u64(want)))
+        s.release()
+    }
+    // 1 MiB download
+    {
+        let s = c.open(head("GET", "/big", port), true, dl).unwrap()
+        let h = s.headers(dl).unwrap()
+        let b = read_all(s).unwrap()
+        let mut ok = b.len() == 1048576
+        if ok {
+            for i in 0..1048576 {
+                if b[i as usize] != ((i % 251) as u8) { ok = false }
+            }
+        }
+        bad += check("1 MiB download /big", ok)
+        s.release()
+    }
+    // a status with no body, and fetch
+    {
+        let s = c.open(head("GET", "/status/204", port), true, dl).unwrap()
+        let h = s.headers(dl).unwrap()
+        let b = read_all(s).unwrap()
+        bad += check("204 without a body", http.eq_s(http.find_s(h, ":status").unwrap(), "204") && b.len() == 0)
+        s.release()
+        let mut req = http.request("POST", lit("/echo"))
+        req.body = lit("via fetch")
+        let r = c.fetch(req, dl).unwrap()
+        bad += check("Client.fetch", r.status == 200 && bytes.eq(r.body, lit("VIA FETCH")) && http.find_s(r.headers, "x-len").is_some())
+        let r2 = c.fetch(http.request("GET", lit("/nothing")), dl).unwrap()
+        bad += check("a 404", r2.status == 404)
+    }
+    // 50 at once
+    {
+        let mut tasks: List[Task[i32]] = List.new()
+        for i in 0..50 {
+            let cc = c
+            tasks.push(spawn(|| -> i32 {
+                let s = cc.open(head("POST", "/echo", port), false, dl).unwrap()
+                let mut m = String.from("call ")
+                m.append(String.from_int(i as i64))
+                let z = s.send(m.bytes(), true, dl)
+                let h = s.headers(dl).unwrap()
+                let b = read_all(s).unwrap()
+                s.release()
+                let mut want = String.from("CALL ")
+                want.append(String.from_int(i as i64))
+                if bytes.eq(b, want.bytes()) { 0 } else { 1 }
+            }))
+        }
+        let mut fails = 0
+        for t in tasks { fails += t.join() }
+        bad += check("50 concurrent calls", fails == 0)
+    }
+    c.close()
+    if bad > 0 { env.exit(1) }
+}

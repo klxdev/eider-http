@@ -46,6 +46,7 @@ import tls.suite
 import tls.x509
 import http
 import http.client
+import http.h2
 import http.transport
 import http.ws
 
@@ -99,13 +100,15 @@ pub type ServerTls = {
     identity: config.Identity,
     client_auth: config.ClientAuth,
     handshake_timeout: time.Duration,
-    max_handshakes: usize
+    max_handshakes: usize,
+    /// offer ALPN `h2` (before `http/1.1`)
+    h2: bool
 }
 
 /// A server with `identity` (certificate chain, leaf first, and its private key; eider-tls' `config.identity_from_pem`),
 /// no client certificates, a 10 s handshake deadline and at most 128 handshakes at once.
 pub fn server(identity: config.Identity) -> ServerTls {
-    ServerTls(identity, config.NoClientAuth, time.seconds(10), 128)
+    ServerTls(identity, config.NoClientAuth, time.seconds(10), 128, false)
 }
 
 /// From the PEM text of the chain (every CERTIFICATE block, leaf first) and of the private key (PKCS#8, SEC1 or
@@ -142,23 +145,30 @@ impl ServerTls {
         let roots = x509.store_from_pem(ca_pem)?
         if roots.roots.len() == 0 { return Err(String.from("secure: no certificate in the client CA PEM")) }
         let ca = if required { config.RequireClientAuth(roots) } else { config.RequestClientAuth(roots) }
-        Ok(ServerTls(self.identity, ca, self.handshake_timeout, self.max_handshakes))
+        Ok(ServerTls(self.identity, ca, self.handshake_timeout, self.max_handshakes, self.h2))
     }
 
     /// How long a connection has for the whole handshake, from the moment it took a worker slot (also the wait
     /// for a place among the concurrent handshakes).
     fn with_handshake_timeout(self, d: time.Duration) -> ServerTls {
-        ServerTls(self.identity, self.client_auth, d, self.max_handshakes)
+        ServerTls(self.identity, self.client_auth, d, self.max_handshakes, self.h2)
     }
 
     /// At most `n` (at least 1) handshakes at the same time; a connection waits for its turn within its handshake deadline.
     fn with_max_handshakes(self, n: usize) -> ServerTls {
-        ServerTls(self.identity, self.client_auth, self.handshake_timeout, if n == 0 { 1 } else { n })
+        ServerTls(self.identity, self.client_auth, self.handshake_timeout, if n == 0 { 1 } else { n }, self.h2)
+    }
+
+    /// Offers ALPN `h2` ahead of `http/1.1`: a client that picks it speaks HTTP/2, which a server whose
+    /// `Config.h2` is set serves (without it a client that picked `h2` gets no answer it can use). Off by default.
+    fn with_h2(self) -> ServerTls {
+        ServerTls(self.identity, self.client_auth, self.handshake_timeout, self.max_handshakes, true)
     }
 
     /// What `service.Options.with_tls` and `server.Config.secure` take.
     fn acceptor(self) -> transport.Acceptor uses io, clock {
         let mut cfg = config.server_config(self.identity)
+        if self.h2 { cfg.alpn.push("h2".bytes()) }
         cfg.alpn.push("http/1.1".bytes())
         cfg.client_auth = self.client_auth
         let cell = sync.lock(cfg)
@@ -240,13 +250,18 @@ impl ClientTls {
 
     /// The handshake for connections to `name` (verified against it and sent as SNI), for `client.connect_host_secure`.
     fn connector(self, name: List[u8]) -> transport.Connector uses io, clock {
+        self.connector_alpn(name, List["http/1.1".bytes()])
+    }
+
+    /// `connector`, offering `protocols` (ALPN, in preference order) instead of `http/1.1`.
+    fn connector_alpn(self, name: List[u8], protocols: List[List[u8]]) -> transport.Connector uses io, clock {
         let tls = self
         |fd: i32, dl: time.Deadline| -> Result[transport.Secure, String] {
             let mut cfg = config.client_config("", tls.roots)
             cfg.server_name = Some(name)
             cfg.verify = tls.verify
             cfg.identity = tls.identity
-            cfg.alpn.push("http/1.1".bytes())
+            for p in protocols { cfg.alpn.push(p.copy()) }
             match tlsclient.connect(stream.fd(fd), cfg, dl) {
                 Ok(c) => Ok(wrap(c))
                 Err(e) => Err(text_of(e))
@@ -362,4 +377,21 @@ pub fn dial_ws(url: List[u8], tls: ClientTls, protocols: List[List[u8]], dl: tim
     let u = parse_url(url)?
     let c = connect_url(url, tls, dl)?
     ws.dial_conn(c, u.target, protocols, dl)
+}
+
+/// HTTP/2 over TLS: connects to `name:port` offering ALPN `h2` only, verifies the server against `tls` and the host
+/// name, and starts HTTP/2 on the session (`Err` when the server did not select `h2`). Streams are opened on the
+/// `Client` (`open`, or `fetch` for a buffered request).
+pub fn connect_h2(name: str, port: i32, tls: ClientTls, opt: h2.Options, dl: time.Deadline) -> Result[h2.Client, String] uses net, io, clock, threads {
+    let nm = name.bytes()
+    let cn = client.connect_bytes(nm, port, http.limits(), Some(tls.connector_alpn(nm, List["h2".bytes()])), dl)?
+    if !http.eq_s(cn.alpn(), "h2") {
+        let mut c = cn.copy()
+        c.close()
+        return Err(String.from("secure: the server did not select ALPN h2"))
+    }
+    match h2.connect(h2.wire_of_transport(cn.transport()), opt) {
+        Ok(c) => { Ok(c.with_target("https".bytes(), cn.host.copy())) }
+        Err(e) => { Err(e.why) }
+    }
 }

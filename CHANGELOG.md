@@ -3,6 +3,28 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+HTTP/2 (RFC 9113) and HPACK (RFC 7541), for gRPC (eider-http#9). Docs: docs/services.md "HTTP/2". **Off by default for the
+server**; nothing changes for a program that does not use it.
+
+- **`http/hpack`**: the encoder and decoder (static and dynamic tables, Huffman, size limits, never-indexed credentials). RFC 7541
+  Appendix C vectors pass; checked against libnghttp2's encoder and decoder on random blocks, both directions.
+- **`http/h2frame`**: the frame codec with each type's size and stream rules.
+- **`http/h2`**: connections, streams, flow control (connection and stream windows, replenished as the application reads), SETTINGS,
+  PING, GOAWAY, RST_STREAM, trailers, streaming in both directions at once, as a server (`serve`, `serve_until`, `serve_listener`) and as a
+  client (`connect`, `dial`, `Client.fetch`) over any connected duplex (`Wire`: `wire_of_transport`, `wire_of_duplex`, `wire_with_prefix`);
+  `accept_server` / `accept_client` for `Upgrade: h2c` on a connection a handler took over (both of Docker's BuildKit shapes); `handler`
+  runs an `http.Handler` on HTTP/2. Limits against rapid reset, CONTINUATION floods, SETTINGS/PING/empty-DATA floods, oversized headers and
+  slow peers (`h2.Options`).
+- **`server.Config.h2`** (None: HTTP/1.1 only, as before) serves HTTP/2 on the HTTP/1.1 listener (prior-knowledge h2c, or ALPN `h2` over https
+  with `secure.ServerTls.with_h2()`); `Config.h2_wrap` is a layer around the stream handler, for protocols that take whole streams (gRPC).
+  `secure.connect_h2` is the https client; `ClientTls.connector_alpn(name, protocols)`.
+- Tested against curl (nghttp2), the Rust `h2` crate as client and as server, and h2spec (147 of 147, strict, on an HTTP/2-only server; 146 of
+  147 on a shared port, the invalid-preface test expects GOAWAY); `tests/h2_interop.sh`.
+- **Breaking for code that builds records by position:** `server.Config` has two new last fields (`h2`, `h2_wrap`) and `secure.ServerTls` one
+  (`h2`); `config()` and `secure.server(...)` fill them with the old behaviour.
+
 ## 0.7.6
 
 Needs Eider 0.7.9 or later (`scripts/env.sh` refuses an older toolchain). No code changes.

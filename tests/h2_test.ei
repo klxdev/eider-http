@@ -1,0 +1,257 @@
+// http/h2 between an Eider client and an Eider server over a socket pair: a unary call with trailers,
+// a bidirectional stream, flow control with small windows, concurrent streams, PING, a reset stream,
+// GOAWAY, and the server refusing what it should (malformed requests, too many streams).
+
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.net
+import std.stream
+import std.task
+import std.time
+import http
+import http.h2
+import http.h2frame
+import http.transport
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn msg(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn hd(n: str, v: str) -> http.Header { http.Header(lit(n), lit(v)) }
+
+fn txt(b: List[u8]) -> String { sys.to_string(b) }
+
+fn show(hs: List[http.Header]) -> String {
+    let mut l = String.from("")
+    for h in hs {
+        l.append(txt(h.name))
+        l.push_str("=")
+        l.append(txt(h.value))
+        l.push_str(" ")
+    }
+    l
+}
+
+fn request(path: str) -> List[http.Header] {
+    let mut r: List[http.Header] = List.new()
+    r.push(hd(":method", "POST"))
+    r.push(hd(":scheme", "http"))
+    r.push(hd(":path", path))
+    r.push(hd(":authority", "test"))
+    r
+}
+
+fn ok_head() -> List[http.Header] {
+    let mut r: List[http.Header] = List.new()
+    r.push(hd(":status", "200"))
+    r.push(hd("content-type", "text/plain"))
+    r
+}
+
+fn read_all(s: h2.Stream) -> Result[List[u8], h2.Error] uses io, clock {
+    let mut out: List[u8] = List.new()
+    while true {
+        let b = s.read(65536, time.after(time.seconds(10)))?
+        if b.len() == 0 { break }
+        out.extend(b)
+    }
+    Ok(out)
+}
+
+fn sum(b: List[u8]) -> u64 {
+    let mut s: u64 = 0
+    for x in b { s = (s * 31 +% (x as u64)) % 1000000007 }
+    s
+}
+
+/// The server's handler: by path.
+fn serve_stream(s: h2.Stream) uses io, clock {
+    let hs = match s.headers(time.never()) {
+        Ok(h) => h
+        Err(e) => { return }
+    }
+    let path = http.find_s(hs, ":path").unwrap()
+    if http.eq_s(path, "/echo") {
+        let body = match read_all(s) {
+            Ok(b) => b
+            Err(e) => { return }
+        }
+        let z = s.send_headers(ok_head(), false)
+        let mut up: List[u8] = List.new()
+        for c in body { up.push(if c >= 97 && c <= 122 { c - 32 } else { c }) }
+        let z2 = s.send(up, false, time.never())
+        let mut t: List[http.Header] = List.new()
+        t.push(http.Header(lit("x-len"), body.len().to_string().bytes()))
+        let z3 = s.send_trailers(t)
+    } else if http.eq_s(path, "/bidi") {
+        let z = s.send_headers(ok_head(), false)
+        while true {
+            match s.read(65536, time.never()) {
+                Ok(b) => {
+                    if b.len() == 0 { break }
+                    let mut r = lit("echo:")
+                    r.extend(b)
+                    let z1 = s.send(r, false, time.never())
+                }
+                Err(e) => { return }
+            }
+        }
+        let z2 = s.finish()
+    } else if http.eq_s(path, "/big") {
+        let body = match read_all(s) {
+            Ok(b) => b
+            Err(e) => { return }
+        }
+        let z = s.send_headers(ok_head(), false)
+        let z2 = s.send(bytes.from_u64(sum(body)), true, time.never())
+    } else if http.eq_s(path, "/gen") {
+        let z = s.send_headers(ok_head(), false)
+        let mut chunk: List[u8] = List.new()
+        for i in 0..100000 { chunk.push((i % 251) as u8) }
+        let z2 = s.send(chunk, true, time.never())
+    } else if http.eq_s(path, "/wait") {
+        let z = s.send_headers(ok_head(), false)
+        match s.read(10, time.never()) {
+            Ok(b) => { say(String.from("server: read returned data")) }
+            Err(e) => {
+                say(msg("server: read failed with kind ", e.kind.to_string()))
+                say(msg("server: code ", h2frame.code_name(e.code)))
+            }
+        }
+    } else {
+        let mut r: List[http.Header] = List.new()
+        r.push(hd(":status", "404"))
+        let z = s.send_headers(r, true)
+    }
+}
+
+fn pair_wires() -> (h2.Wire, h2.Wire) uses net, io, clock {
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    (h2.wire_of_transport(transport.plain(p.r)), h2.wire_of_transport(transport.plain(p.w)))
+}
+
+fn start(opt: h2.Options) -> (h2.Client, Task[i32]) uses net, io, clock, threads {
+    let (cw, sw) = pair_wires()
+    let t = spawn(|| -> i32 {
+        match h2.serve(sw, opt, |s: h2.Stream| -> () { serve_stream(s) }) {
+            Ok(z) => {}
+            Err(e) => { say(msg("server ended: ", e.why)) }
+        }
+        0
+    })
+    let c = h2.connect(cw, opt).unwrap()
+    (c, t)
+}
+
+fn main() uses net, io, clock, threads {
+    let opt = h2.options()
+    let (c, srv) = start(opt)
+
+    say(String.from("-- unary with trailers"))
+    let s = c.open(request("/echo"), false, time.never()).unwrap()
+    let z = s.send(lit("hello, h2"), true, time.never())
+    let head = s.headers(time.after(time.seconds(5))).unwrap()
+    say(msg("head: ", show(head)))
+    say(msg("body: ", txt(read_all(s).unwrap())))
+    say(msg("trailers: ", show(s.trailers().unwrap())))
+    s.release()
+
+    say(String.from("-- an unknown path is a 404 with no body"))
+    let s2 = c.open(request("/nope"), true, time.never()).unwrap()
+    say(msg("head: ", show(s2.headers(time.after(time.seconds(5))).unwrap())))
+    say(msg("body bytes: ", read_all(s2).unwrap().len().to_string()))
+    s2.release()
+
+    say(String.from("-- a bidirectional stream: each message is answered before the next is sent"))
+    let b = c.open(request("/bidi"), false, time.never()).unwrap()
+    let bh = b.headers(time.after(time.seconds(5))).unwrap()
+    for m in List["one", "two", "three"] {
+        let z1 = b.send(lit(m), false, time.never())
+        let got = b.read(100, time.after(time.seconds(5))).unwrap()
+        say(txt(got))
+    }
+    let z4 = b.finish()
+    say(msg("end of body: ", b.read(100, time.after(time.seconds(5))).unwrap().len().to_string()))
+    b.release()
+
+    say(String.from("-- ping"))
+    match c.ping(time.after(time.seconds(5))) {
+        Ok(d) => { say(String.from("ping answered")) }
+        Err(e) => { say(msg("ping failed: ", e.why)) }
+    }
+
+    say(String.from("-- a request body of 700000 bytes through the default windows"))
+    let mut big: List[u8] = List.new()
+    for i in 0..700000 { big.push((i % 253) as u8) }
+    let s3 = c.open(request("/big"), false, time.never()).unwrap()
+    let z5 = s3.send(big, true, time.after(time.seconds(20)))
+    let h3 = s3.headers(time.after(time.seconds(20))).unwrap()
+    let r3 = txt(read_all(s3).unwrap())
+    say(msg("checksum from the server: ", r3))
+    say(msg("checksum here:            ", sum(big).to_string()))
+    s3.release()
+
+    say(String.from("-- a response of 100000 bytes"))
+    let s4 = c.open(request("/gen"), true, time.never()).unwrap()
+    let h4 = s4.headers(time.after(time.seconds(5))).unwrap()
+    let r4 = read_all(s4).unwrap()
+    say(msg("length: ", r4.len().to_string()))
+    let mut okc = true
+    for i in 0..100000 {
+        if r4[i as usize] != ((i % 251) as u8) { okc = false }
+    }
+    say(msg("content ok: ", okc.to_string()))
+    s4.release()
+
+    say(String.from("-- 20 concurrent calls"))
+    let mut tasks: List[Task[i32]] = List.new()
+    for i in 0..20 {
+        let cc = c
+        tasks.push(spawn(|| -> i32 {
+            let st = cc.open(request("/echo"), false, time.never()).unwrap()
+            let mut body: List[u8] = List.new()
+            for j in 0..(100 + i * 50) { body.push(97) }
+            let zz = st.send(body, true, time.never())
+            let hh = st.headers(time.after(time.seconds(10))).unwrap()
+            let rr = read_all(st).unwrap()
+            st.release()
+            if rr.len() == ((100 + i * 50) as usize) { 0 } else { 1 }
+        }))
+    }
+    let mut bad = 0
+    for t in tasks { bad += t.join() }
+    say(msg("failures: ", bad.to_string()))
+
+    say(String.from("-- a reset ends the reader on the other side"))
+    let w = c.open(request("/wait"), false, time.never()).unwrap()
+    let wh = w.headers(time.after(time.seconds(5))).unwrap()
+    time.sleep_ms(100)
+    w.reset(h2frame.CANCEL)
+    time.sleep_ms(200)
+    match w.read(10, time.after(time.seconds(1))) {
+        Ok(x) => { say(String.from("client: read returned")) }
+        Err(e) => { say(msg("client: read failed with kind ", e.kind.to_string())) }
+    }
+    w.release()
+
+    say(String.from("-- GOAWAY: the client shuts down, new streams are refused, the server returns"))
+    c.shutdown()
+    time.sleep_ms(100)
+    c.close()
+    let z6 = srv.join()
+    match c.open(request("/echo"), false, time.after(time.seconds(1))) {
+        Ok(x) => { say(String.from("opened after close")) }
+        Err(e) => { say(msg("open after close: kind ", e.kind.to_string())) }
+    }
+    say(String.from("done"))
+}

@@ -1,0 +1,17 @@
+-- /grpc: HTTP/1.1 Upgrade: h2c, then the CLI is the HTTP/2 client
+response head: HTTP/1.1 101 Switching Protocols
+status: 200
+body: hello world
+trailers: 0
+-- /session: the CLI serves, the daemon is the HTTP/2 client
+response head: HTTP/1.1 101 Switching Protocols
+daemon got: cli answers auth
+daemon got: cli answers filesync
+the CLI's connection ended
+-- prior-knowledge h2c on the HTTP/1.1 listener
+status: 426
+-- an Upgrade request that is not for h2c is refused with 426
+HTTP/1.1 426 
+-- plain HTTP/1.1 still works
+HTTP/1.1 200 OK
+done

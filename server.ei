@@ -75,6 +75,7 @@ import http.transport
 import http.middleware
 import http.metrics
 import http.compress
+import http.h2
 import compression
 
 pub type Config = {
@@ -90,6 +91,8 @@ pub type Config = {
     log: Option[logging.Logger],
     decode_max: usize,
     secure: Option[transport.Acceptor],
+    h2: Option[h2.Options],
+    h2_wrap: Option[h2.Middleware],
 }
 
 /// 10,000 connections served at once, a queue of 64, 5 s idle, 10 s to read a request, 10 s to write a
@@ -103,9 +106,11 @@ pub type Config = {
 /// corrupt or cut short; other codings are 501. `secure` None: plain HTTP; `Some(acceptor)` (from
 /// http/secure, or `service.options().with_tls(...)`) serves https: every accepted connection runs the TLS
 /// handshake (bounded by the acceptor's handshake timeout and limit on concurrent handshakes) before its
-/// first request.
+/// first request. `h2` None: HTTP/1.1 only, as before; `Some(options)` (`h2.options()`) also serves HTTP/2 on the same
+/// port: a connection that opens with the HTTP/2 preface (prior-knowledge h2c) or that negotiated ALPN `h2` (https,
+/// `ServerTls.with_h2()`) is HTTP/2, every request stream calling the same handler (docs/services.md "HTTP/2").
 pub fn config() -> Config {
-    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan, Some(logging.new(logging.Error)), 0, None)
+    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan, Some(logging.new(logging.Error)), 0, None, None, None)
 }
 
 fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) }
@@ -594,7 +599,7 @@ fn run_stream(t: transport.Transport, sig: Sig, resp: http.Response, stm: http.S
 
 /// A connection's task: waits for a slot if it was accepted without one, serves the connection,
 /// gives the slot back and tells the acceptor it is done (so its Task can be joined).
-fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, sh: Hub, slots: chan.Channel[bool], admitted: bool, done: chan.Channel[i64], id: i64) uses net, io, clock {
+fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, sh: Hub, slots: chan.Channel[bool], admitted: bool, done: chan.Channel[i64], id: i64) uses net, io, clock, threads {
     if !admitted {
         // accepted while every slot was taken: wait for one (the acceptor counted this
         // connection as waiting, so at most `queue` of them are parked here)
@@ -626,9 +631,36 @@ fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, sh: Hub, slo
     let fin = done.try_send(id)
 }
 
+/// A connection that speaks HTTP/2: http/h2 reads and writes it (`pre` is what was read before it was known to be
+/// HTTP/2), and every request stream calls `h` as an HTTP/1.1 request would (a trap is contained and counted as
+/// there). The server stopping ends the connection gracefully (GOAWAY, then once its streams are done).
+fn serve_h2(t: transport.Transport, pre: List[u8], peer: List[u8], h: http.Handler, cfg: Config, opt: h2.Options, sig: Sig, sh: Hub) uses net, io, clock, threads {
+    let mut ctx: List[http.Header] = List.new()
+    match t.sec {
+        Some(sc) => {
+            ctx.push(http.Header(sys.lit("tls"), sc.suite.bytes()))
+            if sc.peer_certs.len() > 0 { ctx.push(http.Header(sys.lit("tls_client_cert"), sc.peer_certs[0].copy())) }
+        }
+        None => {}
+    }
+    let counted = |r: http.Request| -> http.Response {
+        bump(sh, 2)
+        let ans = guarded(h, r, cfg, sh)
+        ans.resp
+    }
+    let wire = h2.wire_with_prefix(h2.wire_of_transport(t), pre)
+    let stopping = || -> bool { stop_signalled(sig) }
+    let base = h2.handler(counted, peer, ctx)
+    let top = match cfg.h2_wrap {
+        Some(w) => w(base)
+        None => base
+    }
+    let r = h2.serve_until(wire, opt, top, stopping)
+}
+
 /// One connection, request after request (see the module comment), with its slot held. Owns
 /// `c`; `peer` is the client's address as text (it goes in every Request).
-fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Config, sig: Sig, sh: Hub) uses net, io, clock {
+fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Config, sig: Sig, sh: Hub) uses net, io, clock, threads {
     let mut ok = true
     let mut stopping = false
     let mut parser = parse.requests(cfg.limits)
@@ -641,6 +673,41 @@ fn serve_slot(t: transport.Transport, peer: List[u8], h: http.Handler, cfg: Conf
     // close), 2 close now
     let mut end = 0
     if !ok { end = 2 }
+    match cfg.h2 {
+        Some(h2o) => {
+            // HTTP/2 is on: a connection that negotiated `h2`, or whose first bytes are the HTTP/2 preface
+            // ("PRI * HTTP/2.0": not a request HTTP/1.1 accepts), is served by http/h2
+            let mut is_h2 = http.eq_s(t.alpn(), "h2")
+            let mut pre: List[u8] = List.new()
+            if !is_h2 {
+                let dl0 = time.after(cfg.idle_timeout)
+                while pre.len() < 4 && end == 0 {
+                    match wait_conn(t, sig, dl0) {
+                        Readable => {
+                            match t.try_recv(65536) {
+                                Ok(Some(b)) => {
+                                    if b.len() == 0 { end = 2 } else { pre.extend(b) }
+                                }
+                                Ok(None) => {}
+                                Err(e) => { end = 2 }
+                            }
+                        }
+                        TimedOut => { end = 2 }
+                        Stopped => { end = 2 }
+                        Failed => { end = 2 }
+                    }
+                }
+                if end == 0 && pre.len() >= 4 && pre[0] == 80 && pre[1] == 82 && pre[2] == 73 && pre[3] == 32 { is_h2 = true }
+            }
+            if end == 0 && is_h2 {
+                serve_h2(t, pre, peer, h, cfg, h2o, sig, sh)
+                return
+            }
+            if end == 0 { parser.feed(pre) }
+        }
+        None => {}
+    }
+    if end == 2 { t.close_now() }
     while end == 0 {
         // read one request
         let mut started = !parser.idle()

@@ -1,0 +1,158 @@
+// The Eider HTTP/2 server for tests/h2_interop.sh, against curl (prior-knowledge h2c, h2c upgrade, https with
+// ALPN h2) and, when installed, other HTTP/2 clients:
+//
+//   h2_interop_server [chain.pem key.pem]
+//   h2_interop_server h2only        a server that speaks only HTTP/2 (h2.serve_listener), for h2spec's preface test
+//
+// Serves GET /hello, POST /echo (the body back, upper-cased), GET /big (1 MiB), GET /stream (chunked, slow), GET /info
+// (protocol and TLS facts), GET /quit (stops the server). With a chain and key it also serves https (ALPN h2 and
+// http/1.1) on a second port. Prints `listening <port> [<tls port>]` once it is up.
+
+import core.sys
+import std.bytes
+import std.env
+import std.io
+import std.net
+import std.task
+import std.time
+import std.utf8
+import http
+import http.router
+import http.server
+import http.secure
+import http.h2
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn main() uses io, net, clock, threads, fs {
+    let a = env.args()
+    let tok = task.root()
+    if a.len() >= 2 && utf8.lossy(a[1].copy()) == String.from("h2only") {
+        let ls = net.listener(net.ipv4(127, 0, 0, 1, 0), true).unwrap()
+        let port = net.local_addr(ls).unwrap().port
+        let mut up = String.from("listening ")
+        up.append(String.from_int(port as i64))
+        io.outln(up.bytes())
+        h2.serve_listener(ls, h2.options(), 100, |s: h2.Stream| -> () {
+            // the request body is read before the answer (one that is answered and abandoned first is reset with
+            // NO_ERROR, so a malformed body behind it is never looked at)
+            while true {
+                match s.read(65536, time.never()) {
+                    Ok(b) => {
+                        if b.len() == 0 { break }
+                    }
+                    Err(e) => { return }
+                }
+            }
+            let mut ok: List[http.Header] = List.new()
+            ok.push(http.Header(lit(":status"), lit("200")))
+            let z = s.send_headers(ok, false)
+            let z1 = s.send(lit("h2only"), true, time.never())
+        }, tok)
+        return
+    }
+    let mut r = router.new()
+    r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello h2") })
+    r.post("/echo", |q: http.Request| -> http.Response {
+        let mut up: List[u8] = List.new()
+        for c in q.body { up.push(if c >= 97 && c <= 122 { c - 32 } else { c }) }
+        http.respond(200, "text/plain", up)
+    })
+    r.get("/big", |q: http.Request| -> http.Response {
+        let mut b: List[u8] = List.new()
+        for i in 0..1048576 { b.push((i % 251) as u8) }
+        http.respond(200, "application/octet-stream", b)
+    })
+    r.get("/info", |q: http.Request| -> http.Response {
+        let mut t = String.from("protocol=")
+        t.append(sys.to_string(q.get_ctx("protocol").unwrap_or(lit("h1"))))
+        t.push_str(" host=")
+        t.append(sys.to_string(q.header("host").unwrap_or(lit("-"))))
+        t.push_str(" tls=")
+        t.append(sys.to_string(q.get_ctx("tls").unwrap_or(lit("-"))))
+        http.respond(200, "text/plain", t.bytes())
+    })
+    r.get("/stream", |q: http.Request| -> http.Response {
+        let mut resp = http.response(200)
+        resp.set_header("Content-Type", lit("text/plain"))
+        resp.stream = Some(http.Stream(|d: http.Duplex| -> () {
+            for i in 0..(10 as i32) {
+                let z = d.write(lit("0123456789abcdef0123456789abcdef\n"))
+                time.sleep(time.millis(20))
+            }
+        }, false))
+        resp
+    })
+    let t2 = tok
+    r.get("/quit", |q: http.Request| -> http.Response {
+        t2.cancel()
+        http.text(200, "bye")
+    })
+    let h = router.handler(r)
+    let mut cfg = server.config()
+    cfg.h2 = Some(h2.options())
+    // streams the buffering adapter cannot serve are taken here: /bidi echoes each chunk as it arrives,
+    // /trailers answers with trailers; everything else goes on to the router
+    cfg.h2_wrap = Some(|next: h2.StreamHandler| -> h2.StreamHandler {
+        |s: h2.Stream| -> () {
+            let hs = match s.headers(time.never()) {
+                Ok(x) => x
+                Err(e) => { return }
+            }
+            let path = http.find_s(hs, ":path").unwrap_or(lit("/"))
+            if http.eq_s(path, "/bidi") {
+                let mut ok: List[http.Header] = List.new()
+                ok.push(http.Header(lit(":status"), lit("200")))
+                let z = s.send_headers(ok, false)
+                let mut n: i64 = 0
+                while true {
+                    match s.read(65536, time.never()) {
+                        Ok(b) => {
+                            if b.len() == 0 { break }
+                            n += 1
+                            let mut r = lit("echo:")
+                            r.extend(b)
+                            let z1 = s.send(r, false, time.never())
+                        }
+                        Err(e) => { return }
+                    }
+                }
+                let mut t: List[http.Header] = List.new()
+                t.push(http.Header(lit("x-chunks"), n.to_string().bytes()))
+                let z2 = s.send_trailers(t)
+            } else if http.eq_s(path, "/trailers") {
+                let mut ok: List[http.Header] = List.new()
+                ok.push(http.Header(lit(":status"), lit("200")))
+                ok.push(http.Header(lit("content-type"), lit("application/grpc")))
+                let z = s.send_headers(ok, false)
+                let z1 = s.send(lit("payload"), false, time.never())
+                let mut t: List[http.Header] = List.new()
+                t.push(http.Header(lit("grpc-status"), lit("0")))
+                t.push(http.Header(lit("grpc-message"), lit("ok")))
+                let z2 = s.send_trailers(t)
+            } else {
+                next(s)
+            }
+        }
+    })
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let mut up = String.from("listening ")
+    up.append(String.from_int(srv.port() as i64))
+    let mut tasks: List[Task[i32]] = List.new()
+    if a.len() >= 3 {
+        let tls = secure.server_from_files(utf8.lossy(a[1].copy()), utf8.lossy(a[2].copy())).unwrap().with_h2()
+        let mut cfg2 = server.config()
+        cfg2.h2 = Some(h2.options())
+        cfg2.secure = Some(tls.acceptor())
+        let srv2 = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg2).unwrap()
+        up.push_str(" ")
+        up.append(String.from_int(srv2.port() as i64))
+        tasks.push(spawn(|| -> i32 {
+            let z = srv2.serve(h, tok)
+            0
+        }))
+    }
+    io.outln(up.bytes())
+    let s = srv.serve(h, tok).unwrap()
+    for t in tasks { let z = t.join() }
+}

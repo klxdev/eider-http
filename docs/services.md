@@ -58,6 +58,9 @@ the step-by-step guide to both ("Building services").
 | `http/ws` | WebSockets (RFC 6455): `accept` (the handshake and the upgrade), `Conn.recv/send_text/send_binary/ping/close`, the frame codec, SHA-1, a test client (`dial`, `dial_conn` over any `client.Conn`, so wss) | `clock` for `recv`, `dial` needs `net, io, clock` |
 | `http/transport` | the bytes under a connection, plain or TLS: `Transport`, `Secure`, `Acceptor`, `Connector`; every read, write, wait and close of the server, the client and `ws.Client` goes through it. Imports no TLS | `net, io, clock` |
 | `http/secure` | https: `server_from_files/pem/der(...)` + `with_client_auth_pem`, `with_handshake_timeout`, `with_max_handshakes`, `acceptor()`, `reload`; `client_system()`, `client_roots_pem(pem)`, `client_insecure_skip_verify_for_tests()`, `connect_host`, `connect_url`, `get_url`, `dial_ws` (`wss://`); the only module that imports eider-tls (docs "TLS") | `net, io, clock, fs` |
+| `http/hpack` | HPACK (RFC 7541): the encoder and decoder with the static and dynamic tables, Huffman coding, never-indexed credentials, size limits; passes the RFC's Appendix C vectors and is checked against libnghttp2 in both directions | none |
+| `http/h2frame` | HTTP/2 frames (RFC 9113): the incremental decoder with every frame type's size and stream rules, the encoders, SETTINGS, error codes | none |
+| `http/h2` | HTTP/2: connections, streams and flow control as a server (`serve`, `serve_listener`, `server.Config.h2`) and a client (`connect`, `dial`, `secure.connect_h2`), over any connected duplex (`Wire`), trailers, streaming both ways, `Upgrade: h2c` (`accept_server`, `accept_client`), `handler` for an `http.Handler` (docs "HTTP/2") | `net, io, clock, threads` |
 | `http/sock` | sending before a deadline, lingering close | `net, io, clock` |
 | `http/profiling` | profiler labels per route, `/debug/profile` and `/debug/heap` (eider-lang's docs/site/tooling/profiler.md) | `fs, clock` for the endpoints |
 
@@ -440,7 +443,7 @@ Recorded rather than worked around; none blocks the design.
 5. **Concurrency:** move the worker loop onto stackless tasks over std/event when the
    compiler has them (C4), keeping `serve` and the handler type; per-connection pollers go
    away (N4).
-6. **TLS 1.3 in Eider** (P1.4): done (`http/secure`, section "TLS"). Then HTTP/2 (P1.7) for gRPC: the ALPN list is where `h2` would go.
+6. **TLS 1.3 in Eider** (P1.4): done (`http/secure`, section "TLS"). **HTTP/2** (P1.7), for gRPC: done (section "HTTP/2"); gRPC itself is in eider-rpc.
 
 
 ## Production defaults (`http/health`, `http/service`)
@@ -729,3 +732,102 @@ libcrypto at link time). Handlers that call `recv` need `uses clock` on the func
 that is already connected, which is how `secure.dial_ws("wss://...")` works. The server side needs
 nothing for wss: a handler's `Duplex` is the connection's transport, plain or TLS. Not done: permessage-deflate and
 other extensions, backpressure beyond the write deadline.
+
+
+## HTTP/2 (`http/h2`, `http/hpack`, `http/h2frame`)
+
+HTTP/2 (RFC 9113) with header compression (RFC 7541): the transport gRPC needs, and also a way to serve ordinary
+handlers over one multiplexed connection. Three modules, layered: `http/hpack` (pure: the header compression),
+`http/h2frame` (pure: the frame codec), `http/h2` (the connection). No new dependency, and a program that does not
+import them loads none of it.
+
+### Shape
+
+A connection has **one client and one server**: the client opens the streams (odd ids), the server answers them. Both
+roles run on the same machinery over a `Wire`, which is read, write and close of *any connected duplex*: `wire_of_transport(t)`
+(a socket, or a TLS session on one: `http/transport`) and `wire_of_duplex(d, close)` (the `http.Duplex` of a connection a
+handler took over after `101 Switching Protocols`). `wire_with_prefix(w, bytes)` puts back bytes that were read before it was
+known to be HTTP/2. Docker's BuildKit shows why the roles are separate: on `/grpc` the daemon is the HTTP/2 server; on
+`/session` the CLI made the HTTP/1.1 request but then *serves*, and the daemon is the HTTP/2 client calling into it over that
+connection (`accept_client` below). Within one connection a side is a client or a server, never both.
+
+```
+// server: one task per request stream
+h2.serve(h2.wire_of_transport(t), h2.options(), |s: h2.Stream| -> () {
+    let head = s.headers(time.never()).unwrap()           // :method, :path, :authority, then the fields
+    let body = s.read(65536, time.never()).unwrap()       // empty at the end of the body; then s.trailers()
+    let z = s.send_headers(response_head, false)          // :status first
+    let z = s.send(data, false, time.never())             // waits for the peer's flow-control windows
+    let z = s.send_trailers(trailers)                     // or s.finish()
+})
+
+// client
+let c = h2.dial("example.com", 80, h2.options(), dl).unwrap()      // prior-knowledge h2c; secure.connect_h2 for https
+let s = c.open(request_head, false, dl).unwrap()
+let z = s.send(body, true, dl)
+let head = s.headers(dl).unwrap()
+let r = c.fetch(http.request("GET", "/x".bytes()), dl)             // or one buffered request
+```
+
+`Stream.read` and `Stream.send` work from different tasks at the same time, so a bidirectional stream (the server answers
+while the client is still sending) needs nothing more; trailers end either direction (`send_trailers`, `trailers()`).
+Streams are handles: call `release()` when done with one (a server's `serve` does it for the handler; what is unfinished is
+reset: INTERNAL_ERROR for an unfinished response, NO_ERROR when only the request body is unread, CANCEL for a client).
+Errors are `h2.Error { kind, code, why }`: `ERR_TIMEOUT`, `ERR_RESET` (the peer's or our RST_STREAM, with its code),
+`ERR_CLOSED` (the connection ended, with the GOAWAY code), `ERR_STATE`, `ERR_INVALID`.
+
+### In the HTTP/1.1 server
+
+`server.Config.h2 = Some(h2.options())` serves HTTP/2 on the same listener, **off by default** (nothing changes for existing
+programs): a connection that opens with the HTTP/2 preface (prior-knowledge h2c) or that negotiated ALPN `h2` is HTTP/2 and
+every request stream calls the same `http.Handler` (through `h2.handler`: the request body is buffered up to
+`Options.max_body`, `:authority` is the `host` header, the request context has `protocol` = `h2`, and `tls`/`tls_client_cert`
+as for HTTP/1.1; the response is written as HEADERS and DATA, a handler's `stream` as DATA as it is produced). Over https the
+server offers ALPN `h2` with `ServerTls.with_h2()`. A trap in a handler is a 500 and counted as in HTTP/1.1; the server stopping
+sends GOAWAY and ends the connection when its streams are done. `Config.h2_wrap` is a layer around the stream handler
+(`h2.Middleware`) for protocols that take whole streams, such as gRPC (content type `application/grpc`), and pass the rest on.
+`h2.serve_listener(listener, options, max_conns, handler, token)` is a server that speaks only HTTP/2.
+
+### `Upgrade: h2c` on a connection a handler took over
+
+`h2.accept_server(req, options, handler)` answers `Connection: Upgrade`, `Upgrade: h2c` with `101` and then serves HTTP/2 on the
+connection; `h2.accept_client(req, options, run)` is the inverted shape (the peer serves, `run(client)` calls it). A request
+that is not for h2c is a 426. `tests/h2_upgrade_test.ei` plays both BuildKit endpoints. RFC 9113 deprecated this upgrade for
+HTTP/2 itself, so the server does not upgrade a plain `Upgrade: h2c` request by itself (clients fall back to HTTP/1.1); it is
+here for the protocols that use it between known peers.
+
+### Flow control
+
+A receiver's window is given back as the application reads, so a stream that nobody reads stalls its sender and not the
+connection; the unread data of a stream that ends (reset, or released) is credited to the connection at once. Initial windows:
+1 MiB per stream, 4 MiB per connection (`Options`). A sender waits for the stream window and the connection window
+(`send`'s deadline). A stream that does not consume stalls only itself.
+
+### Limits and what is refused
+
+All in `Options`: `max_streams` concurrent streams (a stream counts until the handler is done too, so resets cannot pile up
+work: REFUSED_STREAM); `max_frame` (16 KiB; larger is FRAME_SIZE_ERROR from the header, before the payload is read);
+`max_header_list` (64 KiB in the RFC's accounting; a block over it is decoded to its end so HPACK stays in step, the stream
+is reset with ENHANCE_YOUR_CALM, a CONTINUATION run over twice that closes the connection); `header_table`; `max_body`;
+`settings_timeout` (the preface, the peer's SETTINGS and the acknowledgement of ours); `write_timeout` on every write (a peer
+that does not read ends the connection); `idle`; `max_resets` per 10 s (the "rapid reset" attack: GOAWAY ENHANCE_YOUR_CALM).
+Floods of empty DATA, PING, SETTINGS and PRIORITY are counted and refused. Messages are validated as RFC 9113 section 8 asks:
+pseudo-headers first and once, only those a request or response has, lowercase names, no connection-specific fields,
+`te: trailers` only, no stray whitespace or NUL/CR/LF in values, `content-length` against the DATA received; a malformed message
+resets its stream with PROTOCOL_ERROR. HPACK: strings are limited, integers are at most 2^32, Huffman padding and EOS are
+checked, and credentials (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`) are written as never-indexed literals.
+Server push is disabled (`SETTINGS_ENABLE_PUSH` 0 as a client; a PUSH_PROMISE as a server is a connection error). Priority
+signals are accepted and ignored.
+
+### Tests
+
+`tests/hpack_test` (the RFC 7541 Appendix C examples, integers, Huffman for every byte, malformed blocks, 1200 round trips
+with changing table sizes), `tests/h2frame_test` (every frame type, one byte at a time, the malformed corpus),
+`tests/h2_test` (client and server over a socket pair: unary with trailers, bidirectional, 700 KB through the windows, 20
+concurrent streams, reset, GOAWAY, PING), `tests/h2_upgrade_test` (both BuildKit shapes over a hijacked HTTP/1.1 connection).
+`tests/h2_interop.sh` (in `scripts/test.sh`; `skip` for a missing tool) runs: curl (nghttp2) against the server (prior-knowledge
+h2c, https with ALPN h2, 1 MiB, streamed bodies, parallel requests); the Rust `h2` crate (hyper's HTTP/2) as a client of the
+server and as a server for the Eider client; **h2spec** (strict, all 147 tests) against `h2srv h2only`; and
+`tests/hpack_interop.sh` checks HPACK against libnghttp2's encoder and decoder on random blocks, both ways. With h2spec against
+a server that *shares* its port with HTTP/1.1 (`Config.h2`), 146 of 147 pass: the test that sends an invalid connection preface
+expects GOAWAY, and an HTTP/1.1 parser answers 400.

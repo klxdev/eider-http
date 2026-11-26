@@ -1,0 +1,2105 @@
+//! http/h2: HTTP/2 (RFC 9113): the connection, its streams, flow control, and both roles, over any
+//! connected duplex (a socket, a TLS session, the connection a handler took over after
+//! `101 Switching Protocols`). The header compression is http/hpack and the frames are
+//! http/h2frame; this module is what makes them a connection.
+//!
+//! A connection has one client and one server: the client opens the streams, the server answers them,
+//! and the two roles are separate functions over the same machinery (`serve` and `connect`). What the
+//! caller hands in is a `Wire`: read, write and close of the connection, with `wire_of_transport` for
+//! a socket (or TLS session) and `wire_of_duplex` for the `http.Duplex` an upgraded HTTP/1.1
+//! connection gives a handler.
+//!
+//! Server:
+//!
+//!     h2.serve(h2.wire_of_transport(t), h2.options(), |s: h2.Stream| -> () {
+//!         // s.headers(): the request's pseudo-headers (:method, :path, ...) and fields
+//!         // s.read(max, dl): the request body as it arrives, empty at its end; s.trailers() after it
+//!         let z = s.send_headers(response_headers, false)
+//!         let z = s.send(body, false, time.never())
+//!         let z = s.send_trailers(trailers)            // or s.finish()
+//!     })
+//!
+//! `h2.handler(h)` turns an ordinary `http.Handler` (a router, with its middleware) into such a
+//! stream handler: the request is buffered up to `Options.max_body`, the response is written as one
+//! HEADERS and DATA. Each request runs in a task of its own; a handler that traps costs its stream
+//! (RST_STREAM INTERNAL_ERROR), not the connection.
+//!
+//! Client:
+//!
+//!     let conn = h2.connect(h2.wire_of_transport(t), h2.options())?
+//!     let s = conn.open(request_headers, false, time.never())?      // :method, :scheme, :path, :authority, ...
+//!     let z = s.send(body, true, dl)                                   // end of the request
+//!     let head = s.headers(dl)?                                        // :status and fields
+//!     let chunk = s.read(65536, dl)?                                   // empty at the end; s.trailers()
+//!
+//! Streaming goes both ways at once: `read` and `send` of a stream work from different tasks while
+//! the other side is still sending, and trailers close either direction (`send_trailers`).
+//!
+//! Flow control: a receiver's window is replenished as the application reads (a stream that is not
+//! read stalls its sender, not the connection: unread data of a stream that ends is given back at
+//! once); a sender waits (`send`'s deadline) for the peer's stream and connection windows.
+//!
+//! Protection (all limits are `Options`): the number of concurrent streams (`max_streams`, counted
+//! until the handler is done too, so resets cannot pile up work), header list size and the
+//! CONTINUATION run (a flood of it closes the connection), frame size, the rate of RST_STREAM
+//! (`max_resets` per 10 s: the "rapid reset" attack: GOAWAY ENHANCE_YOUR_CALM), SETTINGS and PING
+//! (answered in order through a bounded queue, so a flood slows the reader and nothing else), empty
+//! DATA frames, a peer that does not acknowledge SETTINGS or does not finish the preface in
+//! `settings_timeout`, and a peer that does not read (`write_timeout` on every write).
+//! Requests and responses are validated as RFC 9113 section 8 asks: pseudo-header order and presence,
+//! lowercase names, no connection-specific fields, `te: trailers` only, `content-length` against
+//! the DATA received; a malformed message resets its stream (PROTOCOL_ERROR).
+
+import std.bytes
+import std.chan
+import std.fd
+import std.net
+import std.stream
+import std.sync
+import std.task
+import std.time
+import http
+import http.h2frame
+import http.client
+import http.hpack
+import http.transport
+
+// ---- the connection's bytes ----
+
+/// The bytes under a connection. `read(max, dl)`: 1 to `max` bytes, empty at the end of the
+/// connection, `Err(TimedOut)` at the deadline; `write(data, dl)`: all of it or an error; `close()`:
+/// closes the connection (idempotent), which also ends a read that is waiting.
+pub type Wire = {
+    read: fn(usize, time.Deadline) -> Result[List[u8], stream.Error],
+    write: fn(List[u8], time.Deadline) -> Result[(), stream.Error],
+    close: fn(),
+}
+
+fn closed_err() -> stream.Error { stream.error(stream.BrokenPipe, "the connection is closed") }
+
+/// A wire over a transport (a socket, or a TLS session on one).
+pub fn wire_of_transport(t: transport.Transport) -> Wire uses net, io, clock {
+    let rd = |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
+        match t.read_by(max as i64, dl) {
+            Ok(Some(b)) => { Ok(b) }
+            Ok(None) => { Err(stream.error(stream.TimedOut, "timed out")) }
+            Err(e) => { Err(stream.error_text(stream.Other, e)) }
+        }
+    }
+    let wr = |data: List[u8], dl: time.Deadline| -> Result[(), stream.Error] {
+        if t.send_by(data, dl) { return Ok(()) }
+        Err(closed_err())
+    }
+    // a lingering close: our last frames (GOAWAY) reach the peer instead of being cut by a reset when it still sends
+    let cl = || -> () { t.linger_close(time.after_ms(1000)) }
+    Wire(rd, wr, cl)
+}
+
+/// A wire over the `http.Duplex` of an upgraded connection; `close` ends the connection (the
+/// server closes it when the handler's `run` returns, so a no-op is often right).
+pub fn wire_of_duplex(d: http.Duplex, close: fn()) -> Wire {
+    let rd = d.recv
+    let wr = d.send
+    Wire(rd, |data: List[u8], dl: time.Deadline| -> Result[(), stream.Error] { wr(data) }, close)
+}
+
+// ---- errors and options ----
+
+pub const ERR_TIMEOUT: i32 = 1
+/// the peer reset the stream (`code`), or the stream was reset locally
+pub const ERR_RESET: i32 = 2
+/// the connection ended (`code`: the error of a GOAWAY, or INTERNAL_ERROR for a lost connection)
+pub const ERR_CLOSED: i32 = 3
+/// a call that the state of the stream does not allow
+pub const ERR_STATE: i32 = 4
+/// what was passed is not a valid message
+pub const ERR_INVALID: i32 = 5
+
+/// What a stream or connection call fails with: a `kind` (the `ERR_` constants), the HTTP/2 error
+/// `code` that goes with it, and a message.
+pub type Error = { kind: i32, code: u32, why: String }
+
+fn err(kind: i32, code: u32, why: str) -> Error { Error(kind, code, String.from(why)) }
+
+impl Show for Error {
+    fn show(self, inout out: String) { out.append(self.why) }
+}
+
+/// The limits and timeouts of a connection.
+pub type Options = {
+    /// streams the peer may have open at once (our SETTINGS_MAX_CONCURRENT_STREAMS)
+    max_streams: u32,
+    /// the window of each stream we receive on, and of the connection
+    stream_window: u32,
+    conn_window: u32,
+    /// the largest frame we accept (16384 to 16777215)
+    max_frame: usize,
+    /// the largest header list we accept, in the RFC's accounting (name + value + 32 each)
+    max_header_list: usize,
+    /// the dynamic table we let the peer's encoder use
+    header_table: usize,
+    /// `h2.handler`: the longest request body buffered
+    max_body: usize,
+    /// the peer must send its SETTINGS and acknowledge ours within this
+    settings_timeout: time.Duration,
+    /// every write to the wire
+    write_timeout: time.Duration,
+    /// close a connection with no open stream after this long without a frame (0: never)
+    idle: time.Duration,
+    /// RST_STREAMs from the peer tolerated per 10 seconds
+    max_resets: u32,
+}
+
+/// 100 concurrent streams, 1 MiB stream windows and a 4 MiB connection window, 16 KiB frames, 64 KiB
+/// of headers, the default 4 KiB HPACK table, 1 MiB request bodies in `handler`, 10 s for SETTINGS and
+/// for every write, no idle limit, 400 resets per 10 s.
+pub fn options() -> Options {
+    Options(100, 1048576, 4194304, 16384, 65536, 4096, 1048576, time.seconds(10), time.seconds(10), time.zero(), 400)
+}
+
+// ---- the state of a connection and its streams ----
+
+/// One stream. `send_win` is what the peer allows us to send, `recv_win` what we allow it to send;
+/// `consumed` is what the application read and we have not yet given back as WINDOW_UPDATE.
+type Strm = {
+    id: u32,
+    in_done: bool,
+    out_done: bool,
+    reset: i64,
+    /// the reset came from the peer (frames after it are a STREAM_CLOSED error; after our own reset they are ignored)
+    reset_peer: bool,
+    send_win: i64,
+    recv_win: i64,
+    consumed: i64,
+    inq: List[u8],
+    inpos: usize,
+    head: Option[List[http.Header]],
+    trailers: Option[List[http.Header]],
+    clen: i64,
+    got: i64,
+    rw: List[sync.Parker],
+    ww: List[sync.Parker],
+    out_head: bool,
+    counted: bool,
+    released: bool,
+}
+
+fn new_strm(id: u32, send_win: i64, recv_win: i64) -> Strm {
+    Strm(id, false, false, -1, false, send_win, recv_win, 0, List.new(), 0, None, None, -1, 0, List.new(), List.new(), false, true, false)
+}
+
+fn is_done(s: Strm) -> bool { s.reset >= 0 || (s.in_done && s.out_done) }
+
+/// The connection: windows, the table of streams, what the peer told us in SETTINGS, GOAWAY state.
+type Core = {
+    streams: Map[u32, sync.Lock[Strm]],
+    send_win: i64,
+    recv_win: i64,
+    consumed: i64,
+    peer_win: i64,
+    peer_frame: usize,
+    peer_streams: i64,
+    next_id: u32,
+    last_peer: u32,
+    active: i64,
+    goaway_in: i64,
+    goaway_code: u32,
+    goaway_out: bool,
+    closed: bool,
+    why: String,
+    code: u32,
+    wwait: List[sync.Parker],
+    owait: List[sync.Parker],
+    ping_sent: List[u8],
+    ping_ack: bool,
+    ping_pk: List[sync.Parker],
+    resets: i64,
+    reset_from: i64,
+    got_settings: bool,
+    settings_acked: bool,
+    last_frame_ms: i64,
+}
+
+fn new_core(client: bool, opt: Options) -> Core {
+    Core(Map.new(), 65535, 65535, 0, 65535, 16384, 100, if client { 1 } else { 2 }, 0, 0, -1, 0, false, false, String.from(""), 0, List.new(), List.new(), List.new(), false, List.new(), 0, 0, false, false, 0)
+}
+
+/// A connection (a handle: copies share it).
+pub type Conn = {
+    core: sync.Lock[Core],
+    out: chan.Channel[List[u8]],
+    enc: sync.Lock[hpack.Encoder],
+    opt: Options,
+    client: bool,
+    wire: Wire,
+    /// stream ids whose handler task has finished (the reader joins them)
+    fin: chan.Channel[u32],
+}
+
+/// One stream of a connection (a handle). `rpk` and `wpk` are the wake-ups of its reader and writer.
+pub type Stream = { conn: Conn, id: u32, sl: sync.Lock[Strm], rpk: sync.Parker, wpk: sync.Parker }
+
+/// What serves one request stream (`serve`): called in a task of its own; the stream is released
+/// when it returns.
+pub type StreamHandler = fn(Stream)
+
+/// A layer around a stream handler (what `server.Config.h2_wrap` takes): it gets the handler that serves
+/// ordinary HTTP requests and returns the one the connection uses, so it can take some streams itself (gRPC
+/// takes those whose content-type is `application/grpc`) and pass the rest on.
+pub type Middleware = fn(StreamHandler) -> StreamHandler
+
+// ---- the writer, and failing a connection ----
+
+fn wake(ps: List[sync.Parker]) uses io {
+    for p in ps { p.unpark() }
+}
+
+/// Queues `frames` for the writer, in order. False when the connection is gone (or its queue does not
+/// drain within the write timeout, which fails it).
+fn emit(c: Conn, frames: List[List[u8]]) -> bool uses io, clock {
+    for f in frames {
+        match c.out.send(f, time.after(c.opt.write_timeout)) {
+            chan.Sent => {}
+            chan.Full(v) => {
+                fail_conn(c, h2frame.INTERNAL_ERROR, String.from("the write queue did not drain"))
+                return false
+            }
+            chan.Rejected(v) => { return false }
+        }
+    }
+    true
+}
+
+/// Ends the connection: marks it closed (the first reason is kept), wakes everything that waits, and
+/// closes the write queue; the writer drains it and then closes the wire.
+fn fail_conn(c: Conn, code: u32, why: String) uses io, clock {
+    let first = c.core.modify(|inout k: Core| -> bool {
+        if k.closed { return false }
+        k.closed = true
+        k.why = why.copy()
+        k.code = code
+        wake(k.wwait)
+        wake(k.owait)
+        wake(k.ping_pk)
+        for sl in k.streams.values() {
+            sl.modify(|inout s: Strm| -> () {
+                wake(s.rw)
+                wake(s.ww)
+            })
+        }
+        true
+    })
+    if first { c.out.close() }
+}
+
+/// Sends GOAWAY (`last` is the highest peer stream processed) and ends the connection.
+fn goaway_close(c: Conn, code: u32, why: String) uses io, clock {
+    let last = c.core.modify(|inout k: Core| -> u32 {
+        k.goaway_out = true
+        k.last_peer
+    })
+    let z = emit(c, List[h2frame.goaway(last, code, why.bytes())])
+    fail_conn(c, code, why)
+}
+
+fn writer(c: Conn) uses io, clock {
+    let mut dead = false
+    while true {
+        match c.out.recv(time.never()) {
+            chan.Value(first) => {
+                let mut buf = first.copy()
+                let mut more = true
+                while more && buf.len() < 65536 {
+                    match c.out.try_recv() {
+                        chan.Value(v) => { buf.extend(v) }
+                        chan.Empty => { more = false }
+                        chan.Closed => { more = false }
+                    }
+                }
+                if !dead {
+                    match c.wire.write(buf, time.after(c.opt.write_timeout)) {
+                        Ok(z) => {}
+                        Err(e) => {
+                            dead = true
+                            fail_conn(c, h2frame.INTERNAL_ERROR, msg_of("write failed: ", e.message))
+                        }
+                    }
+                }
+            }
+            chan.Empty => {}
+            chan.Closed => { break }
+        }
+    }
+    c.wire.close()
+}
+
+fn msg_of(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+// ---- windows, and settling a stream ----
+
+/// The application consumed `n` bytes of connection-level data: gives window back once half of it is owed.
+fn credit_conn(c: Conn, n: i64) uses io, clock {
+    if n <= 0 { return }
+    let half = (c.opt.conn_window as i64) / 2
+    let inc = c.core.modify(|inout k: Core| -> i64 {
+        k.consumed += n
+        if k.consumed >= half && !k.closed {
+            let v = k.consumed
+            k.consumed = 0
+            k.recv_win += v
+            return v
+        }
+        0
+    })
+    if inc > 0 {
+        let z = emit(c, List[h2frame.window_update(0, inc as u32)])
+    }
+}
+
+/// After anything that may have finished a stream: counts it out (waking whoever waits for a free
+/// slot), gives the connection window back for what was never read, and forgets it once the
+/// application let go of it too.
+fn settle(c: Conn, id: u32) uses io, clock {
+    let unread = c.core.modify(|inout k: Core| -> i64 {
+        match k.streams.get(id) {
+            Some(sl) => {
+                let st = sl.modify(|inout s: Strm| -> (bool, bool, bool, i64) {
+                    let d = is_done(s)
+                    // what nobody will read (a reset or released stream) goes back to the connection window
+                    let drop = (s.reset >= 0 || s.released) && s.inq.len() > s.inpos
+                    let lost = if drop { (s.inq.len() - s.inpos) as i64 } else { 0 }
+                    if drop {
+                        s.inq.clear()
+                        s.inpos = 0
+                    }
+                    let counted = s.counted
+                    if d { s.counted = false }
+                    (d, s.released, counted, lost)
+                })
+                let (d, rel, counted, lost) = st
+                if d && counted {
+                    k.active -= 1
+                    wake(k.owait)
+                }
+                if d && rel { k.streams.remove(id) }
+                lost
+            }
+            None => 0
+        }
+    })
+    credit_conn(c, unread)
+}
+
+fn reset_err(code: u32, local: bool) -> Error {
+    let mut m = String.from(if local { "the stream was reset (" } else { "the peer reset the stream (" })
+    m.append(h2frame.code_name(code))
+    m.push_str(")")
+    Error(ERR_RESET, code, m)
+}
+
+fn closed_conn_err(code: u32, why: String) -> Error { Error(ERR_CLOSED, code, why) }
+
+// ---- a stream's API ----
+
+type Poll = | Data(b: List[u8], wu: i64) | End | Pending | Failed(e: Error)
+
+type Gate = | Open(n: i64) | Block | Dead(e: Error)
+
+fn stream_failure(s: Strm) -> Option[Error] {
+    if s.reset >= 0 { return Some(reset_err(s.reset as u32, false)) }
+    None
+}
+
+fn conn_failure(c: Conn) -> Option[Error] {
+    c.core.modify(|inout k: Core| -> Option[Error] {
+        if k.closed { return Some(closed_conn_err(k.code, k.why.copy())) }
+        None
+    })
+}
+
+/// Why a stream that ended or was reset, or whose connection is gone, cannot be used.
+fn dead_reason(st: Stream) -> Error {
+    match conn_failure(st.conn) {
+        Some(e) => { e }
+        None => { err(ERR_STATE, h2frame.STREAM_CLOSED, "the stream is closed") }
+    }
+}
+
+impl Stream {
+    fn id(self) -> u32 { self.id }
+
+    /// Whether this stream's connection is a client.
+    fn is_client(self) -> bool { self.conn.client }
+
+    /// The initial header block (a server: the request's, with its pseudo-headers; a client: the
+    /// response's, with `:status`), waiting for it until `dl`.
+    fn headers(self, dl: time.Deadline) -> Result[List[http.Header], Error] uses io, clock {
+        while true {
+            let pk = self.rpk
+            let p = self.sl.modify(|inout s: Strm| -> Poll {
+                s.rw = sync.without(s.rw, pk)
+                match s.head {
+                    Some(h) => { return Data(List.new(), 0) }
+                    None => {}
+                }
+                match stream_failure(s) {
+                    Some(e) => { return Failed(e) }
+                    None => {}
+                }
+                if s.in_done { return End }
+                s.rw.push(pk)
+                Pending
+            })
+            match p {
+                Data(b, wu) => {
+                    return Ok(self.sl.modify(|inout s: Strm| -> List[http.Header] {
+                        match s.head {
+                            Some(h) => h.copy()
+                            None => List.new()
+                        }
+                    }))
+                }
+                End => { return Err(err(ERR_STATE, h2frame.PROTOCOL_ERROR, "the stream ended without headers")) }
+                Failed(e) => { return Err(e) }
+                Pending => {
+                    match conn_failure(self.conn) {
+                        Some(e) => { return Err(e) }
+                        None => {}
+                    }
+                    if !self.rpk.park(dl) {
+                        self.sl.modify(|inout s: Strm| -> () { s.rw = sync.without(s.rw, pk) })
+                        return Err(err(ERR_TIMEOUT, 0, "timed out waiting for headers"))
+                    }
+                }
+            }
+        }
+        Err(err(ERR_STATE, 0, "unreachable"))
+    }
+
+    /// The trailers, once the body has ended (None: there were none, or it has not ended).
+    fn trailers(self) -> Option[List[http.Header]] {
+        self.sl.modify(|inout s: Strm| -> Option[List[http.Header]] {
+            match s.trailers {
+                Some(t) => Some(t.copy())
+                None => None
+            }
+        })
+    }
+
+    /// 1 to `max` bytes of the body, waiting until `dl`; empty at its end (then `trailers()`).
+    /// Reading is what gives the peer more window.
+    fn read(self, max: usize, dl: time.Deadline) -> Result[List[u8], Error] uses io, clock {
+        if max == 0 { return Err(err(ERR_INVALID, 0, "read of 0 bytes")) }
+        let win = self.conn.opt.stream_window as i64
+        while true {
+            let pk = self.rpk
+            let p = self.sl.modify(|inout s: Strm| -> Poll {
+                s.rw = sync.without(s.rw, pk)
+                let avail = s.inq.len() - s.inpos
+                if avail > 0 {
+                    let n = if avail < max { avail } else { max }
+                    let out = s.inq.slice(s.inpos, s.inpos + n)
+                    s.inpos += n
+                    if s.inpos == s.inq.len() {
+                        s.inq.clear()
+                        s.inpos = 0
+                    }
+                    s.consumed += n as i64
+                    let mut wu: i64 = 0
+                    if !s.in_done && s.reset < 0 && s.consumed * 2 >= win {
+                        wu = s.consumed
+                        s.consumed = 0
+                        s.recv_win += wu
+                    }
+                    return Data(out, wu)
+                }
+                match stream_failure(s) {
+                    Some(e) => { return Failed(e) }
+                    None => {}
+                }
+                if s.in_done { return End }
+                s.rw.push(pk)
+                Pending
+            })
+            match p {
+                Data(b, wu) => {
+                    if wu > 0 {
+                        let z = emit(self.conn, List[h2frame.window_update(self.id, wu as u32)])
+                    }
+                    credit_conn(self.conn, b.len() as i64)
+                    return Ok(b)
+                }
+                End => {
+                    settle(self.conn, self.id)
+                    return Ok(List.new())
+                }
+                Failed(e) => { return Err(e) }
+                Pending => {
+                    match conn_failure(self.conn) {
+                        Some(e) => { return Err(e) }
+                        None => {}
+                    }
+                    if !self.rpk.park(dl) {
+                        self.sl.modify(|inout s: Strm| -> () { s.rw = sync.without(s.rw, pk) })
+                        return Err(err(ERR_TIMEOUT, 0, "timed out reading"))
+                    }
+                }
+            }
+        }
+        Err(err(ERR_STATE, 0, "unreachable"))
+    }
+
+    /// Sends a header block: a server's response head (`:status` first), or a client's request head
+    /// is sent by `Conn.open`. `end` ends the stream (no body). Informational (1xx) heads may precede
+    /// the final one.
+    fn send_headers(self, hs: List[http.Header], end: bool) -> Result[(), Error] uses io, clock {
+        if self.conn.client { return Err(err(ERR_STATE, 0, "a client sends its head with Conn.open")) }
+        match check_response_head(hs) {
+            Ok(informational) => {
+                let id = self.id
+                let c = self.conn
+                let gate = self.sl.modify(|inout s: Strm| -> Option[Error] {
+                    match stream_failure(s) {
+                        Some(e) => { return Some(e) }
+                        None => {}
+                    }
+                    if s.out_done { return Some(err(ERR_STATE, h2frame.STREAM_CLOSED, "the response is already complete")) }
+                    if informational {
+                        if end || s.out_head { return Some(err(ERR_STATE, 0, "an informational head cannot end the stream")) }
+                    } else {
+                        if s.out_head { return Some(err(ERR_STATE, 0, "the response head was already sent")) }
+                        s.out_head = true
+                        if end { s.out_done = true }
+                    }
+                    None
+                })
+                match gate {
+                    Some(e) => { return Err(e) }
+                    None => {}
+                }
+                let r = send_block(c, id, hs, end)
+                settle(c, id)
+                r
+            }
+            Err(why) => { Err(Error(ERR_INVALID, 0, why)) }
+        }
+    }
+
+    /// Sends `data` (flow controlled: it waits, until `dl`, for the peer's stream and connection
+    /// windows), and `end` ends the stream after it. The head must have been sent.
+    fn send(self, data: List[u8], end: bool, dl: time.Deadline) -> Result[(), Error] uses io, clock {
+        let c = self.conn
+        let id = self.id
+        let wpk = self.wpk
+        if data.len() == 0 {
+            if end { return self.finish() }
+            return Ok(())
+        }
+        let mut off: usize = 0
+        while off < data.len() {
+            let frame_max = c.core.modify(|inout k: Core| -> usize { k.peer_frame })
+            let want = if data.len() - off < frame_max { data.len() - off } else { frame_max }
+            // the stream's window first
+            let g1 = self.sl.modify(|inout s: Strm| -> Gate {
+                s.ww = sync.without(s.ww, wpk)
+                match stream_failure(s) {
+                    Some(e) => { return Dead(e) }
+                    None => {}
+                }
+                if s.out_done { return Dead(err(ERR_STATE, h2frame.STREAM_CLOSED, "the stream is closed for sending")) }
+                if !s.out_head { return Dead(err(ERR_STATE, 0, "the head has not been sent")) }
+                if s.send_win <= 0 {
+                    s.ww.push(wpk)
+                    return Block
+                }
+                let n = if (want as i64) < s.send_win { want as i64 } else { s.send_win }
+                s.send_win -= n
+                Open(n)
+            })
+            match g1 {
+                Dead(e) => { return Err(e) }
+                Block => {
+                    match conn_failure(c) {
+                        Some(e) => { return Err(e) }
+                        None => {}
+                    }
+                    if !wpk.park(dl) {
+                        self.sl.modify(|inout s: Strm| -> () { s.ww = sync.without(s.ww, wpk) })
+                        return Err(err(ERR_TIMEOUT, 0, "timed out waiting for the stream's flow-control window"))
+                    }
+                }
+                Open(n) => {
+                    // then the connection's
+                    let g2 = c.core.modify(|inout k: Core| -> Gate {
+                        k.wwait = sync.without(k.wwait, wpk)
+                        if k.closed { return Dead(closed_conn_err(k.code, k.why.copy())) }
+                        if k.send_win <= 0 {
+                            k.wwait.push(wpk)
+                            return Block
+                        }
+                        let m = if n < k.send_win { n } else { k.send_win }
+                        k.send_win -= m
+                        Open(m)
+                    })
+                    let mut m: i64 = 0
+                    match g2 {
+                        Dead(e) => { return Err(e) }
+                        Block => {}
+                        Open(x) => { m = x }
+                    }
+                    if m < n {
+                        // give back what the connection could not carry
+                        self.sl.modify(|inout s: Strm| -> () { s.send_win += n - m })
+                    }
+                    if m == 0 {
+                        if !wpk.park(dl) {
+                            c.core.modify(|inout k: Core| -> () { k.wwait = sync.without(k.wwait, wpk) })
+                            return Err(err(ERR_TIMEOUT, 0, "timed out waiting for the connection's flow-control window"))
+                        }
+                    } else {
+                        let last = end && off + (m as usize) == data.len()
+                        if last {
+                            self.sl.modify(|inout s: Strm| -> () { s.out_done = true })
+                        }
+                        let piece = data.slice(off, off + (m as usize))
+                        if !emit(c, List[h2frame.data(id, piece, last)]) { return Err(dead_reason(self)) }
+                        off += m as usize
+                        if last { settle(c, id) }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the stream's sending side with an empty DATA frame.
+    fn finish(self) -> Result[(), Error] uses io, clock {
+        let c = self.conn
+        let gate = self.sl.modify(|inout s: Strm| -> Option[Error] {
+            match stream_failure(s) {
+                Some(e) => { return Some(e) }
+                None => {}
+            }
+            if s.out_done { return None }
+            if !s.out_head { return Some(err(ERR_STATE, 0, "the head has not been sent")) }
+            s.out_done = true
+            None
+        })
+        match gate {
+            Some(e) => { return Err(e) }
+            None => {}
+        }
+        if !emit(c, List[h2frame.data(self.id, List.new(), true)]) { return Err(dead_reason(self)) }
+        settle(c, self.id)
+        Ok(())
+    }
+
+    /// Ends the stream's sending side with trailers (HEADERS with END_STREAM): no pseudo-headers.
+    fn send_trailers(self, hs: List[http.Header]) -> Result[(), Error] uses io, clock {
+        let c = self.conn
+        for h in hs {
+            if h.name.len() == 0 || h.name[0] == 58 { return Err(err(ERR_INVALID, 0, "a trailer cannot be a pseudo-header")) }
+        }
+        match check_fields(hs, 2) {
+            Ok(z) => {}
+            Err(why) => { return Err(Error(ERR_INVALID, 0, why)) }
+        }
+        let gate = self.sl.modify(|inout s: Strm| -> Option[Error] {
+            match stream_failure(s) {
+                Some(e) => { return Some(e) }
+                None => {}
+            }
+            if s.out_done { return Some(err(ERR_STATE, h2frame.STREAM_CLOSED, "the stream is closed for sending")) }
+            if !s.out_head { return Some(err(ERR_STATE, 0, "the head has not been sent")) }
+            s.out_done = true
+            None
+        })
+        match gate {
+            Some(e) => { return Err(e) }
+            None => {}
+        }
+        let r = send_block(c, self.id, hs, true)
+        settle(c, self.id)
+        r
+    }
+
+    /// Resets the stream with `code` (RST_STREAM): both directions end; waiting calls fail.
+    fn reset(self, code: u32) uses io, clock {
+        let c = self.conn
+        let sent = self.sl.modify(|inout s: Strm| -> bool {
+            if s.reset >= 0 { return false }
+            if s.in_done && s.out_done { return false }
+            s.reset = code as i64
+            wake(s.rw)
+            wake(s.ww)
+            true
+        })
+        if sent {
+            let z = emit(c, List[h2frame.rst_stream(self.id, code)])
+        }
+        settle(c, self.id)
+    }
+
+    /// The application is done with the stream: what is unfinished is reset (a response that was
+    /// not completed: INTERNAL_ERROR; a request body nobody will read once the response is complete:
+    /// NO_ERROR; a client's unfinished request: CANCEL), and the stream is forgotten when it is over.
+    fn release(self) uses io, clock {
+        let client = self.conn.client
+        let code = self.sl.modify(|inout s: Strm| -> i64 {
+            s.released = true
+            if s.reset >= 0 || (s.in_done && s.out_done) { return -1 }
+            if client { return h2frame.CANCEL as i64 }
+            if !s.out_done { return h2frame.INTERNAL_ERROR as i64 }
+            h2frame.NO_ERROR as i64
+        })
+        if code >= 0 { self.reset(code as u32) } else { settle(self.conn, self.id) }
+        self.rpk.close()
+        self.wpk.close()
+    }
+}
+
+/// Encodes `hs` and queues it as one run of HEADERS and CONTINUATION frames. The encoder's lock is
+/// held across both, so header blocks reach the wire in the order they were compressed.
+fn send_block(c: Conn, id: u32, hs: List[http.Header], end: bool) -> Result[(), Error] uses io, clock {
+    let max = c.core.modify(|inout k: Core| -> usize { k.peer_frame })
+    let ok = c.enc.modify(|inout e: hpack.Encoder| -> bool {
+        let mut blk: List[u8] = List.new()
+        e.encode(hs, inout blk)
+        emit(c, List[h2frame.headers(id, blk, end, max)])
+    })
+    if ok { return Ok(()) }
+    match conn_failure(c) {
+        Some(e) => { Err(e) }
+        None => { Err(err(ERR_CLOSED, h2frame.INTERNAL_ERROR, "the connection is closed")) }
+    }
+}
+
+// ---- message validation (RFC 9113 section 8) ----
+
+fn conn_specific(n: List[u8]) -> bool {
+    http.eq_s(n, "connection") || http.eq_s(n, "keep-alive") || http.eq_s(n, "proxy-connection") || http.eq_s(n, "transfer-encoding") || http.eq_s(n, "upgrade")
+}
+
+fn pseudo_ok(n: List[u8], kind: i32) -> bool {
+    if kind == 0 { return http.eq_s(n, ":method") || http.eq_s(n, ":scheme") || http.eq_s(n, ":path") || http.eq_s(n, ":authority") || http.eq_s(n, ":protocol") }
+    if kind == 1 { return http.eq_s(n, ":status") }
+    false
+}
+
+/// A header list as HTTP/2 allows it: `kind` 0 a request, 1 a response, 2 trailers. Pseudo-headers
+/// come first, once each, and only the ones that kind has; names are lowercase tokens; no
+/// connection-specific fields; `te` only says `trailers`; values have no NUL, CR or LF and no leading
+/// or trailing whitespace; a request has :method, :scheme and a non-empty :path (a CONNECT only :method
+/// and :authority); a response has :status of three digits.
+fn check_fields(hs: List[http.Header], kind: i32) -> Result[(), String] {
+    let mut regular = false
+    let mut seen: List[List[u8]] = List.new()
+    for f in hs {
+        let n = f.name
+        if n.len() == 0 { return Err(String.from("an empty field name")) }
+        for ch in n {
+            if ch >= 65 && ch <= 90 { return Err(String.from("an uppercase field name")) }
+        }
+        if n[0] == 58 {
+            if regular { return Err(String.from("a pseudo-header after a regular field")) }
+            if !pseudo_ok(n, kind) { return Err(String.from("a pseudo-header that does not belong here")) }
+            for s in seen {
+                if bytes.eq(s, n) { return Err(String.from("a repeated pseudo-header")) }
+            }
+            seen.push(n)
+        } else {
+            regular = true
+            if !http.is_token(n) { return Err(String.from("a bad field name")) }
+            if conn_specific(n) { return Err(String.from("a connection-specific field")) }
+            if http.eq_s(n, "te") && !http.eq_s(f.value, "trailers") { return Err(String.from("te may only be trailers")) }
+        }
+        if !http.valid_value(f.value) { return Err(String.from("a bad field value")) }
+        if f.value.len() > 0 {
+            let a = f.value[0]
+            let z = f.value[f.value.len() - 1]
+            if a == 32 || a == 9 || z == 32 || z == 9 { return Err(String.from("a field value with surrounding whitespace")) }
+        }
+    }
+    if kind == 0 {
+        let method = http.find_s(hs, ":method")
+        let m = match method {
+            Some(v) => v
+            None => { return Err(String.from("a request without :method")) }
+        }
+        if http.eq_s(m, "CONNECT") {
+            if http.find_s(hs, ":authority").is_none() { return Err(String.from("CONNECT without :authority")) }
+            if http.find_s(hs, ":path").is_some() || http.find_s(hs, ":scheme").is_some() { return Err(String.from("CONNECT with :path or :scheme")) }
+        } else {
+            if http.find_s(hs, ":scheme").is_none() { return Err(String.from("a request without :scheme")) }
+            match http.find_s(hs, ":path") {
+                Some(p) => { if p.len() == 0 { return Err(String.from("an empty :path")) } }
+                None => { return Err(String.from("a request without :path")) }
+            }
+        }
+    }
+    if kind == 1 {
+        match http.find_s(hs, ":status") {
+            Some(v) => {
+                if v.len() != 3 { return Err(String.from("a bad :status")) }
+                for ch in v {
+                    if ch < 48 || ch > 57 { return Err(String.from("a bad :status")) }
+                }
+            }
+            None => { return Err(String.from("a response without :status")) }
+        }
+    }
+    Ok(())
+}
+
+/// A response head to send: valid, `:status` first; true when it is informational (1xx).
+fn check_response_head(hs: List[http.Header]) -> Result[bool, String] {
+    check_fields(hs, 1)?
+    if hs.len() == 0 || !http.eq_s(hs[0].name, ":status") { return Err(String.from(":status must be the first field")) }
+    let v = hs[0].value
+    let n = ((v[0] - 48) as i32) * 100 + ((v[1] - 48) as i32) * 10 + ((v[2] - 48) as i32)
+    Ok(n < 200)
+}
+
+/// The Content-Length of a message (-1: none); an error when they disagree or are not numbers.
+fn content_length(hs: List[http.Header]) -> Result[i64, String] {
+    let mut out: i64 = -1
+    for f in hs {
+        if http.eq_s(f.name, "content-length") {
+            if f.value.len() == 0 || f.value.len() > 18 { return Err(String.from("a bad content-length")) }
+            let mut n: i64 = 0
+            for ch in f.value {
+                if ch < 48 || ch > 57 { return Err(String.from("a bad content-length")) }
+                n = n * 10 + ((ch - 48) as i64)
+            }
+            if out >= 0 && out != n { return Err(String.from("conflicting content-length fields")) }
+            out = n
+        }
+    }
+    Ok(out)
+}
+
+fn status_of(hs: List[http.Header]) -> i32 {
+    match http.find_s(hs, ":status") {
+        Some(v) => {
+            if v.len() != 3 { return 0 }
+            ((v[0] - 48) as i32) * 100 + ((v[1] - 48) as i32) * 10 + ((v[2] - 48) as i32)
+        }
+        None => 0
+    }
+}
+
+// ---- the reader: frames in ----
+
+type Rd = {
+    fd: h2frame.Decoder,
+    dec: hpack.Decoder,
+    hb: List[u8],
+    hb_id: u32,
+    hb_end: bool,
+    hb_on: bool,
+    empty: i64,
+    ctl: i64,
+    ctl_from: i64,
+    settings: bool,
+    /// the handler tasks of this connection, by stream id: a task handle joins when its last copy goes,
+    /// so they are kept here (not in the shared connection) until they have finished
+    tasks: Map[u32, Task[i32]],
+}
+
+fn fatal(code: u32, why: str) -> Error { Error(ERR_CLOSED, code, String.from(why)) }
+
+/// RST_STREAM `code` for a stream, and the stream (when we have it) marked reset.
+fn stream_error(c: Conn, id: u32, code: u32) uses io, clock {
+    let found = c.core.modify(|inout k: Core| -> Option[sync.Lock[Strm]] { k.streams.get(id) })
+    match found {
+        Some(sl) => {
+            let sent = sl.modify(|inout s: Strm| -> bool {
+                if s.reset >= 0 { return false }
+                s.reset = code as i64
+                wake(s.rw)
+                wake(s.ww)
+                true
+            })
+            if !sent { return }
+        }
+        None => {}
+    }
+    let z = emit(c, List[h2frame.rst_stream(id, code)])
+    settle(c, id)
+}
+
+fn on_settings(c: Conn, f: h2frame.Frame) -> Result[(), Error] uses io, clock {
+    if (f.flags & h2frame.ACK) != 0 {
+        c.core.modify(|inout k: Core| -> () { k.settings_acked = true })
+        return Ok(())
+    }
+    let entries = h2frame.parse_settings(f.payload)
+    let bad = c.core.modify(|inout k: Core| -> Option[Error] {
+        for e in entries {
+            if e.id == h2frame.INITIAL_WINDOW_SIZE {
+                if e.value > 2147483647 { return Some(fatal(h2frame.FLOW_CONTROL_ERROR, "SETTINGS_INITIAL_WINDOW_SIZE is over 2^31-1")) }
+                let delta = (e.value as i64) - k.peer_win
+                k.peer_win = e.value as i64
+                let mut overflow = false
+                for sl in k.streams.values() {
+                    let o = sl.modify(|inout s: Strm| -> bool {
+                        s.send_win += delta
+                        if s.send_win > h2frame.MAX_WINDOW { return true }
+                        if delta > 0 { wake(s.ww) }
+                        false
+                    })
+                    if o { overflow = true }
+                }
+                if overflow { return Some(fatal(h2frame.FLOW_CONTROL_ERROR, "a stream window went over 2^31-1")) }
+            } else if e.id == h2frame.MAX_FRAME_SIZE {
+                if e.value < 16384 || e.value > 16777215 { return Some(fatal(h2frame.PROTOCOL_ERROR, "SETTINGS_MAX_FRAME_SIZE is out of range")) }
+                k.peer_frame = e.value as usize
+            } else if e.id == h2frame.ENABLE_PUSH {
+                if e.value > 1 { return Some(fatal(h2frame.PROTOCOL_ERROR, "SETTINGS_ENABLE_PUSH is not 0 or 1")) }
+            } else if e.id == h2frame.MAX_CONCURRENT_STREAMS {
+                k.peer_streams = e.value as i64
+                wake(k.owait)
+            }
+        }
+        wake(k.wwait)
+        None
+    })
+    match bad {
+        Some(e) => { return Err(e) }
+        None => {}
+    }
+    for e in entries {
+        if e.id == h2frame.HEADER_TABLE_SIZE {
+            let n = e.value as usize
+            c.enc.modify(|inout en: hpack.Encoder| -> () { en.set_limit(n) })
+        }
+    }
+    if !emit(c, List[h2frame.settings_ack()]) { return Err(fatal(h2frame.INTERNAL_ERROR, "the connection is closed")) }
+    Ok(())
+}
+
+fn on_ping(c: Conn, f: h2frame.Frame) -> Result[(), Error] uses io, clock {
+    if (f.flags & h2frame.ACK) != 0 {
+        let pl = f.payload
+        c.core.modify(|inout k: Core| -> () {
+            if bytes.eq(k.ping_sent, pl) {
+                k.ping_ack = true
+                wake(k.ping_pk)
+            }
+        })
+        return Ok(())
+    }
+    if !emit(c, List[h2frame.ping(f.payload, true)]) { return Err(fatal(h2frame.INTERNAL_ERROR, "the connection is closed")) }
+    Ok(())
+}
+
+fn on_goaway(c: Conn, f: h2frame.Frame) -> Result[(), Error] uses io, clock {
+    let (last, code) = h2frame.parse_goaway(f.payload)
+    let refused = c.core.modify(|inout k: Core| -> List[u32] {
+        k.goaway_in = last as i64
+        k.goaway_code = code
+        wake(k.owait)
+        let mut out: List[u32] = List.new()
+        // streams the peer will not process (ours above `last`) fail at once
+        for id in k.streams.keys() {
+            if c.client && id > last { out.push(id) }
+        }
+        out
+    })
+    for id in refused { stream_error(c, id, h2frame.REFUSED_STREAM) }
+    Ok(())
+}
+
+fn is_idle(k: Core, id: u32, client: bool) -> bool {
+    if client { return id >= k.next_id || id % 2 == 0 }
+    id > k.last_peer || id % 2 == 0
+}
+
+fn on_window_update(c: Conn, f: h2frame.Frame) -> Result[(), Error] uses io, clock {
+    let inc = (h2frame.u32_of(f.payload, 0) & 2147483647) as i64
+    if f.stream == 0 {
+        if inc == 0 { return Err(fatal(h2frame.PROTOCOL_ERROR, "a WINDOW_UPDATE of 0")) }
+        let ok = c.core.modify(|inout k: Core| -> bool {
+            k.send_win += inc
+            if k.send_win > h2frame.MAX_WINDOW { return false }
+            wake(k.wwait)
+            true
+        })
+        if !ok { return Err(fatal(h2frame.FLOW_CONTROL_ERROR, "the connection window went over 2^31-1")) }
+        return Ok(())
+    }
+    let id = f.stream
+    let found = c.core.modify(|inout k: Core| -> Option[sync.Lock[Strm]] {
+        match k.streams.get(id) {
+            Some(sl) => { Some(sl) }
+            None => { None }
+        }
+    })
+    match found {
+        Some(sl) => {
+            if inc == 0 {
+                stream_error(c, id, h2frame.PROTOCOL_ERROR)
+                return Ok(())
+            }
+            let over = sl.modify(|inout s: Strm| -> bool {
+                s.send_win += inc
+                if s.send_win > h2frame.MAX_WINDOW { return true }
+                wake(s.ww)
+                false
+            })
+            if over { stream_error(c, id, h2frame.FLOW_CONTROL_ERROR) }
+        }
+        None => {
+            let idle = c.core.modify(|inout k: Core| -> bool { is_idle(k, id, c.client) })
+            if idle { return Err(fatal(h2frame.PROTOCOL_ERROR, "WINDOW_UPDATE on an idle stream")) }
+        }
+    }
+    Ok(())
+}
+
+fn on_rst(c: Conn, f: h2frame.Frame) -> Result[(), Error] uses io, clock {
+    let id = f.stream
+    let code = h2frame.u32_of(f.payload, 0)
+    let now = time.mono_ms()
+    let max = c.opt.max_resets as i64
+    // 0 fine, 1 the stream was never opened, 2 too many resets lately (the "rapid reset" attack)
+    let v = c.core.modify(|inout k: Core| -> i32 {
+        if is_idle(k, id, c.client) { return 1 }
+        if now - k.reset_from > 10000 {
+            k.reset_from = now
+            k.resets = 0
+        }
+        k.resets += 1
+        if k.resets > max { return 2 }
+        0
+    })
+    if v == 1 { return Err(fatal(h2frame.PROTOCOL_ERROR, "RST_STREAM on an idle stream")) }
+    if v == 2 { return Err(fatal(h2frame.ENHANCE_YOUR_CALM, "too many RST_STREAM frames")) }
+    let found = c.core.modify(|inout k: Core| -> Option[sync.Lock[Strm]] { k.streams.get(id) })
+    match found {
+        Some(sl) => {
+            sl.modify(|inout s: Strm| -> () {
+                if s.reset < 0 {
+                    s.reset = code as i64
+                    s.reset_peer = true
+                }
+                wake(s.rw)
+                wake(s.ww)
+            })
+            settle(c, id)
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn on_data(c: Conn, f: h2frame.Frame) -> Result[(), Error] uses io, clock {
+    let id = f.stream
+    let n = (f.payload.len() + f.padded) as i64
+    let end = (f.flags & h2frame.END_STREAM) != 0
+    // the connection window is spent whatever becomes of the data
+    let st = c.core.modify(|inout k: Core| -> i32 {
+        if n > k.recv_win { return 1 }
+        k.recv_win -= n
+        if is_idle(k, id, c.client) { return 2 }
+        0
+    })
+    if st == 1 { return Err(fatal(h2frame.FLOW_CONTROL_ERROR, "DATA over the connection window")) }
+    if st == 2 { return Err(fatal(h2frame.PROTOCOL_ERROR, "DATA on an idle stream")) }
+    let found = c.core.modify(|inout k: Core| -> Option[sync.Lock[Strm]] { k.streams.get(id) })
+    match found {
+        None => {
+            // a closed stream: the data is dropped, its window given back
+            credit_conn(c, n)
+            stream_error(c, id, h2frame.STREAM_CLOSED)
+        }
+        Some(sl) => {
+            let payload = f.payload
+            let padded = f.padded as i64
+            let code = sl.modify(|inout s: Strm| -> i64 {
+                if s.reset >= 0 { return if s.reset_peer { -3 } else { -2 } }
+                if s.in_done { return h2frame.STREAM_CLOSED as i64 }
+                if s.head.is_none() { return h2frame.PROTOCOL_ERROR as i64 }
+                if n > s.recv_win { return h2frame.FLOW_CONTROL_ERROR as i64 }
+                s.recv_win -= n
+                s.got += payload.len() as i64
+                if s.clen >= 0 && s.got > s.clen { return h2frame.PROTOCOL_ERROR as i64 }
+                if end {
+                    s.in_done = true
+                    if s.clen >= 0 && s.got != s.clen { return h2frame.PROTOCOL_ERROR as i64 }
+                }
+                if payload.len() > 0 { s.inq.extend(payload) }
+                // padding is never read: its window goes back at once
+                s.consumed += padded
+                wake(s.rw)
+                -1
+            })
+            if code == -2 {
+                credit_conn(c, n)
+            } else if code == -3 {
+                // data after the peer's own RST_STREAM: STREAM_CLOSED (RFC 9113 section 5.1, "closed")
+                credit_conn(c, n)
+                let z = emit(c, List[h2frame.rst_stream(id, h2frame.STREAM_CLOSED)])
+            } else if code >= 0 {
+                credit_conn(c, n)
+                stream_error(c, id, code as u32)
+            } else {
+                if padded > 0 { credit_conn(c, padded) }
+                if end { settle(c, id) }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---- header blocks ----
+
+type Fresh = | Skip | Refuse | Made(sl: sync.Lock[Strm]) | Bad(e: Error)
+
+fn on_headers(c: Conn, inout rd: Rd, f: h2frame.Frame, h: Option[StreamHandler]) -> Result[(), Error] uses io, clock, threads {
+    let end = (f.flags & h2frame.END_STREAM) != 0
+    if (f.flags & h2frame.END_HEADERS) != 0 {
+        return process_block(c, inout rd, f.stream, f.payload, end, h)
+    }
+    rd.hb = f.payload.copy()
+    rd.hb_id = f.stream
+    rd.hb_end = end
+    rd.hb_on = true
+    Ok(())
+}
+
+fn on_continuation(c: Conn, inout rd: Rd, f: h2frame.Frame, h: Option[StreamHandler]) -> Result[(), Error] uses io, clock, threads {
+    rd.hb.extend(f.payload)
+    if rd.hb.len() > c.opt.max_header_list * 2 { return Err(fatal(h2frame.ENHANCE_YOUR_CALM, "a header block is too large")) }
+    if (f.flags & h2frame.END_HEADERS) != 0 {
+        rd.hb_on = false
+        let block = rd.hb.copy()
+        rd.hb.clear()
+        return process_block(c, inout rd, rd.hb_id, block, rd.hb_end, h)
+    }
+    Ok(())
+}
+
+fn process_block(c: Conn, inout rd: Rd, id: u32, block: List[u8], end: bool, h: Option[StreamHandler]) -> Result[(), Error] uses io, clock, threads {
+    let dec = match rd.dec.decode(block, c.opt.max_header_list) {
+        Ok(d) => d
+        Err(e) => { return Err(Error(ERR_CLOSED, h2frame.COMPRESSION_ERROR, e)) }
+    }
+    let fields = dec.fields
+    let found = c.core.modify(|inout k: Core| -> Option[sync.Lock[Strm]] { k.streams.get(id) })
+    match found {
+        Some(sl) => {
+            // the head of a response (a client), or trailers
+            let verdict = sl.modify(|inout s: Strm| -> i64 {
+                if s.reset >= 0 { return if s.reset_peer { -3 } else { -2 } }
+                if s.in_done { return h2frame.STREAM_CLOSED as i64 }
+                if dec.too_large { return h2frame.ENHANCE_YOUR_CALM as i64 }
+                if s.head.is_none() {
+                    if !c.client { return h2frame.PROTOCOL_ERROR as i64 }
+                    match check_fields(fields, 1) {
+                        Ok(z) => {}
+                        Err(why) => { return h2frame.PROTOCOL_ERROR as i64 }
+                    }
+                    let st = status_of(fields)
+                    if st >= 100 && st < 200 {
+                        if end { return h2frame.PROTOCOL_ERROR as i64 }
+                        return -1
+                    }
+                    match content_length(fields) {
+                        Ok(n) => { s.clen = n }
+                        Err(why) => { return h2frame.PROTOCOL_ERROR as i64 }
+                    }
+                    s.head = Some(fields)
+                    if end {
+                        s.in_done = true
+                        if s.clen > 0 { return h2frame.PROTOCOL_ERROR as i64 }
+                    }
+                    wake(s.rw)
+                    return -1
+                }
+                // trailers
+                if !end { return h2frame.PROTOCOL_ERROR as i64 }
+                match check_fields(fields, 2) {
+                    Ok(z) => {}
+                    Err(why) => { return h2frame.PROTOCOL_ERROR as i64 }
+                }
+                if s.clen >= 0 && s.got != s.clen { return h2frame.PROTOCOL_ERROR as i64 }
+                s.trailers = Some(fields)
+                s.in_done = true
+                wake(s.rw)
+                -1
+            })
+            if verdict == -3 {
+                let z = emit(c, List[h2frame.rst_stream(id, h2frame.STREAM_CLOSED)])
+            }
+            if verdict >= 0 { stream_error(c, id, verdict as u32) }
+            if end { settle(c, id) }
+            Ok(())
+        }
+        None => {
+            if c.client {
+                let idle = c.core.modify(|inout k: Core| -> bool { is_idle(k, id, true) })
+                if idle { return Err(fatal(h2frame.PROTOCOL_ERROR, "HEADERS on a stream that was never opened")) }
+                return Ok(())
+            }
+            // a new request
+            let mut bad = dec.too_large
+            let mut clen: i64 = -1
+            if !bad {
+                match check_fields(fields, 0) {
+                    Ok(z) => {}
+                    Err(why) => { bad = true }
+                }
+            }
+            if !bad {
+                match content_length(fields) {
+                    Ok(n) => { clen = n }
+                    Err(why) => { bad = true }
+                }
+            }
+            if !bad && end && clen > 0 { bad = true }
+            let code: u32 = if dec.too_large { h2frame.ENHANCE_YOUR_CALM } else { h2frame.PROTOCOL_ERROR }
+            let win = c.opt.stream_window as i64
+            let max = c.opt.max_streams as i64
+            let made = c.core.modify(|inout k: Core| -> Fresh {
+                if id % 2 == 0 || id <= k.last_peer { return Bad(fatal(h2frame.PROTOCOL_ERROR, "a request stream id out of order")) }
+                k.last_peer = id
+                if k.goaway_out { return Skip }
+                if bad { return Refuse }
+                if k.active >= max { return Refuse }
+                let mut s = new_strm(id, k.peer_win, win)
+                s.head = Some(fields)
+                s.clen = clen
+                s.in_done = end
+                let sl = sync.lock(s)
+                k.streams.insert(id, sl)
+                k.active += 1
+                Made(sl)
+            })
+            match made {
+                Bad(e) => { return Err(e) }
+                Skip => { return Ok(()) }
+                Refuse => {
+                    let r = if bad { code } else { h2frame.REFUSED_STREAM }
+                    let z = emit(c, List[h2frame.rst_stream(id, r)])
+                    return Ok(())
+                }
+                Made(sl) => {
+                    let st = Stream(c, id, sl, sync.parker(), sync.parker())
+                    match h {
+                        Some(hf) => {
+                            let t = spawn(|| -> i32 {
+                                let r = task.catch(|| -> () { hf(st) })
+                                match r {
+                                    Ok(z) => {}
+                                    Err(why) => { st.reset(h2frame.INTERNAL_ERROR) }
+                                }
+                                st.release()
+                                let z = c.fin.try_send(id)
+                                0
+                            })
+                            rd.tasks.insert(id, t)
+                        }
+                        None => { st.release() }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---- the reader loop ----
+
+fn on_frame(c: Conn, inout rd: Rd, f: h2frame.Frame, h: Option[StreamHandler]) -> Result[(), Error] uses io, clock, threads {
+    if rd.hb_on && (f.kind != h2frame.CONTINUATION || f.stream != rd.hb_id) { return Err(fatal(h2frame.PROTOCOL_ERROR, "a header block was interrupted")) }
+    if !rd.hb_on && f.kind == h2frame.CONTINUATION { return Err(fatal(h2frame.PROTOCOL_ERROR, "CONTINUATION without HEADERS")) }
+    if !rd.settings {
+        if f.kind != h2frame.SETTINGS || (f.flags & h2frame.ACK) != 0 { return Err(fatal(h2frame.PROTOCOL_ERROR, "the connection must start with SETTINGS")) }
+        rd.settings = true
+        c.core.modify(|inout k: Core| -> () { k.got_settings = true })
+    }
+    if f.kind == h2frame.DATA {
+        if f.payload.len() == 0 && (f.flags & h2frame.END_STREAM) == 0 {
+            rd.empty += 1
+            if rd.empty > 1000 { return Err(fatal(h2frame.ENHANCE_YOUR_CALM, "too many empty DATA frames")) }
+        } else {
+            rd.empty = 0
+        }
+    }
+    if f.kind == h2frame.PING || f.kind == h2frame.SETTINGS || f.kind == h2frame.PRIORITY {
+        let now = time.mono_ms()
+        if now - rd.ctl_from > 10000 {
+            rd.ctl_from = now
+            rd.ctl = 0
+        }
+        rd.ctl += 1
+        if rd.ctl > 5000 { return Err(fatal(h2frame.ENHANCE_YOUR_CALM, "too many control frames")) }
+    }
+    if f.kind == h2frame.DATA { return on_data(c, f) }
+    if f.kind == h2frame.HEADERS { return on_headers(c, inout rd, f, h) }
+    if f.kind == h2frame.CONTINUATION { return on_continuation(c, inout rd, f, h) }
+    if f.kind == h2frame.SETTINGS { return on_settings(c, f) }
+    if f.kind == h2frame.PING { return on_ping(c, f) }
+    if f.kind == h2frame.GOAWAY { return on_goaway(c, f) }
+    if f.kind == h2frame.WINDOW_UPDATE { return on_window_update(c, f) }
+    if f.kind == h2frame.RST_STREAM { return on_rst(c, f) }
+    if f.kind == h2frame.PUSH_PROMISE { return Err(fatal(h2frame.PROTOCOL_ERROR, "PUSH_PROMISE with push disabled")) }
+    // PRIORITY and unknown frame types are ignored
+    Ok(())
+}
+
+fn read_preface(c: Conn) -> Result[(), Error] uses io, clock {
+    let want = h2frame.preface()
+    let dl = time.after(c.opt.settings_timeout)
+    let mut got: List[u8] = List.new()
+    while got.len() < want.len() {
+        match c.wire.read(want.len() - got.len(), dl) {
+            Ok(b) => {
+                if b.len() == 0 { return Err(fatal(h2frame.PROTOCOL_ERROR, "the connection closed before the preface")) }
+                got.extend(b)
+                for i in 0..got.len() {
+                    if got[i] != want[i] { return Err(fatal(h2frame.PROTOCOL_ERROR, "not an HTTP/2 connection preface")) }
+                }
+            }
+            Err(e) => { return Err(fatal(h2frame.SETTINGS_TIMEOUT, "no connection preface")) }
+        }
+    }
+    Ok(())
+}
+
+/// Joins the handler tasks that have finished (they said so on `fin`).
+fn reap(c: Conn, inout rd: Rd) uses io {
+    let mut more = true
+    while more {
+        match c.fin.try_recv() {
+            chan.Value(id) => { rd.tasks.remove(id) }
+            chan.Empty => { more = false }
+            chan.Closed => { more = false }
+        }
+    }
+}
+
+fn reader(c: Conn, h: Option[StreamHandler], stop: fn() -> bool) -> Map[u32, Task[i32]] uses io, clock, threads {
+    if !c.client {
+        match read_preface(c) {
+            Ok(z) => {}
+            Err(e) => {
+                goaway_close(c, e.code, e.why)
+                return Map.new()
+            }
+        }
+    }
+    let start = time.mono_ms()
+    let mut rd = Rd(h2frame.decoder(c.opt.max_frame), hpack.decoder(c.opt.header_table), List.new(), 0, false, false, 0, 0, start, false, Map.new())
+    let ack_by = start + c.opt.settings_timeout.ns / 1000000
+    c.core.modify(|inout k: Core| -> () { k.last_frame_ms = start })
+    let mut draining = false
+    while true {
+        reap(c, inout rd)
+        let ended = c.core.modify(|inout k: Core| -> bool { k.closed })
+        if ended { break }
+        if stop() {
+            // the server is stopping: no new streams, and the connection ends when the open ones are done
+            if !draining {
+                draining = true
+                c.shutdown()
+            }
+            if c.open_streams() == 0 {
+                fail_conn(c, h2frame.NO_ERROR, String.from("the server is stopping"))
+                break
+            }
+        }
+        match c.wire.read(65536, time.after_ms(200)) {
+            Ok(b) => {
+                if b.len() == 0 {
+                    fail_conn(c, h2frame.NO_ERROR, String.from("the peer closed the connection"))
+                    break
+                }
+                let now = time.mono_ms()
+                c.core.modify(|inout k: Core| -> () { k.last_frame_ms = now })
+                rd.fd.feed(b)
+                let mut more = true
+                while more {
+                    match rd.fd.next() {
+                        h2frame.NeedMore => { more = false }
+                        h2frame.Fail(code, why) => {
+                            goaway_close(c, code, why)
+                            return rd.tasks
+                        }
+                        h2frame.Got(f) => {
+                            match on_frame(c, inout rd, f, h) {
+                                Ok(z) => {}
+                                Err(e) => {
+                                    goaway_close(c, e.code, e.why)
+                                    return rd.tasks
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind == stream.TimedOut {
+                    let now = time.mono_ms()
+                    let verdict = c.core.modify(|inout k: Core| -> u32 {
+                        if !k.got_settings && now > ack_by { return h2frame.SETTINGS_TIMEOUT }
+                        if !k.settings_acked && now > ack_by { return h2frame.SETTINGS_TIMEOUT }
+                        let idle_ms = c.opt.idle.ns / 1000000
+                        if idle_ms > 0 && k.active == 0 && now - k.last_frame_ms > idle_ms { return 100 }
+                        0
+                    })
+                    if verdict == 100 {
+                        goaway_close(c, h2frame.NO_ERROR, String.from("idle"))
+                        return rd.tasks
+                    }
+                    if verdict != 0 {
+                        goaway_close(c, verdict, String.from("the peer did not complete the SETTINGS exchange"))
+                        return rd.tasks
+                    }
+                } else {
+                    fail_conn(c, h2frame.INTERNAL_ERROR, msg_of("read failed: ", e.message))
+                    break
+                }
+            }
+        }
+    }
+    rd.tasks
+}
+
+// ---- a connection: starting, serving, connecting, closing ----
+
+fn new_conn(w: Wire, opt: Options, client: bool) -> Conn {
+    let out: chan.Channel[List[u8]] = chan.bounded(256)
+    let mut core = new_core(client, opt)
+    core.recv_win = opt.conn_window as i64
+    let fin: chan.Channel[u32] = chan.unbounded()
+    Conn(sync.lock(core), out, sync.lock(hpack.encoder(hpack.DEFAULT_TABLE)), opt, client, w, fin)
+}
+
+/// Our SETTINGS, and the window update that raises the connection window to `conn_window`.
+fn first_frames(opt: Options, client: bool) -> List[List[u8]] {
+    let mut s: List[h2frame.Setting] = List.new()
+    if opt.header_table != 4096 { s.push(h2frame.Setting(h2frame.HEADER_TABLE_SIZE, opt.header_table as u32)) }
+    if client { s.push(h2frame.Setting(h2frame.ENABLE_PUSH, 0)) }
+    s.push(h2frame.Setting(h2frame.MAX_CONCURRENT_STREAMS, opt.max_streams))
+    s.push(h2frame.Setting(h2frame.INITIAL_WINDOW_SIZE, opt.stream_window))
+    if opt.max_frame != 16384 { s.push(h2frame.Setting(h2frame.MAX_FRAME_SIZE, opt.max_frame as u32)) }
+    s.push(h2frame.Setting(h2frame.MAX_HEADER_LIST_SIZE, opt.max_header_list as u32))
+    let mut out: List[List[u8]] = List.new()
+    if client { out.push(h2frame.preface()) }
+    out.push(h2frame.settings(s))
+    if (opt.conn_window as i64) > 65535 { out.push(h2frame.window_update(0, ((opt.conn_window as i64) - 65535) as u32)) }
+    out
+}
+
+/// Serves HTTP/2 on `w` as the server until the connection ends: every request stream runs `h` in a
+/// task of its own. Returns when the connection is closed and its streams are done (or after 10 s of
+/// handlers that do not return).
+pub fn serve(w: Wire, opt: Options, h: StreamHandler) -> Result[(), Error] uses io, clock, threads {
+    serve_until(w, opt, h, || -> bool { false })
+}
+
+/// `serve`, ending gracefully (GOAWAY, then the connection closes once its streams are done) when
+/// `stop()` turns true; it is asked every 200 ms or so.
+pub fn serve_until(w: Wire, opt: Options, h: StreamHandler, stop: fn() -> bool) -> Result[(), Error] uses io, clock, threads {
+    let c = new_conn(w, opt, false)
+    let wt = spawn(|| -> i32 {
+        writer(c)
+        0
+    })
+    let z = emit(c, first_frames(opt, false))
+    let tasks = reader(c, Some(h), stop)
+    fail_conn(c, h2frame.NO_ERROR, String.from("done"))
+    drain(c)
+    for t in tasks.values() { let zt = t.join() }
+    let z2 = wt.join()
+    match c.core.modify(|inout k: Core| -> Option[Error] {
+        if k.code != h2frame.NO_ERROR { return Some(closed_conn_err(k.code, k.why.copy())) }
+        None
+    }) {
+        Some(e) => { Err(e) }
+        None => { Ok(()) }
+    }
+}
+
+/// Waits (at most 10 s) for the handlers of a closed connection to let go of their streams.
+fn drain(c: Conn) uses io, clock {
+    let dl = time.after(time.seconds(10))
+    while !dl.expired() {
+        let n = c.core.modify(|inout k: Core| -> usize { k.streams.len() })
+        if n == 0 { return }
+        time.sleep_ms(5)
+    }
+}
+
+/// A client connection: the `Conn` and the tasks that run it. `close` ends it and waits for them.
+pub type Client = { conn: Conn, tasks: List[Task[i32]], scheme: List[u8], authority: List[u8] }
+
+/// Starts HTTP/2 on `w` as the client: sends the preface and SETTINGS and returns at once; the
+/// connection runs in tasks of its own until `close` or the peer's end. Streams are opened with
+/// `Client.conn.open` (or `Client.open`).
+pub fn connect(w: Wire, opt: Options) -> Result[Client, Error] uses io, clock, threads {
+    let c = new_conn(w, opt, true)
+    let wt = spawn(|| -> i32 {
+        writer(c)
+        0
+    })
+    let rt = spawn(|| -> i32 {
+        let hs = reader(c, None, || -> bool { false })
+        fail_conn(c, h2frame.NO_ERROR, String.from("done"))
+        drain(c)
+        0
+    })
+    if !emit(c, first_frames(opt, true)) {
+        c.close()
+        let z1 = wt.join()
+        let z2 = rt.join()
+        return Err(closed_conn_err(h2frame.INTERNAL_ERROR, String.from("the connection could not be started")))
+    }
+    Ok(Client(c, List[wt, rt], "http".bytes(), List.new()))
+}
+
+/// Connects to `name:port` over plain TCP and starts HTTP/2 on it (prior-knowledge h2c): the `Client`'s `fetch`
+/// sends `name:port` as the authority. For https use `secure.connect_h2`.
+pub fn dial(name: str, port: i32, opt: Options, dl: time.Deadline) -> Result[Client, String] uses net, io, clock, threads {
+    let conn = client.connect_bytes(name.bytes(), port, http.limits(), None, dl)?
+    match connect(wire_of_transport(conn.transport()), opt) {
+        Ok(c) => { Ok(c.with_target("http".bytes(), conn.host.copy())) }
+        Err(e) => { Err(e.why) }
+    }
+}
+
+impl Client {
+    /// The scheme and authority `fetch` puts in a request that has no `host` header of its own.
+    fn with_target(self, scheme: List[u8], authority: List[u8]) -> Client { Client(self.conn, self.tasks, scheme, authority) }
+
+    /// One request, buffered both ways: `req.method`, `req.target`, `req.headers` and `req.body` go out
+    /// (`host` becomes the authority; connection-specific fields are dropped), and the response's status,
+    /// fields (trailers last) and whole body come back, within `dl`.
+    fn fetch(self, req: http.Request, dl: time.Deadline) -> Result[http.Response, Error] uses io, clock {
+        let mut hs: List[http.Header] = List.new()
+        hs.push(http.Header(":method".bytes(), req.method.copy()))
+        hs.push(http.Header(":scheme".bytes(), self.scheme.copy()))
+        let mut auth = self.authority.copy()
+        match http.find_s(req.headers, "host") {
+            Some(v) => { auth = v }
+            None => {}
+        }
+        hs.push(http.Header(":path".bytes(), req.target.copy()))
+        if auth.len() > 0 { hs.push(http.Header(":authority".bytes(), auth)) }
+        for f in req.headers {
+            let n = http.lower(f.name)
+            if conn_specific(n) || http.eq_s(n, "host") { continue }
+            hs.push(http.Header(n, f.value))
+        }
+        let st = self.conn.open(hs, req.body.len() == 0, dl)?
+        if req.body.len() > 0 {
+            match st.send(req.body, true, dl) {
+                Ok(z) => {}
+                Err(e) => {
+                    st.release()
+                    return Err(e)
+                }
+            }
+        }
+        let head = match st.headers(dl) {
+            Ok(x) => x
+            Err(e) => {
+                st.release()
+                return Err(e)
+            }
+        }
+        let mut body: List[u8] = List.new()
+        while true {
+            match st.read(65536, dl) {
+                Ok(b) => {
+                    if b.len() == 0 { break }
+                    body.extend(b)
+                }
+                Err(e) => {
+                    st.release()
+                    return Err(e)
+                }
+            }
+        }
+        let mut resp = http.response(status_of(head))
+        for f in head {
+            if f.name.len() > 0 && f.name[0] != 58 { resp.headers.push(f) }
+        }
+        match st.trailers() {
+            Some(t) => { for f in t { resp.headers.push(f) } }
+            None => {}
+        }
+        resp.body = body
+        st.release()
+        Ok(resp)
+    }
+
+    fn open(self, hs: List[http.Header], end: bool, dl: time.Deadline) -> Result[Stream, Error] uses io, clock { self.conn.open(hs, end, dl) }
+    fn ping(self, dl: time.Deadline) -> Result[time.Duration, Error] uses io, clock { self.conn.ping(dl) }
+    fn failure(self) -> Option[Error] { self.conn.failure() }
+    fn shutdown(self) uses io, clock { self.conn.shutdown() }
+
+    /// Ends the connection (GOAWAY, then the wire) and waits for its tasks.
+    fn close(self) uses io, clock {
+        self.conn.close()
+        for t in self.tasks { let z = t.join() }
+    }
+
+    /// Waits for the connection to end (the peer's GOAWAY or close, or an error) and for its tasks.
+    fn wait(self) uses io, clock {
+        for t in self.tasks { let z = t.join() }
+    }
+}
+
+impl Conn {
+    /// Whether the connection has ended (or is ending), and why.
+    fn failure(self) -> Option[Error] { conn_failure(self) }
+
+    /// Streams open now.
+    fn open_streams(self) -> usize { self.core.modify(|inout k: Core| -> usize { k.active as usize }) }
+
+    /// Opens a stream (a client): sends the request head `hs` (pseudo-headers `:method`, `:scheme`,
+    /// `:path`, `:authority` first, then the fields), with `end` for a request without a body. Waits
+    /// until `dl` for a free stream (the peer's SETTINGS_MAX_CONCURRENT_STREAMS).
+    fn open(self, hs: List[http.Header], end: bool, dl: time.Deadline) -> Result[Stream, Error] uses io, clock {
+        if !self.client { return Err(err(ERR_STATE, 0, "only a client opens streams")) }
+        match check_fields(hs, 0) {
+            Ok(z) => {}
+            Err(why) => { return Err(Error(ERR_INVALID, 0, why)) }
+        }
+        let rpk = sync.parker()
+        let wpk = sync.parker()
+        let win = self.opt.stream_window as i64
+        while true {
+            // wait for a slot before taking the encoder's lock (a stream that is finishing needs it)
+            let slot = self.core.modify(|inout k: Core| -> i32 {
+                k.owait = sync.without(k.owait, wpk)
+                if k.closed { return 1 }
+                if k.goaway_in >= 0 { return 2 }
+                if k.active >= k.peer_streams {
+                    k.owait.push(wpk)
+                    return 3
+                }
+                0
+            })
+            if slot == 1 || slot == 2 {
+                rpk.close()
+                wpk.close()
+                match conn_failure(self) {
+                    Some(e) => { return Err(e) }
+                    None => { return Err(closed_conn_err(h2frame.REFUSED_STREAM, String.from("the peer is shutting the connection down (GOAWAY)"))) }
+                }
+            }
+            if slot == 3 {
+                if !wpk.park(dl) {
+                    self.core.modify(|inout k: Core| -> () { k.owait = sync.without(k.owait, wpk) })
+                    rpk.close()
+                    wpk.close()
+                    return Err(err(ERR_TIMEOUT, 0, "timed out waiting for a free stream"))
+                }
+                continue
+            }
+            let c = self
+            let r = self.enc.modify(|inout e: hpack.Encoder| -> Option[Result[Stream, Error]] {
+                let made = c.core.modify(|inout k: Core| -> Option[(u32, sync.Lock[Strm], usize)] {
+                    if k.closed || k.goaway_in >= 0 || k.active >= k.peer_streams { return None }
+                    let id = k.next_id
+                    k.next_id += 2
+                    let mut s = new_strm(id, k.peer_win, win)
+                    s.out_head = true
+                    if end { s.out_done = true }
+                    let sl = sync.lock(s)
+                    k.streams.insert(id, sl)
+                    k.active += 1
+                    Some((id, sl, k.peer_frame))
+                })
+                match made {
+                    None => { None }
+                    Some((id, sl, max)) => {
+                        let mut blk: List[u8] = List.new()
+                        e.encode(hs, inout blk)
+                        let st = Stream(c, id, sl, rpk, wpk)
+                        if !emit(c, List[h2frame.headers(id, blk, end, max)]) {
+                            Some(Err(dead_reason(st)))
+                        } else {
+                            Some(Ok(st))
+                        }
+                    }
+                }
+            })
+            match r {
+                Some(res) => { return res }
+                None => {}
+            }
+        }
+        Err(err(ERR_STATE, 0, "unreachable"))
+    }
+
+    /// A PING and its acknowledgement: the round trip, or a timeout.
+    fn ping(self, dl: time.Deadline) -> Result[time.Duration, Error] uses io, clock {
+        let pk = sync.parker()
+        let t0 = time.mono_ns()
+        let opaque = bytes.from_u64(time.mono_ns() as u64)
+        let mut pl = opaque.copy()
+        while pl.len() < 8 { pl.push(48) }
+        pl = pl.slice(0, 8)
+        let ok = self.core.modify(|inout k: Core| -> bool {
+            if k.closed { return false }
+            k.ping_sent = pl.copy()
+            k.ping_ack = false
+            k.ping_pk.push(pk)
+            true
+        })
+        if !ok {
+            pk.close()
+            return Err(dead_ping(self))
+        }
+        let z = emit(self, List[h2frame.ping(pl, false)])
+        while true {
+            let st = self.core.modify(|inout k: Core| -> i32 {
+                if k.ping_ack { return 0 }
+                if k.closed { return 2 }
+                1
+            })
+            if st == 0 { break }
+            if st == 2 {
+                self.core.modify(|inout k: Core| -> () { k.ping_pk = sync.without(k.ping_pk, pk) })
+                pk.close()
+                return Err(dead_ping(self))
+            }
+            if !pk.park(dl) {
+                self.core.modify(|inout k: Core| -> () { k.ping_pk = sync.without(k.ping_pk, pk) })
+                pk.close()
+                return Err(err(ERR_TIMEOUT, 0, "no answer to PING"))
+            }
+        }
+        self.core.modify(|inout k: Core| -> () { k.ping_pk = sync.without(k.ping_pk, pk) })
+        pk.close()
+        Ok(time.nanos(time.mono_ns() - t0))
+    }
+
+    /// Tells the peer no new streams will be accepted (GOAWAY with NO_ERROR) and, once the open streams
+    /// are done, the connection ends.
+    fn shutdown(self) uses io, clock {
+        let last = self.core.modify(|inout k: Core| -> u32 {
+            k.goaway_out = true
+            k.last_peer
+        })
+        let z = emit(self, List[h2frame.goaway(last, h2frame.NO_ERROR, List.new())])
+    }
+
+    /// Ends the connection now: GOAWAY, then the wire is closed; waiting calls fail.
+    fn close(self) uses io, clock {
+        goaway_close(self, h2frame.NO_ERROR, String.from("closed"))
+    }
+
+    /// Waits until the connection has ended or `dl` passes.
+    fn wait_closed(self, dl: time.Deadline) -> bool uses io, clock {
+        while !dl.expired() {
+            if self.failure().is_some() { return true }
+            time.sleep_ms(5)
+        }
+        false
+    }
+}
+
+fn dead_ping(c: Conn) -> Error {
+    match conn_failure(c) {
+        Some(e) => { e }
+        None => { err(ERR_CLOSED, h2frame.INTERNAL_ERROR, "the connection is closed") }
+    }
+}
+
+// ---- serving an http.Handler over HTTP/2 ----
+
+/// A wire that first gives `left` (bytes already read from the connection), then reads `w`.
+pub fn wire_with_prefix(w: Wire, left: List[u8]) -> Wire {
+    let pending = sync.lock(left)
+    let rd = w.read
+    let wr = w.write
+    let cl = w.close
+    let read = |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
+        let early = pending.modify(|inout b: List[u8]| -> List[u8] {
+            if b.len() == 0 { return List.new() }
+            let n = if b.len() < max { b.len() } else { max }
+            let out = b.slice(0, n)
+            b.remove_range(0, n)
+            out
+        })
+        if early.len() > 0 { return Ok(early) }
+        rd(max, dl)
+    }
+    Wire(read, wr, cl)
+}
+
+fn bodyless_status(st: i32) -> bool { (st >= 100 && st < 200) || st == 204 || st == 304 }
+
+/// An `http.Handler` as a stream handler: the request is built from the stream's head (`:method`,
+/// `:path`, `:authority` becomes `host`), its body buffered up to `Options.max_body` (more is a 413) and
+/// `peer` is the client's address; the response is written as HEADERS and DATA (a response with a
+/// `stream` is sent as DATA as it is produced; an upgrade stream is not possible over HTTP/2 and is 501).
+/// A request has the context value `protocol` = `h2`. `ctx` is added to the request's context (the TLS
+/// facts the HTTP/1.1 server sets). A handler that traps costs a 500.
+pub fn handler(h: http.Handler, peer: List[u8], ctx: List[http.Header]) -> StreamHandler uses io, clock {
+    |s: Stream| -> () {
+        let hs = match s.headers(time.never()) {
+            Ok(x) => x
+            Err(e) => { return }
+        }
+        let max = s.conn.opt.max_body
+        let mut method: List[u8] = List.new()
+        let mut target: List[u8] = List.new()
+        let mut authority: List[u8] = List.new()
+        let mut fields: List[http.Header] = List.new()
+        for f in hs {
+            if http.eq_s(f.name, ":method") {
+                method = f.value
+            } else if http.eq_s(f.name, ":path") {
+                target = f.value
+            } else if http.eq_s(f.name, ":authority") {
+                authority = f.value
+            } else if f.name.len() > 0 && f.name[0] != 58 {
+                fields.push(f)
+            }
+        }
+        if authority.len() > 0 && http.find_s(fields, "host").is_none() { fields.push(http.Header("host".bytes(), authority)) }
+        // the body, buffered
+        let mut body: List[u8] = List.new()
+        let mut too_big = false
+        while true {
+            match s.read(65536, time.never()) {
+                Ok(b) => {
+                    if b.len() == 0 { break }
+                    if body.len() + b.len() > max {
+                        too_big = true
+                        break
+                    }
+                    body.extend(b)
+                }
+                Err(e) => { return }
+            }
+        }
+        let mut resp = http.response(500)
+        if too_big {
+            resp = http.error_response(413)
+        } else {
+            let mut req = http.request("GET", target)
+            req.method = method
+            req.headers = fields
+            req.body = body
+            req.peer = peer
+            req.keep_alive = true
+            for c in ctx { req.ctx.push(c) }
+            req.set_ctx("protocol", "h2".bytes())
+            match s.trailers() {
+                Some(t) => { for f in t { req.headers.push(f) } }
+                None => {}
+            }
+            match task.catch(|| -> http.Response { h(req) }) {
+                Ok(r) => { resp = r }
+                Err(why) => { resp = http.error_response(500) }
+            }
+        }
+        send_response(s, resp, http.eq_s(method, "HEAD"))
+    }
+}
+
+fn send_response(s: Stream, resp: http.Response, head_only: bool) uses io, clock {
+    let mut hs: List[http.Header] = List.new()
+    let code = resp.status.to_string()
+    hs.push(http.Header(":status".bytes(), code.bytes()))
+    let mut has_len = false
+    for f in resp.headers {
+        let n = http.lower(f.name)
+        if conn_specific(n) { continue }
+        if n.len() > 0 && n[0] == 58 { continue }
+        if http.eq_s(n, "content-length") { has_len = true }
+        hs.push(http.Header(n, f.value))
+    }
+    let none = bodyless_status(resp.status)
+    match resp.stream {
+        Some(stm) => {
+            if stm.raw {
+                let mut e: List[http.Header] = List.new()
+                e.push(http.Header(":status".bytes(), "501".bytes()))
+                let z = s.send_headers(e, true)
+                return
+            }
+            // a streamed body has no length
+            let mut hs2: List[http.Header] = List.new()
+            for f in hs {
+                if !http.eq_s(f.name, "content-length") { hs2.push(f) }
+            }
+            if s.send_headers(hs2, false).is_err() { return }
+            let run = stm.run
+            let send = |data: List[u8]| -> Result[(), stream.Error] {
+                match s.send(data, false, time.after(time.seconds(60))) {
+                    Ok(z) => { Ok(()) }
+                    Err(e) => { Err(stream.error(stream.BrokenPipe, e.why)) }
+                }
+            }
+            let recv = |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
+                Err(stream.error(stream.Unsupported, "a streamed response has nothing to read"))
+            }
+            let stopping = || -> bool { s.conn.failure().is_some() }
+            let dx = http.Duplex(recv, send, stopping)
+            match task.catch(|| -> () { run(dx) }) {
+                Ok(z) => {}
+                Err(why) => {
+                    s.reset(h2frame.INTERNAL_ERROR)
+                    return
+                }
+            }
+            let z = s.finish()
+            return
+        }
+        None => {}
+    }
+    if !has_len && !none && !head_only {
+        hs.push(http.Header("content-length".bytes(), resp.body.len().to_string().bytes()))
+    }
+    if head_only || none || resp.body.len() == 0 {
+        if head_only && !has_len && !none { hs.push(http.Header("content-length".bytes(), resp.body.len().to_string().bytes())) }
+        let z = s.send_headers(hs, true)
+        return
+    }
+    if s.send_headers(hs, false).is_err() { return }
+    let z = s.send(resp.body, true, time.after(time.seconds(60)))
+}
+
+// ---- HTTP/1.1 Upgrade: h2c on a connection a handler took over ----
+
+fn token_in(v: List[u8], want: str) -> bool {
+    for t in http.list_items(v) {
+        if http.eq_ci_s(t, want) { return true }
+    }
+    false
+}
+
+/// Whether a request asks to switch to HTTP/2 over the connection it came on: `Connection: Upgrade` and
+/// `Upgrade: h2c` (what Docker's BuildKit sessions send). No body, so the connection is the
+/// handler's to give away.
+pub fn wants_upgrade(q: http.Request) -> bool {
+    let mut up = false
+    let mut conn = false
+    for f in q.headers {
+        if http.eq_s(f.name, "upgrade") && token_in(f.value, "h2c") { up = true }
+        if http.eq_s(f.name, "connection") && token_in(f.value, "upgrade") { conn = true }
+    }
+    up && conn
+}
+
+fn switching() -> http.Response {
+    let mut r = http.response(101)
+    r.set_header("Connection", "Upgrade".bytes())
+    r.set_header("Upgrade", "h2c".bytes())
+    r
+}
+
+/// The answer to an `Upgrade: h2c` request: `101 Switching Protocols`, and then the connection is HTTP/2
+/// with this side as the server (the client opens the streams): `h` serves each of them. The server calls
+/// `run` on the connection's task after the 101 and closes the connection when it returns. A request that
+/// is not an upgrade to h2c is a 426 with `Upgrade: h2c`.
+pub fn accept_server(q: http.Request, opt: Options, h: StreamHandler) -> http.Response uses io, clock, threads {
+    if !wants_upgrade(q) {
+        let mut r = http.response(426)
+        r.set_header("Upgrade", "h2c".bytes())
+        r.set_header("Connection", "Upgrade".bytes())
+        return r
+    }
+    let mut r = switching()
+    r.stream = Some(http.Stream(|d: http.Duplex| -> () {
+        let w = wire_of_duplex(d, || -> () {})
+        let z = serve_until(w, opt, h, || -> bool { d.is_stopping() })
+    }, true))
+    r
+}
+
+/// The same upgrade, with this side as the HTTP/2 *client*: after the 101 the peer (which sent the
+/// request, and so serves) answers the streams `run` opens on the `Client` it gets. This is the shape
+/// of Docker's `/session`, where the daemon calls back into the CLI over the connection the CLI made.
+/// The connection ends when `run` returns.
+pub fn accept_client(q: http.Request, opt: Options, run: fn(Client)) -> http.Response uses io, clock, threads {
+    if !wants_upgrade(q) {
+        let mut r = http.response(426)
+        r.set_header("Upgrade", "h2c".bytes())
+        r.set_header("Connection", "Upgrade".bytes())
+        return r
+    }
+    let mut r = switching()
+    r.stream = Some(http.Stream(|d: http.Duplex| -> () {
+        let w = wire_of_duplex(d, || -> () {})
+        match connect(w, opt) {
+            Ok(c) => {
+                run(c)
+                c.close()
+            }
+            Err(e) => {}
+        }
+    }, true))
+    r
+}
+
+// ---- a listener that speaks only HTTP/2 ----
+
+/// Serves HTTP/2 (prior-knowledge h2c) on the listening socket `ls` (`net.listener(addr, true)`): every
+/// accepted connection is served by `serve_until` in a task of its own, at most `max_conns` at once (more
+/// are closed at once), until `tok` is cancelled; then the connections get GOAWAY and finish their streams. A
+/// connection that does not open with the HTTP/2 preface gets GOAWAY, not an HTTP/1.1 error: for a server that
+/// shares a port with HTTP/1.1 use `server.Config.h2` instead. gRPC servers can use either.
+pub fn serve_listener(ls: i32, opt: Options, max_conns: usize, h: StreamHandler, tok: task.Token) uses net, io, clock, threads {
+    let done: chan.Channel[i64] = chan.unbounded()
+    let mut conns: Map[i64, Task[i32]] = Map.new()
+    let mut next: i64 = 1
+    while !tok.is_cancelled() {
+        // finished connection tasks are joined
+        let mut going = true
+        while going {
+            match done.try_recv() {
+                chan.Value(id) => { conns.remove(id) }
+                chan.Empty => { going = false }
+                chan.Closed => { going = false }
+            }
+        }
+        match fd.wait_ready(ls, fd.READY_READ, time.after_ms(100)) {
+            Ok(r) => {
+                if r {
+                    let mut more = true
+                    let mut taken = 0
+                    while more && taken < 64 {
+                        taken += 1
+                        match net.accept(ls, true) {
+                            Ok(Some(a)) => {
+                                let c = a.fd
+                                let nd = net.set_option(c, net.NODELAY, 1)
+                                if conns.len() >= max_conns {
+                                    let z = fd.close(c)
+                                } else {
+                                    let id = next
+                                    next += 1
+                                    let w = wire_of_transport(transport.plain(c))
+                                    let t = spawn(|| -> i32 {
+                                        let z = serve_until(w, opt, h, || -> bool { tok.is_cancelled() })
+                                        let z2 = done.try_send(id)
+                                        0
+                                    })
+                                    conns.insert(id, t)
+                                }
+                            }
+                            Ok(None) => { more = false }
+                            Err(e) => { more = false }
+                        }
+                    }
+                }
+            }
+            Err(e) => { time.sleep_ms(20) }
+        }
+    }
+    for t in conns.values() { let z = t.join() }
+}

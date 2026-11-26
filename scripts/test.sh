@@ -10,7 +10,7 @@
 # (else `skip`). tests/tls_interop.sh then runs the https server against `openssl s_client` and `curl` and the
 # client against `openssl s_server` (`skip` without openssl). Prints `ok   <test>` or `FAIL <test>` with a diff, then `ALL OK`; exits 1
 # on a failure, 2 when there is no usable toolchain (scripts/env.sh).
-TSAN="tests/client_host_test.ei tests/service_test.ei tests/observe_test.ei tests/ratelimit_test.ei tests/trap_test.ei tests/server_test.ei tests/middleware_test.ei tests/stream_test.ei tests/ws_test.ei tests/compress_test.ei tests/tls_test.ei"
+TSAN="tests/h2_test.ei tests/h2_upgrade_test.ei tests/client_host_test.ei tests/service_test.ei tests/observe_test.ei tests/ratelimit_test.ei tests/trap_test.ei tests/server_test.ei tests/middleware_test.ei tests/stream_test.ei tests/ws_test.ei tests/compress_test.ei tests/tls_test.ei"
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 if [ -z "$NOBUILD" ]; then
   sh "$here/scripts/build.sh" || exit $?
@@ -47,6 +47,14 @@ if ei build tests/hpack_interop.ei -o "$B/hpack_interop" > "$B/log" 2>&1; then
   sh tests/hpack_interop.sh "$B" || fail=1
 else
   echo "FAIL hpack interop: build"; cat "$B/log"; fail=1
+fi
+rm -rf "$B"
+# http/h2 against curl, the Rust h2 crate and h2spec (tests/h2_interop.sh; `skip` for what is not installed)
+B=$(mktemp -d)
+if ei build tests/h2_interop_server.ei -o "$B/h2srv" > "$B/log" 2>&1 && ei build tests/h2_interop_client.ei -o "$B/h2cli" >> "$B/log" 2>&1; then
+  sh tests/h2_interop.sh "$B" || fail=1
+else
+  echo "FAIL h2 interop: build"; cat "$B/log"; fail=1
 fi
 rm -rf "$B"
 if [ -n "$TSAN" ]; then
