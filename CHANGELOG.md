@@ -3,9 +3,9 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.7
 
-HTTP/2 (RFC 9113) and HPACK (RFC 7541), for gRPC (eider-http#9). Docs: docs/services.md "HTTP/2". **Off by default for the
+Needs Eider 0.7.10 or later (`scripts/env.sh` refuses an older toolchain). HTTP/2 (RFC 9113) and HPACK (RFC 7541), for gRPC (eider-http#9). Docs: docs/services.md "HTTP/2". **Off by default for the
 server**; nothing changes for a program that does not use it.
 
 - **`http/hpack`**: the encoder and decoder (static and dynamic tables, Huffman, size limits, never-indexed credentials). RFC 7541
