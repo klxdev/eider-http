@@ -10,7 +10,7 @@
 # (else `skip`). tests/tls_interop.sh then runs the https server against `openssl s_client` and `curl` and the
 # client against `openssl s_server` (`skip` without openssl). Prints `ok   <test>` or `FAIL <test>` with a diff, then `ALL OK`; exits 1
 # on a failure, 2 when there is no usable toolchain (scripts/env.sh).
-TSAN="tests/h2_test.ei tests/h2_upgrade_test.ei tests/client_host_test.ei tests/service_test.ei tests/observe_test.ei tests/ratelimit_test.ei tests/trap_test.ei tests/server_test.ei tests/middleware_test.ei tests/stream_test.ei tests/ws_test.ei tests/compress_test.ei tests/tls_test.ei"
+TSAN="tests/h2_test.ei tests/h2_rst_noerror_test.ei tests/h2_upgrade_test.ei tests/client_host_test.ei tests/service_test.ei tests/observe_test.ei tests/ratelimit_test.ei tests/trap_test.ei tests/server_test.ei tests/middleware_test.ei tests/stream_test.ei tests/ws_test.ei tests/compress_test.ei tests/tls_test.ei"
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 if [ -z "$NOBUILD" ]; then
   sh "$here/scripts/build.sh" || exit $?

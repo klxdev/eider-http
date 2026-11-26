@@ -1,0 +1,76 @@
+// http/h2: a server that has sent its whole response may reset the stream with NO_ERROR to stop the request body
+// (RFC 9113 section 8.1; grpc-go does it after its trailers). The client keeps the response and only stops sending.
+
+import core.sys
+import std.fd
+import std.io
+import std.net
+import std.task
+import std.time
+import http
+import http.h2
+import http.h2frame
+import http.transport
+
+fn say(s: String) uses io { io.errln(s.bytes()) }
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn request() -> List[http.Header] {
+    let mut r: List[http.Header] = List.new()
+    r.push(http.Header(lit(":method"), lit("POST")))
+    r.push(http.Header(lit(":scheme"), lit("http")))
+    r.push(http.Header(lit(":path"), lit("/early")))
+    r.push(http.Header(lit(":authority"), lit("x")))
+    r
+}
+
+fn main() uses net, io, clock, threads {
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    let cw = h2.wire_of_transport(transport.plain(p.r))
+    let sw = h2.wire_of_transport(transport.plain(p.w))
+    let opt = h2.options()
+    let srv = spawn(|| -> i32 {
+        let z = h2.serve(sw, opt, |s: h2.Stream| -> () {
+            let hs = s.headers(time.never())
+            let mut r: List[http.Header] = List.new()
+            r.push(http.Header(lit(":status"), lit("200")))
+            let a = s.send_headers(r, false)
+            let b = s.send(lit("early answer"), true, time.never())
+            // the request body is not finished: stop it
+            s.reset(h2frame.NO_ERROR)
+        })
+        0
+    })
+    let c = h2.connect(cw, opt).unwrap()
+    let s = c.open(request(), false, time.never()).unwrap()
+    let z3 = s.send(lit("part of a body"), false, time.never())
+    let h = s.headers(time.after(time.seconds(5))).unwrap()
+    let mut got: List[u8] = List.new()
+    let mut failed = false
+    while true {
+        match s.read(100, time.after(time.seconds(5))) {
+            Ok(b) => {
+                if b.len() == 0 { break }
+                got.extend(b)
+            }
+            Err(e) => {
+                failed = true
+                break
+            }
+        }
+    }
+    say(String.from(if failed { "response read failed" } else { "response read to the end" }))
+    say(sys.to_string(got))
+    time.sleep_ms(100)
+    match s.send(lit("more"), false, time.after(time.seconds(1))) {
+        Ok(x) => { say(String.from("sent after the reset")) }
+        Err(e) => { say(String.from("send after the reset fails")) }
+    }
+    s.release()
+    c.close()
+    let z4 = srv.join()
+    say(String.from("done"))
+}

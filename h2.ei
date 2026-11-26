@@ -1108,8 +1108,14 @@ fn on_rst(c: Conn, f: h2frame.Frame) -> Result[(), Error] uses io, clock {
         Some(sl) => {
             sl.modify(|inout s: Strm| -> () {
                 if s.reset < 0 {
-                    s.reset = code as i64
-                    s.reset_peer = true
+                    if code == h2frame.NO_ERROR && s.in_done {
+                        // RFC 9113 section 8.1: a peer that has sent its whole message may reset the stream with NO_ERROR to
+                        // stop ours (grpc-go does after its trailers). What it sent stays readable; we just stop sending.
+                        s.out_done = true
+                    } else {
+                        s.reset = code as i64
+                        s.reset_peer = true
+                    }
                 }
                 wake(s.rw)
                 wake(s.ww)

@@ -3,6 +3,13 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.7.8
+
+- **`http/h2`**: RST_STREAM(NO_ERROR) from a peer that has already sent its whole message no longer fails the stream: what it sent stays
+  readable and only our sending stops (RFC 9113 section 8.1). grpc-go sends it right after its trailers; an Eider client calling a Go
+  server failed about 1 call in 100 with "the peer reset the stream (NO_ERROR)" when the reset was handled before the response was read.
+  Test: `tests/h2_rst_noerror_test.ei`.
+
 ## 0.7.7
 
 Needs Eider 0.7.10 or later (`scripts/env.sh` refuses an older toolchain). HTTP/2 (RFC 9113) and HPACK (RFC 7541), for gRPC (eider-http#9). Docs: docs/services.md "HTTP/2". **Off by default for the
