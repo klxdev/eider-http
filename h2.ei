@@ -62,17 +62,21 @@ import http
 import http.h2frame
 import http.client
 import http.hpack
+import http.sock
 import http.transport
 
 // ---- the connection's bytes ----
 
 /// The bytes under a connection. `read(max, dl)`: 1 to `max` bytes, empty at the end of the
 /// connection, `Err(TimedOut)` at the deadline; `write(data, dl)`: all of it or an error; `close()`:
-/// closes the connection (idempotent), which also ends a read that is waiting.
+/// ends our side of the connection once everything is written (a half-close, so a read that is waiting sees the end);
+/// `release()`: lets go of the connection for good (closes the descriptor), called once, after the last read and write. A
+/// descriptor is not closed while a task still reads or writes it: its number could be reused by another connection.
 pub type Wire = {
     read: fn(usize, time.Deadline) -> Result[List[u8], stream.Error],
     write: fn(List[u8], time.Deadline) -> Result[(), stream.Error],
     close: fn(),
+    release: fn(),
 }
 
 fn closed_err() -> stream.Error { stream.error(stream.BrokenPipe, "the connection is closed") }
@@ -90,9 +94,20 @@ pub fn wire_of_transport(t: transport.Transport) -> Wire uses net, io, clock {
         if t.send_by(data, dl) { return Ok(()) }
         Err(closed_err())
     }
-    // a lingering close: our last frames (GOAWAY) reach the peer instead of being cut by a reset when it still sends
-    let cl = || -> () { t.linger_close(time.after_ms(1000)) }
-    Wire(rd, wr, cl)
+    // our side ends after the last frame (over TLS with a close_notify); the descriptor is closed by `release`, with a
+    // lingering close so our last frames (GOAWAY) reach the peer instead of being cut by a reset when it still sends
+    let cl = || -> () {
+        match t.sec {
+            Some(sc) => {
+                let n = sc.notify
+                n(200)
+            }
+            None => {}
+        }
+        let z = net.shutdown(t.fd, net.SHUT_WRITE)
+    }
+    let rl = || -> () { sock.linger_close(t.fd, time.after_ms(1000)) }
+    Wire(rd, wr, cl, rl)
 }
 
 /// A wire over the `http.Duplex` of an upgraded connection; `close` ends the connection (the
@@ -100,7 +115,7 @@ pub fn wire_of_transport(t: transport.Transport) -> Wire uses net, io, clock {
 pub fn wire_of_duplex(d: http.Duplex, close: fn()) -> Wire {
     let rd = d.recv
     let wr = d.send
-    Wire(rd, |data: List[u8], dl: time.Deadline| -> Result[(), stream.Error] { wr(data) }, close)
+    Wire(rd, |data: List[u8], dl: time.Deadline| -> Result[(), stream.Error] { wr(data) }, close, || -> () {})
 }
 
 // ---- errors and options ----
@@ -1518,6 +1533,7 @@ pub fn serve_until(w: Wire, opt: Options, h: StreamHandler, stop: fn() -> bool) 
     drain(c)
     for t in tasks.values() { let zt = t.join() }
     let z2 = wt.join()
+    c.wire.release()
     match c.core.modify(|inout k: Core| -> Option[Error] {
         if k.code != h2frame.NO_ERROR { return Some(closed_conn_err(k.code, k.why.copy())) }
         None
@@ -1559,6 +1575,7 @@ pub fn connect(w: Wire, opt: Options) -> Result[Client, Error] uses io, clock, t
         c.close()
         let z1 = wt.join()
         let z2 = rt.join()
+        c.wire.release()
         return Err(closed_conn_err(h2frame.INTERNAL_ERROR, String.from("the connection could not be started")))
     }
     Ok(Client(c, List[wt, rt], "http".bytes(), List.new()))
@@ -1649,11 +1666,13 @@ impl Client {
     fn close(self) uses io, clock {
         self.conn.close()
         for t in self.tasks { let z = t.join() }
+        self.conn.wire.release()
     }
 
     /// Waits for the connection to end (the peer's GOAWAY or close, or an error) and for its tasks.
     fn wait(self) uses io, clock {
         for t in self.tasks { let z = t.join() }
+        self.conn.wire.release()
     }
 }
 
@@ -1824,6 +1843,7 @@ pub fn wire_with_prefix(w: Wire, left: List[u8]) -> Wire {
     let rd = w.read
     let wr = w.write
     let cl = w.close
+    let rl = w.release
     let read = |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
         let early = pending.modify(|inout b: List[u8]| -> List[u8] {
             if b.len() == 0 { return List.new() }
@@ -1835,7 +1855,7 @@ pub fn wire_with_prefix(w: Wire, left: List[u8]) -> Wire {
         if early.len() > 0 { return Ok(early) }
         rd(max, dl)
     }
-    Wire(read, wr, cl)
+    Wire(read, wr, cl, rl)
 }
 
 fn bodyless_status(st: i32) -> bool { (st >= 100 && st < 200) || st == 204 || st == 304 }
