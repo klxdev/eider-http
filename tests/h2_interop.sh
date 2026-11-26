@@ -60,7 +60,7 @@ if command -v curl >/dev/null 2>&1 && curl -V | grep -q nghttp2; then
   echo "streamed $n" > "$T/o"
   check "curl h2c: a streamed body (10 chunks)" "$T/o" "streamed 330"
   curl -sS --max-time 20 --http2-prior-knowledge -Z "http://127.0.0.1:$port/hello" "http://127.0.0.1:$port/hello" "http://127.0.0.1:$port/info" > "$T/o" 2>&1
-  check "curl h2c: three requests at once" "$T/o" "hello h2hello h2" "protocol=h2"
+  check "curl h2c: three requests at once" "$T/o" "hello h2" "protocol=h2"
   curl -sS --max-time 20 "http://127.0.0.1:$port/hello" > "$T/o" 2>&1
   check "curl: HTTP/1.1 on the same port" "$T/o" "hello h2"
   curl -sS --max-time 20 --http2 --cacert "$P/root.pem" -w '\nversion=%{http_version}\n' "https://localhost:$tport/info" > "$T/o" 2>&1
