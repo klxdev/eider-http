@@ -99,4 +99,4 @@ grep -q "wait_ready_or_unpark" "$toolchain/std/fd.ei" 2>/dev/null && grep -q "tr
 # a toolchain before 0.7.9 can crash a server (a use-after-free of task stacks in the runtime: a finished task's stack was cached
 # before its pages were discarded, so a new task's live frames could be zeroed; present in 0.7.7 and 0.7.8, far likelier with
 # 0.7.8's faster task turnover; eider-http 0.7.6 and later)
-[ "${theirs##*.}" -ge 9 ] 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs, whose runtime can crash programs that start and end many tasks (a use-after-free of task stacks, fixed in 0.7.9); eider-$pkg_name $mine needs Eider 0.7.9 or later (\`eider toolchain install 0.7\`)"
+[ "${theirs##*.}" -ge 10 ] 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs: eider-$pkg_name $mine needs Eider 0.7.10 or later (the compiler crashed on a break after a closure that holds a closure, #248, which http/h2 and rpc/grpc use; 0.7.7 and 0.7.8 also have a task-stack use-after-free fixed in 0.7.9) (\`eider toolchain install 0.7\`)"

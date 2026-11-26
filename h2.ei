@@ -2099,10 +2099,7 @@ pub fn serve_listener(ls: i32, opt: Options, max_conns: usize, h: StreamHandler,
         match fd.wait_ready(ls, fd.READY_READ, time.after_ms(100)) {
             Ok(r) => {
                 if r {
-                    let mut more = true
-                    let mut taken = 0
-                    while more && taken < 64 {
-                        taken += 1
+                    for k in 0..64 {
                         match net.accept(ls, true) {
                             Ok(Some(a)) => {
                                 let c = a.fd
@@ -2121,8 +2118,8 @@ pub fn serve_listener(ls: i32, opt: Options, max_conns: usize, h: StreamHandler,
                                     conns.insert(id, t)
                                 }
                             }
-                            Ok(None) => { more = false }
-                            Err(e) => { more = false }
+                            Ok(None) => { break }
+                            Err(e) => { break }
                         }
                     }
                 }
