@@ -1,0 +1,49 @@
+// The Eider side of tests/jwt_interop.sh (http/jwt against python3's hmac and hashlib):
+//   jwt_interop_prog sign   <HS256|HS384|HS512> <secret> <payload json>   prints the token
+//   jwt_interop_prog verify <HS256|HS384|HS512> <secret> <token>          prints `ok <sub>` or `refused <why>`
+
+import core.sys
+import std.bytes
+import std.env
+import std.io
+import std.time
+import http.jwt
+
+fn alg(s: List[u8]) -> jwt.Alg { jwt.alg_of(s).unwrap() }
+
+fn main() uses io, clock {
+    let a = env.args()
+    if a.len() != 5 {
+        io.errln(sys.lit("usage: sign|verify ALG SECRET PAYLOAD|TOKEN"))
+        env.exit(2)
+        return
+    }
+    let al = alg(a[2])
+    if bytes.eq(a[1], sys.lit("sign")) {
+        match jwt.sign(al, jwt.SecretKey(a[3]), List.new(), a[4]) {
+            Ok(t) => io.outln(t)
+            Err(e) => {
+                io.errln(e.bytes())
+                env.exit(1)
+            }
+        }
+        return
+    }
+    let mut v = jwt.validation(List[al])
+    v.require_exp = false
+    match jwt.verify(v, jwt.keyset().add("", jwt.Secret(a[3])), a[4]) {
+        Ok(c) => {
+            let mut l = sys.lit("ok ")
+            match c.subject() {
+                Some(s) => bytes.append(inout l, s)
+                None => {}
+            }
+            io.outln(l)
+        }
+        Err(e) => {
+            let mut l = sys.lit("refused ")
+            bytes.append(inout l, jwt.error_text(e).bytes())
+            io.outln(l)
+        }
+    }
+}

@@ -57,6 +57,14 @@ else
   echo "FAIL h2 interop: build"; cat "$B/log"; fail=1
 fi
 rm -rf "$B"
+# http/jwt against python3's hmac and hashlib (tests/jwt_interop.sh; `skip` without python3)
+B=$(mktemp -d)
+if ei build tests/jwt_interop_prog.ei -o "$B/jwt_interop_prog" > "$B/log" 2>&1; then
+  sh tests/jwt_interop.sh "$B" || fail=1
+else
+  echo "FAIL jwt interop: build"; cat "$B/log"; fail=1
+fi
+rm -rf "$B"
 if [ -n "$TSAN" ]; then
   T=$(mktemp -d)
   trap 'rm -rf "$T"' EXIT
