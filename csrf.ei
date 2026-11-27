@@ -1,0 +1,429 @@
+//! http/csrf: cross-site request forgery protection for cookie-authenticated services: a
+//! signed double-submit token bound to the session, plus the `Origin` / `Sec-Fetch-Site` checks
+//! browsers make possible. (A service that authenticates with an `Authorization` header it
+//! sets itself, as http/auth's `bearer` does, has no ambient credentials and needs none of this.)
+//!
+//!     let cfg = csrf.new(key, csrf.session_cookie("sid")).unwrap()     // key: 32+ secret bytes
+//!     let app = csrf.protect(cfg, router.handler(r))
+//!
+//! How it works. On a safe request (GET, HEAD, OPTIONS, TRACE) the middleware makes sure the
+//! browser holds a token in a cookie (`__Host-csrf`, readable by scripts, SameSite=Lax, Secure)
+//! and gives the same value to the handler as `req.get_ctx("csrf_token")` for forms and
+//! `<meta>` tags. A token is `nonce.issued_at.mac`, where `mac` is HMAC-SHA256 over the
+//! session id, the nonce and the time under the server's key: it is bound to the session
+//! (one user's token is no use under another's session, and a cookie planted from a sibling
+//! subdomain cannot be made to fit the victim's session), and expires after `max_age` when
+//! that is set. Every other method (POST, PUT, PATCH, DELETE, ...) must pass all of:
+//! 1. the origin check: an `Origin` header, when present, is one of `cfg.origins` (or, with
+//!    none configured, has the request's own `Host`; `null` never passes); without one,
+//!    `Sec-Fetch-Site` must be `same-origin` or `none` (`same-site` too with `allow_same_site`);
+//!    with neither header the request passes this step unless `require_origin` is set;
+//! 2. one `Cookie` of the token's name, which is valid for this request's session;
+//! 3. the same token submitted in the `X-CSRF-Token` header (scripts) or, for plain forms, a
+//!    field the handler passes to `check_form_token`; equality is compared in constant time.
+//! A failure is `403` with a generic problem+json body; `reject_reason` says why, for your log.
+//!
+//! The session id comes from `cfg.session`: `session_cookie("sid")` reads it from a cookie. A
+//! request with no session (a login form, before there is one) is bound to the empty session;
+//! rotate the token (it is reissued when the session id changes) when a session starts.
+//!
+//! The cookie helper (`set_cookie`, `cookie_value`) is minimal and self-contained; it enforces
+//! the RFC 6265bis prefix and SameSite rules it can see (`__Host-` needs Secure, Path=/ and
+//! no Domain; SameSite=None needs Secure).
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.time
+import crypto
+import http
+import http.problem
+
+// ---- cookies
+
+/// The SameSite attribute of a cookie.
+pub type SameSite = | Strict | Lax | CrossSite
+
+/// What a Set-Cookie carries besides the name and the value. `max_age` None: a session cookie.
+pub type CookieOpts = { path: List[u8], domain: Option[List[u8]], max_age: Option[i64], secure: bool, http_only: bool, same_site: SameSite }
+
+/// `Path=/; Secure; SameSite=Lax`, no Domain, no Max-Age, readable by scripts.
+pub fn cookie_opts() -> CookieOpts { CookieOpts(sys.lit("/"), None, None, true, false, Lax) }
+
+fn is_cookie_octet(c: u8) -> bool { c > 32 && c < 127 && c != 34 && c != 44 && c != 59 && c != 92 }
+
+fn attr_ok(v: List[u8]) -> bool {
+    for c in v {
+        if c < 32 || c == 127 || c == 59 { return false }
+    }
+    true
+}
+
+/// A `Set-Cookie` value for `name=value` with `o`. Err when the name is not a token or the
+/// value is not made of cookie-octets (RFC 6265 section 4.1.1: no spaces, quotes, commas,
+/// semicolons or backslashes), when an attribute could break out of the header, when the name
+/// starts with `__Host-` without Secure, Path=/ and no Domain (or `__Secure-` without Secure),
+/// or when SameSite=None is not Secure.
+pub fn set_cookie(name: List[u8], value: List[u8], o: CookieOpts) -> Result[List[u8], String] {
+    if !http.is_token(name) { return Err(String.from("the cookie name is not a token")) }
+    for c in value {
+        if !is_cookie_octet(c) { return Err(String.from("the cookie value has a character a cookie cannot carry")) }
+    }
+    if !attr_ok(o.path) { return Err(String.from("bad Path")) }
+    match o.domain {
+        Some(d) => { if !attr_ok(d) { return Err(String.from("bad Domain")) } }
+        None => {}
+    }
+    if bytes.starts_with(name, sys.lit("__Host-")) {
+        if !o.secure || !bytes.eq(o.path, sys.lit("/")) || o.domain.is_some() { return Err(String.from("a __Host- cookie needs Secure, Path=/ and no Domain")) }
+    }
+    if bytes.starts_with(name, sys.lit("__Secure-")) && !o.secure { return Err(String.from("a __Secure- cookie needs Secure")) }
+    if o.same_site == CrossSite && !o.secure { return Err(String.from("SameSite=None needs Secure")) }
+    let mut out = name.copy()
+    out.push(61)
+    bytes.append(inout out, value)
+    bytes.append(inout out, sys.lit("; Path="))
+    bytes.append(inout out, o.path)
+    match o.domain {
+        Some(d) => {
+            bytes.append(inout out, sys.lit("; Domain="))
+            bytes.append(inout out, d)
+        }
+        None => {}
+    }
+    match o.max_age {
+        Some(n) => {
+            bytes.append(inout out, sys.lit("; Max-Age="))
+            bytes.append(inout out, bytes.from_i64(n))
+        }
+        None => {}
+    }
+    if o.secure { bytes.append(inout out, sys.lit("; Secure")) }
+    if o.http_only { bytes.append(inout out, sys.lit("; HttpOnly")) }
+    bytes.append(inout out, sys.lit(match o.same_site {
+        Strict => "; SameSite=Strict"
+        Lax => "; SameSite=Lax"
+        CrossSite => "; SameSite=None"
+    }))
+    Ok(out)
+}
+
+/// The value of the cookie `name` in the request's `Cookie` headers; None when there is none
+/// or when there are SEVERAL of that name (which one is the server's is ambiguous, and a
+/// cookie planted from a sibling domain is how an attacker makes it so). Surrounding double
+/// quotes are removed.
+pub fn cookie_value(req: http.Request, name: List[u8]) -> Option[List[u8]] {
+    let mut found: Option[List[u8]] = None
+    let mut n = 0
+    for h in req.headers {
+        if !http.eq_s(h.name, "cookie") { continue }
+        for part in bytes.split(h.value, 59) {
+            let p = http.trim_ows(part)
+            let eq = match bytes.find_byte(p, 61, 0) {
+                Some(i) => i
+                None => { continue }
+            }
+            if !bytes.eq(bytes.slice(p, 0, eq), name) { continue }
+            let mut v = bytes.slice(p, eq + 1, p.len())
+            if v.len() >= 2 && v[0] == 34 && v[v.len() - 1] == 34 { v = bytes.slice(v, 1, v.len() - 1) }
+            n += 1
+            found = Some(v)
+        }
+    }
+    if n == 1 { found } else { None }
+}
+
+// ---- configuration
+
+/// How the session id of a request is found (None: no session yet).
+pub type SessionFn = fn(http.Request) -> Option[List[u8]]
+
+/// The session id is the cookie `name`.
+pub fn session_cookie(name: str) -> SessionFn {
+    let n = sys.lit(name)
+    |req: http.Request| -> Option[List[u8]] { cookie_value(req, n) }
+}
+
+/// A CSRF configuration; adjust the fields after `new`:
+/// `key` signs tokens (32+ bytes, secret, kept across restarts and shared by instances);
+/// `cookie` is the token cookie's name (`__Host-csrf`) and `cookie_opts` its attributes;
+/// `header` the header scripts send it in (`x-csrf-token`);
+/// `session` finds the session id; `origins` lists allowed origins (`https://app.example`);
+/// `allow_same_site` accepts `Sec-Fetch-Site: same-site`; `require_origin` refuses unsafe
+/// requests with neither `Origin` nor `Sec-Fetch-Site`; `max_age` is a token's lifetime in
+/// seconds (0: unlimited; the default is a day).
+pub type Config = { key: List[u8], cookie: List[u8], cookie_opts: CookieOpts, header: List[u8], session: SessionFn, origins: List[List[u8]], allow_same_site: bool, require_origin: bool, max_age: i64 }
+
+/// A configuration signing with `key` (at least 32 bytes) and taking the session from `session`.
+pub fn new(key: List[u8], session: SessionFn) -> Result[Config, String] {
+    if key.len() < 32 { return Err(String.from("the CSRF key needs at least 32 bytes")) }
+    Ok(Config(key, sys.lit("__Host-csrf"), cookie_opts(), sys.lit("x-csrf-token"), session, List.new(), false, false, 86400))
+}
+
+// ---- tokens
+
+fn mac_of(cfg: Config, session: List[u8], nonce: List[u8], ts: List[u8]) -> List[u8] {
+    let mut m = sys.lit("csrf-v1:")
+    bytes.append(inout m, bytes.from_u64(session.len() as u64))
+    m.push(58)
+    bytes.append(inout m, session)
+    m.push(58)
+    bytes.append(inout m, nonce)
+    m.push(46)
+    bytes.append(inout m, ts)
+    match crypto.hmac(crypto.hmac_key(crypto.Sha256, cfg.key), m) {
+        Ok(t) => t.bytes
+        Err(_) => List.new()
+    }
+}
+
+/// A token for `session` issued at `now` with a given 16-byte-or-so `nonce` (random in
+/// `generate`; a parameter for the tests).
+pub fn token_at(cfg: Config, session: List[u8], now: i64, nonce: List[u8]) -> List[u8] {
+    let n = encoding.base64_url(nonce).bytes()
+    let ts = bytes.from_i64(now)
+    let mut t = n.copy()
+    t.push(46)
+    bytes.append(inout t, ts)
+    t.push(46)
+    bytes.append(inout t, encoding.base64_url(mac_of(cfg, session, n, ts)).bytes())
+    t
+}
+
+/// A fresh token for `session`, now.
+pub fn generate(cfg: Config, session: List[u8]) -> Result[List[u8], String] uses io, clock {
+    match crypto.random_bytes(16) {
+        Ok(n) => Ok(token_at(cfg, session, time.unix_seconds(), n))
+        Err(_) => Err(String.from("no randomness"))
+    }
+}
+
+/// Why a token is not valid.
+pub type Why = | Malformed | BadMac | Expired | FromTheFuture
+
+/// Whether `token` is one this server issued for `session` and is still good at `now`: Ok(())
+/// as true. The MAC is compared in constant time.
+pub fn check_token_at(cfg: Config, session: List[u8], token: List[u8], now: i64) -> Result[bool, Why] {
+    if token.len() > 256 { return Err(Malformed) }
+    let parts = bytes.split(token, 46)
+    if parts.len() != 3 { return Err(Malformed) }
+    let mac = match encoding.unbase64_url(parts[2]) {
+        Ok(m) => m
+        Err(_) => { return Err(Malformed) }
+    }
+    let ts = match bytes.parse_u64(parts[1]) {
+        Some(t) => t
+        None => { return Err(Malformed) }
+    }
+    if ts > 4000000000 { return Err(Malformed) }
+    let want = mac_of(cfg, session, parts[0], parts[1])
+    if want.len() == 0 || !crypto.ct_equal(want, mac) { return Err(BadMac) }
+    let t = ts as i64
+    if t > now + 60 { return Err(FromTheFuture) }
+    if cfg.max_age > 0 && now - t > cfg.max_age { return Err(Expired) }
+    Ok(true)
+}
+
+// ---- the checks
+
+/// Why a request was refused.
+pub type Reject =
+    | BadOrigin
+    | BadFetchSite
+    | NoOrigin
+    | NoCookie
+    | NoToken
+    | Mismatch
+    | BadToken(why: Why)
+
+/// A short description for a log line.
+pub fn reject_reason(r: Reject) -> String {
+    match r {
+        BadOrigin => String.from("Origin is not allowed")
+        BadFetchSite => String.from("Sec-Fetch-Site says the request is not from this origin")
+        NoOrigin => String.from("no Origin or Sec-Fetch-Site")
+        NoCookie => String.from("no CSRF cookie")
+        NoToken => String.from("no CSRF token submitted")
+        Mismatch => String.from("the submitted token is not the cookie's")
+        BadToken(w) => match w {
+            Malformed => String.from("the token is malformed")
+            BadMac => String.from("the token is not signed for this session")
+            Expired => String.from("the token has expired")
+            FromTheFuture => String.from("the token is dated in the future")
+        }
+    }
+}
+
+/// Whether the method needs no CSRF check (RFC 9110 section 9.2.1: GET, HEAD, OPTIONS, TRACE).
+pub fn is_safe(method: List[u8]) -> bool {
+    bytes.eq(method, sys.lit("GET")) || bytes.eq(method, sys.lit("HEAD")) || bytes.eq(method, sys.lit("OPTIONS")) || bytes.eq(method, sys.lit("TRACE"))
+}
+
+// the part of an origin after "scheme://"
+fn authority(origin: List[u8]) -> List[u8] {
+    match bytes.find(origin, sys.lit("://"), 0) {
+        Some(i) => bytes.slice(origin, i + 3, origin.len())
+        None => List.new()
+    }
+}
+
+/// The origin check alone (step 1 above).
+pub fn check_origin(cfg: Config, req: http.Request) -> Result[bool, Reject] {
+    match req.header("origin") {
+        Some(o) => {
+            if http.eq_ci_s(o, "null") { return Err(BadOrigin) }
+            if cfg.origins.len() > 0 {
+                for a in cfg.origins {
+                    if http.eq_ci(a, o) { return Ok(true) }
+                }
+                return Err(BadOrigin)
+            }
+            match req.header("host") {
+                Some(hh) => {
+                    let a = authority(o)
+                    if a.len() > 0 && http.eq_ci(a, hh) { Ok(true) } else { Err(BadOrigin) }
+                }
+                None => Err(BadOrigin)
+            }
+        }
+        None => {
+            match req.header("sec-fetch-site") {
+                Some(s) => {
+                    if http.eq_ci_s(s, "same-origin") || http.eq_ci_s(s, "none") { return Ok(true) }
+                    if cfg.allow_same_site && http.eq_ci_s(s, "same-site") { return Ok(true) }
+                    Err(BadFetchSite)
+                }
+                None => { if cfg.require_origin { Err(NoOrigin) } else { Ok(true) } }
+            }
+        }
+    }
+}
+
+fn session_of(cfg: Config, req: http.Request) -> List[u8] {
+    let f = cfg.session
+    match f(req) {
+        Some(s) => s
+        None => List.new()
+    }
+}
+
+/// The cookie token of the request when it is valid for the request's session at `now`.
+fn valid_cookie(cfg: Config, req: http.Request, now: i64) -> Option[List[u8]] {
+    let c = cookie_value(req, cfg.cookie)?
+    match check_token_at(cfg, session_of(cfg, req), c, now) {
+        Ok(_) => Some(c)
+        Err(_) => None
+    }
+}
+
+/// The whole check for an unsafe request, with the token `submitted` (the header's value or a
+/// form field's) at `now`.
+pub fn check_at(cfg: Config, req: http.Request, submitted: Option[List[u8]], now: i64) -> Result[bool, Reject] {
+    check_origin(cfg, req)?
+    let c = match cookie_value(req, cfg.cookie) {
+        Some(c) => c
+        None => { return Err(NoCookie) }
+    }
+    let s = match submitted {
+        Some(s) => s
+        None => { return Err(NoToken) }
+    }
+    match check_token_at(cfg, session_of(cfg, req), c, now) {
+        Ok(_) => {}
+        Err(w) => { return Err(BadToken(w)) }
+    }
+    if !crypto.ct_equal(crypto.sha256(c), crypto.sha256(s)) { return Err(Mismatch) }
+    Ok(true)
+}
+
+/// For a handler that read the token from a form field: the same check as the middleware does
+/// for the header (origin, cookie, equality, signature), now. The middleware has already
+/// checked the header: call this inside `protect` only for routes that submit a field, and
+/// use `protect_form` (which leaves the header to the handler) for them.
+pub fn check_form_token(cfg: Config, req: http.Request, field: List[u8]) -> Result[bool, Reject] uses clock {
+    check_at(cfg, req, Some(field), time.unix_seconds())
+}
+
+fn forbidden() -> http.Response {
+    problem.forbidden("the CSRF check failed").response()
+}
+
+fn handle(cfg: Config, req: http.Request, h: http.Handler, form: bool, log: fn(String)) -> http.Response uses io, clock {
+    let now = time.unix_seconds()
+    let mut q = req.copy()
+    q.ctx = http.without(q.ctx, http.lower(sys.lit("csrf_token")))
+    if is_safe(q.method) {
+        let mut tok: List[u8] = List.new()
+        let mut fresh = false
+        match valid_cookie(cfg, q, now) {
+            Some(c) => { tok = c }
+            None => {
+                match generate(cfg, session_of(cfg, q)) {
+                    Ok(t) => {
+                        tok = t
+                        fresh = true
+                    }
+                    Err(_) => { return http.error_response(500) }
+                }
+            }
+        }
+        q.set_ctx("csrf_token", tok)
+        let mut resp = h(q)
+        if fresh {
+            match set_cookie(cfg.cookie, tok, cfg.cookie_opts) {
+                Ok(v) => { resp.set_header("Set-Cookie", v) }
+                Err(_) => {}
+            }
+        }
+        return resp
+    }
+    if form {
+        match check_origin(cfg, q) {
+            Ok(_) => {}
+            Err(r) => {
+                log(reject_reason(r))
+                return forbidden()
+            }
+        }
+        match valid_cookie(cfg, q, now) {
+            Some(c) => { q.set_ctx("csrf_token", c) }
+            None => {
+                log(reject_reason(NoCookie))
+                return forbidden()
+            }
+        }
+        return h(q)
+    }
+    match check_at(cfg, q, http.find(q.headers, cfg.header), now) {
+        Ok(_) => {
+            match cookie_value(q, cfg.cookie) {
+                Some(c) => { q.set_ctx("csrf_token", c) }
+                None => {}
+            }
+            h(q)
+        }
+        Err(r) => {
+            log(reject_reason(r))
+            forbidden()
+        }
+    }
+}
+
+fn quiet(why: String) {}
+
+/// Protects `h`: see the module doc. Rejected requests are not logged (use `protect_logged`).
+pub fn protect(cfg: Config, h: http.Handler) -> http.Handler uses io, clock {
+    |req: http.Request| -> http.Response { handle(cfg, req, h, false, quiet) }
+}
+
+/// `protect`, telling `log` why each request was refused.
+pub fn protect_logged(cfg: Config, log: fn(String), h: http.Handler) -> http.Handler uses io, clock {
+    |req: http.Request| -> http.Response { handle(cfg, req, h, false, log) }
+}
+
+/// `protect` for routes whose token travels in a form field: unsafe requests must pass the
+/// origin check and carry a valid cookie, and the handler must then call `check_form_token`
+/// with the field it read from the body (the middleware cannot: bodies are the handler's).
+pub fn protect_form(cfg: Config, h: http.Handler) -> http.Handler uses io, clock {
+    |req: http.Request| -> http.Response { handle(cfg, req, h, true, quiet) }
+}
