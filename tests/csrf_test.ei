@@ -1,0 +1,279 @@
+// http/csrf: token vectors (HMAC fixed by a fixed nonce), the accept/reject matrix for unsafe
+// requests (cookie, header, session binding, expiry, Origin, Sec-Fetch-Site, duplicates), the
+// token cookie handed out on safe requests, the form flavour, and the cookie helper.
+
+import core.sys
+import std.bytes
+import std.io
+import std.time
+import http
+import http.csrf
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn key() -> List[u8] { lit("0123456789abcdef0123456789abcdef") }
+
+fn req(method: str, hdrs: List[(str, List[u8])]) -> http.Request {
+    let mut q = http.request(method, lit("/pay"))
+    for h in hdrs {
+        let (n, v) = h
+        q.headers.push(http.Header(http.lower(lit(n)), v))
+    }
+    q
+}
+
+fn hv(n: str, v: List[u8]) -> (str, List[u8]) { (n, v) }
+
+fn ok_handler() -> http.Handler {
+    |r: http.Request| -> http.Response {
+        let mut b = lit("done")
+        match r.get_ctx("csrf_token") {
+            Some(t) => {
+                bytes.append(inout b, lit(" token="))
+                bytes.append(inout b, bytes.from_u64(t.len() as u64))
+            }
+            None => {}
+        }
+        http.respond(200, "text/plain", b)
+    }
+}
+
+fn show(label: str, r: http.Response) uses io {
+    let mut l = lit(label)
+    bytes.append(inout l, lit(": "))
+    bytes.append(inout l, bytes.from_u64(r.status as u64))
+    for h in r.headers {
+        if http.eq_ci_s(h.name, "set-cookie") {
+            // the token itself is random: show the cookie's name and attributes
+            bytes.append(inout l, lit(" Set-Cookie: "))
+            match bytes.find_byte(h.value, 61, 0) {
+                Some(i) => bytes.append(inout l, bytes.slice(h.value, 0, i + 1))
+                None => {}
+            }
+            bytes.append(inout l, lit("<token>"))
+            match bytes.find_byte(h.value, 59, 0) {
+                Some(i) => bytes.append(inout l, bytes.slice(h.value, i, h.value.len()))
+                None => {}
+            }
+        }
+    }
+    bytes.append(inout l, lit(" | "))
+    bytes.append(inout l, r.body)
+    io.outln(l)
+}
+
+fn cookie_token(r: http.Response) -> List[u8] {
+    for h in r.headers {
+        if http.eq_ci_s(h.name, "set-cookie") {
+            let eq = bytes.find_byte(h.value, 61, 0).unwrap()
+            let semi = bytes.find_byte(h.value, 59, 0).unwrap()
+            return bytes.slice(h.value, eq + 1, semi)
+        }
+    }
+    List.new()
+}
+
+fn cookies(tok: List[u8], sid: str) -> List[u8] {
+    let mut c = lit("__Host-csrf=")
+    bytes.append(inout c, tok)
+    bytes.append(inout c, lit("; sid="))
+    bytes.append(inout c, lit(sid))
+    c
+}
+
+fn say(label: str, r: Result[bool, csrf.Reject]) uses io {
+    let mut l = lit(label)
+    bytes.append(inout l, lit(": "))
+    match r {
+        Ok(_) => bytes.append(inout l, lit("allowed"))
+        Err(e) => bytes.append(inout l, csrf.reject_reason(e).bytes())
+    }
+    io.outln(l)
+}
+
+fn main() uses io, clock {
+    let mut cfg = csrf.new(key(), csrf.session_cookie("sid")).unwrap()
+    let now = time.unix_seconds()
+    io.outln(lit("-- config"))
+    print(csrf.new(lit("short"), csrf.session_cookie("sid")).is_err())
+
+    io.outln(lit("-- tokens"))
+    let nonce = lit("0123456789abcdef")
+    let t1 = csrf.token_at(cfg, lit("s1"), 1800000000, nonce)
+    io.outln(t1)
+    print(bytes.eq(t1, csrf.token_at(cfg, lit("s1"), 1800000000, nonce)))
+    print(bytes.eq(t1, csrf.token_at(cfg, lit("s2"), 1800000000, nonce)))
+    for case in [("s1", 1800000000), ("s1", 1800086399), ("s1", 1800086401), ("s1", 1799999950), ("s1", 1799999000), ("s2", 1800000000), ("", 1800000000)] {
+        let (sid, at32) = case
+        let at = at32 as i64
+        let mut l = lit("check session=")
+        bytes.append(inout l, lit(sid))
+        bytes.append(inout l, lit(" at +"))
+        bytes.append(inout l, bytes.from_i64(at - 1800000000))
+        bytes.append(inout l, lit(": "))
+        match csrf.check_token_at(cfg, lit(sid), t1, at) {
+            Ok(_) => bytes.append(inout l, lit("valid"))
+            Err(w) => bytes.append(inout l, csrf.reject_reason(csrf.BadToken(w)).bytes())
+        }
+        io.outln(l)
+    }
+    for bad in ["", "a.b.c", "x", "MDEyMzQ1Njc4OWFiY2RlZg.1800000000", "MDEyMzQ1Njc4OWFiY2RlZg.-1.AAAA", "MDEyMzQ1Njc4OWFiY2RlZg.1800000000.AAAA", "MDEyMzQ1Njc4OWFiY2RlZg.1800000000.!!!!", "a.b.c.d"] {
+        let mut l = lit("token [")
+        bytes.append(inout l, lit(bad))
+        bytes.append(inout l, lit("]: "))
+        match csrf.check_token_at(cfg, lit("s1"), lit(bad), 1800000000) {
+            Ok(_) => bytes.append(inout l, lit("valid"))
+            Err(w) => bytes.append(inout l, csrf.reject_reason(csrf.BadToken(w)).bytes())
+        }
+        io.outln(l)
+    }
+    // one flipped character of the MAC
+    let mut flipped = t1.copy()
+    flipped[flipped.len() - 3] = if flipped[flipped.len() - 3] == 65 { 66 } else { 65 }
+    print(csrf.check_token_at(cfg, lit("s1"), flipped, 1800000000).is_err())
+    let mut nonce_changed = t1.copy()
+    nonce_changed[2] = if nonce_changed[2] == 65 { 66 } else { 65 }
+    print(csrf.check_token_at(cfg, lit("s1"), nonce_changed, 1800000000).is_err())
+    // another server key
+    let other = csrf.new(lit("fedcba9876543210fedcba9876543210"), csrf.session_cookie("sid")).unwrap()
+    print(csrf.check_token_at(other, lit("s1"), t1, 1800000000).is_err())
+
+    io.outln(lit("-- the token cookie on safe requests"))
+    let h = csrf.protect(cfg, ok_handler())
+    let first = h(req("GET", List[hv("host", lit("app.example")), hv("cookie", lit("sid=s1"))]))
+    show("GET without a cookie", first)
+    let tok = cookie_token(first)
+    show("GET with a cookie", h(req("GET", List[hv("host", lit("app.example")), hv("cookie", cookies(tok, "s1"))])))
+    show("GET, the cookie is for another session", h(req("GET", List[hv("host", lit("app.example")), hv("cookie", cookies(tok, "s2"))])))
+    show("GET, a forged cookie", h(req("GET", List[hv("host", lit("app.example")), hv("cookie", lit("__Host-csrf=junk.1.junk; sid=s1"))])))
+    show("HEAD", h(req("HEAD", List[hv("host", lit("app.example")), hv("cookie", cookies(tok, "s1"))])))
+    show("OPTIONS", h(req("OPTIONS", List[hv("host", lit("app.example")), hv("cookie", cookies(tok, "s1"))])))
+    // the handler's own context entry cannot be forged by the client: it is replaced
+    let mut spoofed = req("GET", List[hv("cookie", cookies(tok, "s1"))])
+    spoofed.set_ctx("csrf_token", lit("evil"))
+    show("GET with a planted ctx", h(spoofed))
+
+    io.outln(lit("-- unsafe requests"))
+    let sid1 = csrf.token_at(cfg, lit("s1"), now, lit("aaaaaaaaaaaaaaaa"))
+    let sid1b = csrf.token_at(cfg, lit("s1"), now, lit("bbbbbbbbbbbbbbbb"))
+    let sid2 = csrf.token_at(cfg, lit("s2"), now, lit("aaaaaaaaaaaaaaaa"))
+    let old = csrf.token_at(cfg, lit("s1"), now - 100000, lit("aaaaaaaaaaaaaaaa"))
+    let host = hv("host", lit("app.example"))
+    let own = hv("origin", lit("https://app.example"))
+    let logged = csrf.protect_logged(cfg, |why: String| { let mut l = lit("  refused: ")
+        bytes.append(inout l, why.bytes())
+        io.outln(l) }, ok_handler())
+    show("good: origin, cookie, header", logged(req("POST", List[host, own, hv("cookie", cookies(sid1, "s1")), hv("x-csrf-token", sid1)])))
+    show("good: no Origin, no Sec-Fetch-Site", logged(req("DELETE", List[host, hv("cookie", cookies(sid1, "s1")), hv("x-csrf-token", sid1)])))
+    show("good: PUT", logged(req("PUT", List[host, own, hv("cookie", cookies(sid1, "s1")), hv("x-csrf-token", sid1)])))
+    show("good: PATCH, Sec-Fetch-Site same-origin", logged(req("PATCH", List[host, hv("sec-fetch-site", lit("same-origin")), hv("cookie", cookies(sid1, "s1")), hv("x-csrf-token", sid1)])))
+    show("no header", logged(req("POST", List[host, own, hv("cookie", cookies(sid1, "s1"))])))
+    show("no cookie", logged(req("POST", List[host, own, hv("cookie", lit("sid=s1")), hv("x-csrf-token", sid1)])))
+    show("no Cookie header at all", logged(req("POST", List[host, own, hv("x-csrf-token", sid1)])))
+    show("header differs from the cookie (both valid)", logged(req("POST", List[host, own, hv("cookie", cookies(sid1, "s1")), hv("x-csrf-token", sid1b)])))
+    show("token of another session", logged(req("POST", List[host, own, hv("cookie", cookies(sid2, "s1")), hv("x-csrf-token", sid2)])))
+    show("no session at all", logged(req("POST", List[host, own, hv("cookie", cookies(sid1, "")), hv("x-csrf-token", sid1)])))
+    show("expired", logged(req("POST", List[host, own, hv("cookie", cookies(old, "s1")), hv("x-csrf-token", old)])))
+    show("forged", logged(req("POST", List[host, own, hv("cookie", cookies(lit("AAAA.1.AAAA"), "s1")), hv("x-csrf-token", lit("AAAA.1.AAAA"))])))
+    show("lowercase method is not a safe one", logged(req("post", List[host, own, hv("cookie", cookies(sid1, "s1"))])))
+    show("duplicate cookie", logged(req("POST", List[host, own, hv("cookie", cookies(sid1, "s1")), hv("cookie", cookies(sid1b, "s1")), hv("x-csrf-token", sid1)])))
+    show("duplicate cookie, one header", logged(req("POST", List[host, own, hv("cookie", lit("__Host-csrf=x; __Host-csrf=y; sid=s1")), hv("x-csrf-token", sid1)])))
+    show("quoted cookie value", logged(req("POST", List[host, own, hv("cookie", lit("sid=s1; __Host-csrf=\"x\"")), hv("x-csrf-token", sid1)])))
+
+    io.outln(lit("-- Origin and Sec-Fetch-Site"))
+    let good = List[hv("cookie", cookies(sid1, "s1")), hv("x-csrf-token", sid1)]
+    let with = fn_with(good)
+    say("Origin = Host", csrf.check_at(cfg, with(List[host, hv("origin", lit("https://app.example"))]), Some(sid1), now))
+    say("Origin = Host, other case", csrf.check_at(cfg, with(List[host, hv("origin", lit("https://APP.example"))]), Some(sid1), now))
+    say("Origin with a port", csrf.check_at(cfg, with(List[hv("host", lit("app.example:8443")), hv("origin", lit("https://app.example:8443"))]), Some(sid1), now))
+    say("Origin on another port", csrf.check_at(cfg, with(List[hv("host", lit("app.example:8443")), hv("origin", lit("https://app.example"))]), Some(sid1), now))
+    say("Origin evil", csrf.check_at(cfg, with(List[host, hv("origin", lit("https://evil.example"))]), Some(sid1), now))
+    say("Origin evil prefix", csrf.check_at(cfg, with(List[host, hv("origin", lit("https://app.example.evil.example"))]), Some(sid1), now))
+    say("Origin null", csrf.check_at(cfg, with(List[host, hv("origin", lit("null"))]), Some(sid1), now))
+    say("Origin without a scheme", csrf.check_at(cfg, with(List[host, hv("origin", lit("app.example"))]), Some(sid1), now))
+    say("Origin, no Host", csrf.check_at(cfg, with(List[hv("origin", lit("https://app.example"))]), Some(sid1), now))
+    say("Origin ok but Sec-Fetch-Site cross-site", csrf.check_at(cfg, with(List[host, hv("origin", lit("https://app.example")), hv("sec-fetch-site", lit("cross-site"))]), Some(sid1), now))
+    say("Sec-Fetch-Site same-origin", csrf.check_at(cfg, with(List[hv("sec-fetch-site", lit("same-origin"))]), Some(sid1), now))
+    say("Sec-Fetch-Site none", csrf.check_at(cfg, with(List[hv("sec-fetch-site", lit("none"))]), Some(sid1), now))
+    say("Sec-Fetch-Site cross-site", csrf.check_at(cfg, with(List[hv("sec-fetch-site", lit("cross-site"))]), Some(sid1), now))
+    say("Sec-Fetch-Site same-site", csrf.check_at(cfg, with(List[hv("sec-fetch-site", lit("same-site"))]), Some(sid1), now))
+    say("neither header", csrf.check_at(cfg, with(List[host]), Some(sid1), now))
+    cfg.allow_same_site = true
+    say("same-site, allowed", csrf.check_at(cfg, with(List[hv("sec-fetch-site", lit("same-site"))]), Some(sid1), now))
+    say("cross-site, still refused", csrf.check_at(cfg, with(List[hv("sec-fetch-site", lit("cross-site"))]), Some(sid1), now))
+    cfg.allow_same_site = false
+    cfg.require_origin = true
+    say("neither header, require_origin", csrf.check_at(cfg, with(List[host]), Some(sid1), now))
+    say("Origin, require_origin", csrf.check_at(cfg, with(List[host, hv("origin", lit("https://app.example"))]), Some(sid1), now))
+    cfg.require_origin = false
+    cfg.origins = List[lit("https://app.example"), lit("https://admin.example")]
+    say("listed origin, another Host", csrf.check_at(cfg, with(List[hv("host", lit("api.example")), hv("origin", lit("https://admin.example"))]), Some(sid1), now))
+    say("unlisted origin, same Host", csrf.check_at(cfg, with(List[hv("host", lit("evil.example")), hv("origin", lit("https://evil.example"))]), Some(sid1), now))
+    cfg.origins = List.new()
+
+    io.outln(lit("-- the form flavour"))
+    let f = csrf.protect_form(cfg, |r: http.Request| -> http.Response {
+        let field = lit("submitted")
+        let _ = field
+        http.respond(200, "text/plain", lit("form handler"))
+    })
+    show("form POST, cookie ok", f(req("POST", List[host, own, hv("cookie", cookies(sid1, "s1"))])))
+    show("form POST, no cookie", f(req("POST", List[host, own])))
+    show("form POST, evil origin", f(req("POST", List[host, hv("origin", lit("https://evil.example")), hv("cookie", cookies(sid1, "s1"))])))
+    let q = req("POST", List[host, own, hv("cookie", cookies(sid1, "s1"))])
+    print(csrf.check_form_token(cfg, q, sid1).is_ok())
+    print(csrf.check_form_token(cfg, q, sid1b).is_err())
+    print(csrf.check_form_token(cfg, q, lit("")).is_err())
+
+    io.outln(lit("-- cookies"))
+    let o = csrf.cookie_opts()
+    io.outln(csrf.set_cookie(lit("a"), lit("b"), o).unwrap())
+    let mut strict = csrf.cookie_opts()
+    strict.same_site = csrf.Strict
+    strict.http_only = true
+    strict.max_age = Some(3600)
+    strict.domain = Some(lit("example.com"))
+    strict.path = lit("/app")
+    io.outln(csrf.set_cookie(lit("sid"), lit("abc.def-ghi_jkl"), strict).unwrap())
+    let mut dev = csrf.cookie_opts()
+    dev.secure = false
+    io.outln(csrf.set_cookie(lit("csrf"), lit("x"), dev).unwrap())
+    dev.same_site = csrf.CrossSite
+    print(csrf.set_cookie(lit("csrf"), lit("x"), dev).is_err())
+    let mut n = csrf.cookie_opts()
+    n.same_site = csrf.CrossSite
+    io.outln(csrf.set_cookie(lit("x"), lit("y"), n).unwrap())
+    print(csrf.set_cookie(lit("__Host-a"), lit("b"), o).is_ok())
+    print(csrf.set_cookie(lit("__Host-a"), lit("b"), dev).is_err())
+    print(csrf.set_cookie(lit("__Host-a"), lit("b"), strict).is_err())
+    print(csrf.set_cookie(lit("__Secure-a"), lit("b"), dev).is_err())
+    print(csrf.set_cookie(lit("a b"), lit("b"), o).is_err())
+    print(csrf.set_cookie(lit("a"), lit("b;Secure"), o).is_err())
+    print(csrf.set_cookie(lit("a"), lit("b c"), o).is_err())
+    print(csrf.set_cookie(lit("a"), lit("b\"c"), o).is_err())
+    print(csrf.set_cookie(lit("a"), lit("b,c"), o).is_err())
+    print(csrf.set_cookie(lit("a"), lit("b\r\nSet-Cookie: x=y"), o).is_err())
+    let mut inj = csrf.cookie_opts()
+    inj.path = lit("/; Domain=evil")
+    print(csrf.set_cookie(lit("a"), lit("b"), inj).is_err())
+    let r = req("GET", List[hv("cookie", lit("a=1; b=2;c=3 ;  d=\"4\"; b2=5"))])
+    for name in ["a", "b", "c", "d", "e", "b2"] {
+        let mut l = lit(name)
+        bytes.append(inout l, lit(" = "))
+        match csrf.cookie_value(r, lit(name)) {
+            Some(v) => bytes.append(inout l, v)
+            None => bytes.append(inout l, lit("(none)"))
+        }
+        io.outln(l)
+    }
+    print(csrf.is_safe(lit("GET")))
+    print(csrf.is_safe(lit("POST")))
+}
+
+fn fn_with(base: List[(str, List[u8])]) -> fn(List[(str, List[u8])]) -> http.Request {
+    |extra: List[(str, List[u8])]| -> http.Request {
+        let mut all = base.copy()
+        for e in extra { all.push(e) }
+        req("POST", all)
+    }
+}

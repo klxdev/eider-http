@@ -1,0 +1,796 @@
+//! http/jwt: JSON Web Tokens (RFC 7519) signed as compact JWS (RFC 7515): verification and
+//! signing, key sets (JWKS, RFC 7517) and the claim checks, on the toolchain's crypto package.
+//!
+//!     let keys = jwt.keyset().add("2026-11", jwt.Secret(secret))
+//!     let mut v = jwt.validation([jwt.HS256])        // the allow-list: no default
+//!     v.issuer = Some(lit("https://issuer.example"))
+//!     v.audience = Some(lit("my-api"))
+//!     match jwt.verify(v, keys, token) {
+//!         Ok(claims) => ... claims.subject() ...
+//!         Err(e) => ... jwt.error_text(e) ...      // never shown to the client
+//!     }
+//!     let token = jwt.sign(jwt.HS256, jwt.SecretKey(secret), lit("2026-11"), payload)?
+//!
+//! What it refuses (each is a known way JWT libraries have been broken):
+//! - `alg` is never taken from the token alone: it must be in the caller's `Validation.algs`
+//!   AND fit the type of the key chosen for it (a `Secret` takes HS256/384/512 only, an RSA
+//!   key RS*/PS*, a P-256 key ES256, a P-384 key ES384, an Ed25519 key EdDSA), so a token
+//!   cannot present an RSA public key as an HMAC secret. `none` (and anything unknown, such
+//!   as ES512) is "unsupported", always; a key set entry may also pin its own `alg`.
+//! - the signature is checked before the payload is parsed; tags and signatures are compared
+//!   in constant time (the crypto package); `crit`, which this code cannot honour, is refused,
+//!   so is a duplicated member in the header or the payload, padding in base64url, and
+//!   anything over `max_size` bytes (default 8192).
+//! - `exp` (required by default), `nbf`, `iat` (not in the future) with a `leeway` in seconds,
+//!   `iss` equal to the expected issuer and `aud` (a string or an array) containing the
+//!   expected audience. With `audience = None` no audience is required: set it.
+//! - keys are picked by `kid`: a token naming a `kid` the set does not hold is refused (no
+//!   fall back to another key); a token without one needs a set of exactly one key.
+//!
+//! Not here: ES512 (P-521: the crypto package has P-256 and P-384), JWE (encryption), nested
+//! JWTs, fetching a JWKS over the network (parse the document with `parse_jwks`; the refresh
+//! policy is the application's). Time is a parameter of `verify_at` (the tests); `verify`
+//! reads the clock.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.time
+import crypto
+import json
+
+/// A JWS algorithm (RFC 7518): HMAC (HS), RSASSA-PKCS1-v1_5 (RS), RSASSA-PSS (PS), ECDSA (ES)
+/// and Ed25519 (EdDSA, RFC 8037).
+pub type Alg = | HS256 | HS384 | HS512 | RS256 | RS384 | RS512 | PS256 | PS384 | PS512 | ES256 | ES384 | EdDSA
+
+/// The `alg` name of an algorithm.
+pub fn alg_name(a: Alg) -> str {
+    match a {
+        HS256 => "HS256"
+        HS384 => "HS384"
+        HS512 => "HS512"
+        RS256 => "RS256"
+        RS384 => "RS384"
+        RS512 => "RS512"
+        PS256 => "PS256"
+        PS384 => "PS384"
+        PS512 => "PS512"
+        ES256 => "ES256"
+        ES384 => "ES384"
+        EdDSA => "EdDSA"
+    }
+}
+
+/// The algorithm called `name` (exact, case-sensitive, as RFC 7518 spells them); None for
+/// `none` and everything this package does not implement.
+pub fn alg_of(name: List[u8]) -> Option[Alg] {
+    let all = [HS256, HS384, HS512, RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, EdDSA]
+    for a in all {
+        if http_eq(name, sys.lit(alg_name(a))) { return Some(a) }
+    }
+    None
+}
+
+fn http_eq(a: List[u8], b: List[u8]) -> bool { bytes.eq(a, b) }
+
+fn hash_of(a: Alg) -> crypto.Hash {
+    match a {
+        HS256 => crypto.Sha256
+        RS256 => crypto.Sha256
+        PS256 => crypto.Sha256
+        ES256 => crypto.Sha256
+        HS384 => crypto.Sha384
+        RS384 => crypto.Sha384
+        PS384 => crypto.Sha384
+        ES384 => crypto.Sha384
+        HS512 => crypto.Sha512
+        RS512 => crypto.Sha512
+        PS512 => crypto.Sha512
+        EdDSA => crypto.Sha512
+    }
+}
+
+fn is_hs(a: Alg) -> bool { a == HS256 || a == HS384 || a == HS512 }
+fn is_rs(a: Alg) -> bool { a == RS256 || a == RS384 || a == RS512 }
+fn is_ps(a: Alg) -> bool { a == PS256 || a == PS384 || a == PS512 }
+
+// ---- keys
+
+/// A key that verifies: an HMAC secret, an RSA or an EC (P-256, P-384) public key, an Ed25519
+/// public key.
+pub type Key = | Secret(bytes: List[u8]) | Rsa(key: crypto.RsaPublic) | Ec(key: crypto.EcPublic) | Ed25519(key: crypto.Ed25519Public)
+
+/// A key that signs.
+pub type SigningKey = | SecretKey(bytes: List[u8]) | RsaPrivate(key: crypto.RsaPrivate) | EcPrivate(key: crypto.EcSecret) | Ed25519Seed(key: crypto.Ed25519Seed)
+
+/// An HMAC secret of at least 32 bytes (RFC 7518 section 3.2: as long as the hash of the
+/// smallest HS algorithm); Err otherwise. `Secret(bytes)` takes any non-empty length.
+pub fn secret_strong(b: List[u8]) -> Result[Key, String] {
+    if b.len() < 32 { return Err(String.from("an HMAC secret needs at least 32 bytes")) }
+    Ok(Secret(b))
+}
+
+/// Whether `alg` may be used with `k`: the type of the key decides, never the token.
+pub fn key_allows(k: Key, a: Alg) -> bool {
+    match k {
+        Secret(b) => is_hs(a) && b.len() > 0
+        Rsa(pk) => (is_rs(a) || is_ps(a)) && crypto.rsa_bits(pk) >= 2048
+        Ec(pk) => match pk.curve {
+            crypto.P256 => a == ES256
+            crypto.P384 => a == ES384
+        }
+        Ed25519(_) => a == EdDSA
+    }
+}
+
+fn signing_allows(k: SigningKey, a: Alg) -> bool {
+    match k {
+        SecretKey(b) => is_hs(a) && b.len() > 0
+        RsaPrivate(sk) => (is_rs(a) || is_ps(a)) && crypto.rsa_bits(crypto.rsa_public_of(sk)) >= 2048
+        EcPrivate(sk) => match sk.curve {
+            crypto.P256 => a == ES256
+            crypto.P384 => a == ES384
+        }
+        Ed25519Seed(_) => a == EdDSA
+    }
+}
+
+/// A key and its identity in a key set: the `kid` (empty: none) and, optionally, the one
+/// algorithm it may be used with (a JWK's `alg`).
+pub type KeyEntry = { kid: List[u8], alg: Option[Alg], key: Key }
+
+/// The keys a verifier trusts.
+pub type KeySet = { keys: List[KeyEntry] }
+
+/// An empty key set.
+pub fn keyset() -> KeySet { KeySet(List.new()) }
+
+impl KeySet {
+    /// The set with `key` added under `kid` ("": no id).
+    fn add(self, kid: str, key: Key) -> KeySet {
+        let mut ks = self.keys.copy()
+        ks.push(KeyEntry(sys.lit(kid), None, key))
+        KeySet(ks)
+    }
+
+    /// The set with `key` added under `kid`, usable only with `alg`.
+    fn add_for(self, kid: str, alg: Alg, key: Key) -> KeySet {
+        let mut ks = self.keys.copy()
+        ks.push(KeyEntry(sys.lit(kid), Some(alg), key))
+        KeySet(ks)
+    }
+
+    /// The number of keys.
+    fn len(self) -> usize { self.keys.len() }
+}
+
+fn b64(s: List[u8]) -> Option[List[u8]] {
+    for c in s {
+        if c == 61 { return None }
+    }
+    match encoding.unbase64_url(s) {
+        Ok(b) => Some(b)
+        Err(_) => None
+    }
+}
+
+fn jstr(d: json.Doc, id: u32, k: str) -> Option[List[u8]] {
+    let n = json.field(d, id, k)?
+    json.as_str(d, n)
+}
+
+fn fixed(b: List[u8], n: usize) -> Option[List[u8]] {
+    // a JWK coordinate is the full-width big-endian number (RFC 7518 section 6.2.1.2)
+    if b.len() != n { return None }
+    Some(b)
+}
+
+/// The keys of a JWK Set document (RFC 7517 section 5): `{"keys":[...]}`. Understood:
+/// `RSA` (n, e), `EC` with P-256 and P-384 (x, y), `OKP` with Ed25519 (x), and `oct` (k) only
+/// when `allow_oct` (a symmetric key in a set fetched from a remote issuer is a red flag).
+/// A key with `"use":"enc"` or another type (or curve) is skipped; a malformed key or document
+/// is an Err. A JWK's `kid` and `alg` are kept (the `alg` pins the entry).
+pub fn parse_jwks(src: List[u8], allow_oct: bool) -> Result[KeySet, String] {
+    let doc = match json.parse_with(src, json.Limits(1048576, 8, 65536, 1000, false)) {
+        Ok(d) => d
+        Err(_) => { return Err(String.from("the JWKS is not valid JSON")) }
+    }
+    let arr = match json.field(doc, doc.root, "keys") {
+        Some(a) => a
+        None => { return Err(String.from("the JWKS has no \"keys\"")) }
+    }
+    if json.kind(doc, arr) != json.ARRAY { return Err(String.from("\"keys\" is not an array")) }
+    let mut out = keyset()
+    let n = json.len(doc, arr)
+    let mut i: u32 = 0
+    while i < n {
+        let j = match json.at(doc, arr, i) {
+            Some(x) => x
+            None => { return Err(String.from("bad JWKS")) }
+        }
+        i += 1
+        if json.kind(doc, j) != json.OBJECT { return Err(String.from("a JWK is not an object")) }
+        let kty = match jstr(doc, j, "kty") {
+            Some(k) => k
+            None => { return Err(String.from("a JWK has no kty")) }
+        }
+        match jstr(doc, j, "use") {
+            Some(u) => { if bytes.eq(u, sys.lit("enc")) { continue } }
+            None => {}
+        }
+        let kid = match jstr(doc, j, "kid") {
+            Some(k) => k
+            None => { let e: List[u8] = List.new()
+                e }
+        }
+        let mut pin: Option[Alg] = None
+        match jstr(doc, j, "alg") {
+            Some(a) => {
+                match alg_of(a) {
+                    Some(x) => { pin = Some(x) }
+                    None => { continue }
+                }
+            }
+            None => {}
+        }
+        let key: Key = if bytes.eq(kty, sys.lit("RSA")) {
+            let nb = match jstr(doc, j, "n") {
+                Some(x) => x
+                None => { return Err(String.from("an RSA JWK has no n")) }
+            }
+            let eb = match jstr(doc, j, "e") {
+                Some(x) => x
+                None => { return Err(String.from("an RSA JWK has no e")) }
+            }
+            let nn = match b64(nb) {
+                Some(x) => x
+                None => { return Err(String.from("bad base64url in an RSA JWK")) }
+            }
+            let ee = match b64(eb) {
+                Some(x) => x
+                None => { return Err(String.from("bad base64url in an RSA JWK")) }
+            }
+            match crypto.rsa_public_from_ne(nn, ee) {
+                Ok(k) => Rsa(k)
+                Err(_) => { return Err(String.from("an RSA JWK is not a usable key (2048 bits or more)")) }
+            }
+        } else if bytes.eq(kty, sys.lit("EC")) {
+            let crv = match jstr(doc, j, "crv") {
+                Some(x) => x
+                None => { return Err(String.from("an EC JWK has no crv")) }
+            }
+            let curve = if bytes.eq(crv, sys.lit("P-256")) { crypto.P256 } else if bytes.eq(crv, sys.lit("P-384")) { crypto.P384 } else { continue }
+            let size = crypto.ec_scalar_len(curve)
+            let xb = match jstr(doc, j, "x") {
+                Some(x) => x
+                None => { return Err(String.from("an EC JWK has no x")) }
+            }
+            let yb = match jstr(doc, j, "y") {
+                Some(x) => x
+                None => { return Err(String.from("an EC JWK has no y")) }
+            }
+            let x = match b64(xb) {
+                Some(v) => v
+                None => { return Err(String.from("bad base64url in an EC JWK")) }
+            }
+            let y = match b64(yb) {
+                Some(v) => v
+                None => { return Err(String.from("bad base64url in an EC JWK")) }
+            }
+            if x.len() != size || y.len() != size { return Err(String.from("an EC JWK coordinate has the wrong length")) }
+            let mut pt: List[u8] = List.new()
+            pt.push(4)
+            bytes.append(inout pt, x)
+            bytes.append(inout pt, y)
+            match crypto.ec_public_key(curve, pt) {
+                Ok(k) => Ec(k)
+                Err(_) => { return Err(String.from("an EC JWK is not a point on its curve")) }
+            }
+        } else if bytes.eq(kty, sys.lit("OKP")) {
+            let crv = match jstr(doc, j, "crv") {
+                Some(x) => x
+                None => { return Err(String.from("an OKP JWK has no crv")) }
+            }
+            if !bytes.eq(crv, sys.lit("Ed25519")) { continue }
+            let xb = match jstr(doc, j, "x") {
+                Some(x) => x
+                None => { return Err(String.from("an OKP JWK has no x")) }
+            }
+            let x = match b64(xb) {
+                Some(v) => v
+                None => { return Err(String.from("bad base64url in an OKP JWK")) }
+            }
+            match crypto.ed25519_public_key(x) {
+                Ok(k) => Ed25519(k)
+                Err(_) => { return Err(String.from("an Ed25519 JWK is not a key")) }
+            }
+        } else if bytes.eq(kty, sys.lit("oct")) {
+            if !allow_oct { continue }
+            let kb = match jstr(doc, j, "k") {
+                Some(x) => x
+                None => { return Err(String.from("an oct JWK has no k")) }
+            }
+            match b64(kb) {
+                Some(v) => {
+                    if v.len() == 0 { return Err(String.from("an oct JWK is empty")) }
+                    Secret(v)
+                }
+                None => { return Err(String.from("bad base64url in an oct JWK")) }
+            }
+        } else {
+            continue
+        }
+        let mut ks = out.keys.copy()
+        ks.push(KeyEntry(kid, pin, key))
+        out = KeySet(ks)
+    }
+    Ok(out)
+}
+
+// ---- errors
+
+/// Why a token was refused. Log it; do not show it to the client (the middleware answers
+/// `invalid_token` for all of them).
+pub type Error =
+    | TooLarge
+    | Malformed(why: String)
+    | UnsupportedAlg
+    | KeyNotFound
+    | BadSignature
+    | Expired
+    | NotYetValid
+    | IssuedInFuture
+    | WrongIssuer
+    | WrongAudience
+    | MissingClaim(name: String)
+
+/// A short description of why a token was refused.
+pub fn error_text(e: Error) -> String {
+    match e {
+        TooLarge => String.from("token too large")
+        Malformed(w) => {
+            let mut s = String.from("malformed token: ")
+            s.append(w)
+            s
+        }
+        UnsupportedAlg => String.from("unsupported or disallowed algorithm")
+        KeyNotFound => String.from("no key for the token")
+        BadSignature => String.from("bad signature")
+        Expired => String.from("token expired")
+        NotYetValid => String.from("token not yet valid")
+        IssuedInFuture => String.from("token issued in the future")
+        WrongIssuer => String.from("wrong issuer")
+        WrongAudience => String.from("wrong audience")
+        MissingClaim(n) => {
+            let mut s = String.from("missing claim ")
+            s.append(n)
+            s
+        }
+    }
+}
+
+// ---- verification
+
+/// What a token must satisfy. `algs` is the allow-list (required: there is no default);
+/// `issuer` and `audience`, when Some, must match; `leeway` is seconds of clock skew
+/// forgiven; `require_exp` (default true) refuses a token without `exp`; `max_age`, when
+/// above 0, refuses a token whose `iat` is more than that many seconds old (and one without
+/// `iat`); `max_size` is the longest token accepted.
+pub type Validation = { algs: List[Alg], issuer: Option[List[u8]], audience: Option[List[u8]], leeway: i64, require_exp: bool, max_age: i64, max_size: usize }
+
+/// A validation allowing `algs`, with no issuer or audience requirement, no leeway, `exp`
+/// required, and tokens up to 8192 bytes.
+pub fn validation(algs: List[Alg]) -> Validation { Validation(algs, None, None, 0, true, 0, 8192) }
+
+/// A verified token: its payload (`raw`, and parsed as `doc`), the algorithm it used and its `kid`.
+pub type Claims = { doc: json.Doc, raw: List[u8], alg: Alg, kid: List[u8] }
+
+impl Claims {
+    /// The string claim `name` (None when absent or not a string).
+    fn str(self, name: str) -> Option[List[u8]] { jstr(self.doc, self.doc.root, name) }
+
+    /// The integer claim `name` (None when absent or not an integer).
+    fn int(self, name: str) -> Option[i64] {
+        let n = json.field(self.doc, self.doc.root, name)?
+        json.as_int(self.doc, n)
+    }
+
+    /// `sub`.
+    fn subject(self) -> Option[List[u8]] { self.str("sub") }
+
+    /// `iss`.
+    fn issuer(self) -> Option[List[u8]] { self.str("iss") }
+
+    /// The space-separated scopes of the `scope` claim (RFC 8693) or `scp` (a string or an array).
+    fn scopes(self) -> List[List[u8]] {
+        let mut out: List[List[u8]] = List.new()
+        match self.str("scope") {
+            Some(s) => {
+                for p in bytes.split(s, 32) {
+                    if p.len() > 0 { out.push(p) }
+                }
+                return out
+            }
+            None => {}
+        }
+        match json.field(self.doc, self.doc.root, "scp") {
+            Some(n) => {
+                match json.as_str(self.doc, n) {
+                    Some(s) => {
+                        for p in bytes.split(s, 32) {
+                            if p.len() > 0 { out.push(p) }
+                        }
+                    }
+                    None => {
+                        let c = json.len(self.doc, n)
+                        let mut i: u32 = 0
+                        while i < c {
+                            match json.at(self.doc, n, i) {
+                                Some(e) => {
+                                    match json.as_str(self.doc, e) {
+                                        Some(s) => { out.push(s) }
+                                        None => {}
+                                    }
+                                }
+                                None => {}
+                            }
+                            i += 1
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+        out
+    }
+
+    /// Whether the token carries `scope`.
+    fn has_scope(self, scope: str) -> bool {
+        let want = sys.lit(scope)
+        for s in self.scopes() {
+            if bytes.eq(s, want) { return true }
+        }
+        false
+    }
+}
+
+fn jlimits() -> json.Limits { json.Limits(8192, 16, 4096, 256, false) }
+
+fn pick_key(keys: KeySet, kid: List[u8], a: Alg) -> Result[Key, Error] {
+    if kid.len() == 0 {
+        if keys.keys.len() != 1 { return Err(KeyNotFound) }
+        let e = keys.keys[0]
+        if !entry_ok(e, a) { return Err(UnsupportedAlg) }
+        return Ok(e.key)
+    }
+    let mut seen = false
+    for e in keys.keys {
+        if bytes.eq(e.kid, kid) {
+            seen = true
+            if entry_ok(e, a) { return Ok(e.key) }
+        }
+    }
+    if seen { Err(UnsupportedAlg) } else { Err(KeyNotFound) }
+}
+
+fn entry_ok(e: KeyEntry, a: Alg) -> bool {
+    let pinned = match e.alg {
+        Some(p) => p == a
+        None => true
+    }
+    pinned && key_allows(e.key, a)
+}
+
+fn check_sig(a: Alg, k: Key, msg: List[u8], sig: List[u8]) -> bool {
+    if !key_allows(k, a) { return false }
+    let h = hash_of(a)
+    match k {
+        Secret(b) => {
+            match crypto.hmac(crypto.hmac_key(h, b), msg) {
+                Ok(t) => t.matches(sig)
+                Err(_) => false
+            }
+        }
+        Rsa(pk) => {
+            if is_rs(a) {
+                crypto.rsa_pkcs1_verify(pk, h, msg, crypto.rsa_signature(sig))
+            } else {
+                crypto.rsa_pss_verify_tls(pk, h, msg, crypto.rsa_signature(sig))
+            }
+        }
+        Ec(pk) => {
+            match crypto.ec_signature_raw(pk.curve, sig) {
+                Ok(s) => crypto.ec_verify(pk, h, msg, s)
+                Err(_) => false
+            }
+        }
+        Ed25519(pk) => {
+            match crypto.ed25519_signature(sig) {
+                Ok(s) => crypto.ed25519_verify(pk, msg, s)
+                Err(_) => false
+            }
+        }
+    }
+}
+
+// NumericDate (RFC 7519 section 2): a JSON number, possibly fractional; seconds, rounded down
+fn numeric_date(d: json.Doc, n: u32) -> Option[i64] {
+    let t = json.num_text(d, n)?
+    if t.len() == 0 || t.len() > 18 { return None }
+    let mut v: i64 = 0
+    let mut i: usize = 0
+    let mut digits: usize = 0
+    while i < t.len() && t[i] >= 48 && t[i] <= 57 {
+        v = v * 10 + ((t[i] - 48) as i64)
+        i += 1
+        digits += 1
+    }
+    if digits == 0 { return None }
+    if i < t.len() {
+        if t[i] != 46 { return None }
+        i += 1
+        if i == t.len() { return None }
+        while i < t.len() {
+            if t[i] < 48 || t[i] > 57 { return None }
+            i += 1
+        }
+    }
+    Some(v)
+}
+
+fn has_aud(d: json.Doc, n: u32, want: List[u8]) -> bool {
+    match json.as_str(d, n) {
+        Some(s) => { return bytes.eq(s, want) }
+        None => {}
+    }
+    if json.kind(d, n) != json.ARRAY { return false }
+    let c = json.len(d, n)
+    let mut i: u32 = 0
+    let mut found = false
+    while i < c {
+        match json.at(d, n, i) {
+            Some(e) => {
+                match json.as_str(d, e) {
+                    Some(s) => { if bytes.eq(s, want) { found = true } }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        i += 1
+    }
+    found
+}
+
+fn check_claims(v: Validation, d: json.Doc, now: i64) -> Result[bool, Error] {
+    let r = d.root
+    match json.field(d, r, "exp") {
+        Some(n) => {
+            let e = match numeric_date(d, n) {
+                Some(x) => x
+                None => { return Err(Malformed(String.from("exp is not a NumericDate"))) }
+            }
+            if now >= e + v.leeway { return Err(Expired) }
+        }
+        None => { if v.require_exp { return Err(MissingClaim(String.from("exp"))) } }
+    }
+    match json.field(d, r, "nbf") {
+        Some(n) => {
+            let e = match numeric_date(d, n) {
+                Some(x) => x
+                None => { return Err(Malformed(String.from("nbf is not a NumericDate"))) }
+            }
+            if now + v.leeway < e { return Err(NotYetValid) }
+        }
+        None => {}
+    }
+    match json.field(d, r, "iat") {
+        Some(n) => {
+            let e = match numeric_date(d, n) {
+                Some(x) => x
+                None => { return Err(Malformed(String.from("iat is not a NumericDate"))) }
+            }
+            if now + v.leeway < e { return Err(IssuedInFuture) }
+            if v.max_age > 0 && now - e > v.max_age + v.leeway { return Err(Expired) }
+        }
+        None => { if v.max_age > 0 { return Err(MissingClaim(String.from("iat"))) } }
+    }
+    match v.issuer {
+        Some(want) => {
+            match jstr(d, r, "iss") {
+                Some(got) => { if !bytes.eq(got, want) { return Err(WrongIssuer) } }
+                None => { return Err(WrongIssuer) }
+            }
+        }
+        None => {}
+    }
+    match v.audience {
+        Some(want) => {
+            match json.field(d, r, "aud") {
+                Some(n) => { if !has_aud(d, n, want) { return Err(WrongAudience) } }
+                None => { return Err(WrongAudience) }
+            }
+        }
+        None => {}
+    }
+    Ok(true)
+}
+
+/// Verifies `token` (compact JWS) against `keys` and `v` at the time `now` (Unix seconds).
+/// The order: size, shape, header, algorithm allow-list, key by `kid` and key type,
+/// signature, and only then the payload and its claims.
+pub fn verify_at(v: Validation, keys: KeySet, token: List[u8], now: i64) -> Result[Claims, Error] {
+    if token.len() > v.max_size { return Err(TooLarge) }
+    let parts = bytes.split(token, 46)
+    if parts.len() != 3 { return Err(Malformed(String.from("not three dot-separated parts"))) }
+    if parts[0].len() == 0 || parts[1].len() == 0 || parts[2].len() == 0 { return Err(Malformed(String.from("an empty part"))) }
+    let hb = match b64(parts[0]) {
+        Some(x) => x
+        None => { return Err(Malformed(String.from("bad base64url in the header"))) }
+    }
+    let header = match json.parse_with(hb, jlimits()) {
+        Ok(d) => d
+        Err(_) => { return Err(Malformed(String.from("the header is not valid JSON"))) }
+    }
+    if json.kind(header, header.root) != json.OBJECT { return Err(Malformed(String.from("the header is not an object"))) }
+    // extensions this code does not implement are refused, as RFC 7515 section 4.1.11 requires
+    match json.field(header, header.root, "crit") {
+        Some(_) => { return Err(Malformed(String.from("crit is not supported"))) }
+        None => {}
+    }
+    let an = match jstr(header, header.root, "alg") {
+        Some(x) => x
+        None => { return Err(Malformed(String.from("the header has no alg"))) }
+    }
+    let a = match alg_of(an) {
+        Some(x) => x
+        None => { return Err(UnsupportedAlg) }
+    }
+    let mut allowed = false
+    for x in v.algs {
+        if x == a { allowed = true }
+    }
+    if !allowed { return Err(UnsupportedAlg) }
+    let kid = match json.field(header, header.root, "kid") {
+        Some(n) => {
+            match json.as_str(header, n) {
+                Some(s) => s
+                None => { return Err(Malformed(String.from("kid is not a string"))) }
+            }
+        }
+        None => { let e: List[u8] = List.new()
+            e }
+    }
+    let key = pick_key(keys, kid, a)?
+    let sig = match b64(parts[2]) {
+        Some(x) => x
+        None => { return Err(Malformed(String.from("bad base64url in the signature"))) }
+    }
+    let mut input = parts[0].copy()
+    input.push(46)
+    bytes.append(inout input, parts[1])
+    if !check_sig(a, key, input, sig) { return Err(BadSignature) }
+    let pb = match b64(parts[1]) {
+        Some(x) => x
+        None => { return Err(Malformed(String.from("bad base64url in the payload"))) }
+    }
+    let doc = match json.parse_with(pb, jlimits()) {
+        Ok(d) => d
+        Err(_) => { return Err(Malformed(String.from("the payload is not valid JSON"))) }
+    }
+    if json.kind(doc, doc.root) != json.OBJECT { return Err(Malformed(String.from("the payload is not an object"))) }
+    check_claims(v, doc, now)?
+    Ok(Claims(doc, pb, a, kid))
+}
+
+/// `verify_at` with the current time.
+pub fn verify(v: Validation, keys: KeySet, token: List[u8]) -> Result[Claims, Error] uses clock {
+    verify_at(v, keys, token, time.unix_seconds())
+}
+
+// ---- signing
+
+/// The claims of a token to sign, as a JSON object: `claims().str("iss", ..).int("exp", ..).json()`.
+pub type ClaimSet = { members: List[List[u8]] }
+
+/// No claims yet.
+pub fn claims() -> ClaimSet { ClaimSet(List.new()) }
+
+fn member(name: str, value: List[u8]) -> List[u8] {
+    let mut m = json.quote(sys.lit(name))
+    m.push(58)
+    bytes.append(inout m, value)
+    m
+}
+
+impl ClaimSet {
+    /// With the string claim `name`.
+    fn str(self, name: str, value: List[u8]) -> ClaimSet {
+        let mut m = self.members.copy()
+        m.push(member(name, json.quote(value)))
+        ClaimSet(m)
+    }
+
+    /// With the integer claim `name` (a NumericDate for `exp`, `nbf`, `iat`).
+    fn int(self, name: str, value: i64) -> ClaimSet {
+        let mut m = self.members.copy()
+        m.push(member(name, bytes.from_i64(value)))
+        ClaimSet(m)
+    }
+
+    /// With the claim `name` an array of strings (`aud`).
+    fn strs(self, name: str, values: List[List[u8]]) -> ClaimSet {
+        let mut parts: List[List[u8]] = List.new()
+        for s in values { parts.push(json.quote(s)) }
+        let mut arr: List[u8] = List.new()
+        arr.push(91)
+        bytes.append(inout arr, bytes.join(parts, sys.lit(",")))
+        arr.push(93)
+        let mut m = self.members.copy()
+        m.push(member(name, arr))
+        ClaimSet(m)
+    }
+
+    /// The JSON object text.
+    fn json(self) -> List[u8] {
+        let mut out: List[u8] = List.new()
+        out.push(123)
+        bytes.append(inout out, bytes.join(self.members, sys.lit(",")))
+        out.push(125)
+        out
+    }
+}
+
+/// Signs `payload` (JSON text of the claims) as a compact JWS with `alg` and `key` (which
+/// must fit: `key_allows`' rule), with `kid` in the header when it is not empty. The header
+/// is `{"alg":"..","typ":"JWT"[,"kid":".."]}`.
+pub fn sign(a: Alg, key: SigningKey, kid: List[u8], payload: List[u8]) -> Result[List[u8], String] uses io {
+    if !signing_allows(key, a) { return Err(String.from("the key does not fit the algorithm")) }
+    let mut h = sys.lit(r#"{"alg":""#)
+    bytes.append(inout h, sys.lit(alg_name(a)))
+    bytes.append(inout h, sys.lit(r#"","typ":"JWT""#))
+    if kid.len() > 0 {
+        bytes.append(inout h, sys.lit(r#","kid":"#))
+        bytes.append(inout h, json.quote(kid))
+    }
+    h.push(125)
+    let mut input = encoding.base64_url(h).bytes()
+    input.push(46)
+    bytes.append(inout input, encoding.base64_url(payload).bytes())
+    let hh = hash_of(a)
+    let sig: List[u8] = match key {
+        SecretKey(b) => {
+            match crypto.hmac(crypto.hmac_key(hh, b), input) {
+                Ok(t) => t.bytes
+                Err(_) => { return Err(String.from("HMAC failed")) }
+            }
+        }
+        RsaPrivate(sk) => {
+            let r = if is_rs(a) { crypto.rsa_pkcs1_sign(sk, hh, input) } else { crypto.rsa_pss_sign(sk, hh, crypto.hash_len(hh), input) }
+            match r {
+                Ok(s) => s.bytes
+                Err(_) => { return Err(String.from("RSA signing failed")) }
+            }
+        }
+        EcPrivate(sk) => {
+            match crypto.ec_sign(sk, hh, input) {
+                Ok(s) => {
+                    match crypto.ec_signature_to_raw(sk.curve, s) {
+                        Ok(raw) => raw
+                        Err(_) => { return Err(String.from("ECDSA signing failed")) }
+                    }
+                }
+                Err(_) => { return Err(String.from("ECDSA signing failed")) }
+            }
+        }
+        Ed25519Seed(sd) => {
+            match crypto.ed25519_sign(sd, input) {
+                Ok(s) => s.bytes
+                Err(_) => { return Err(String.from("Ed25519 signing failed")) }
+            }
+        }
+    }
+    input.push(46)
+    bytes.append(inout input, encoding.base64_url(sig).bytes())
+    Ok(input)
+}

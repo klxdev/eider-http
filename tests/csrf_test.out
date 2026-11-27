@@ -1,0 +1,115 @@
+-- config
+true
+-- tokens
+MDEyMzQ1Njc4OWFiY2RlZg.1800000000.ae8HYnZHaWPbQSwVjgscmlgTD4x1tsNoDE2XAFx8Kq0
+true
+false
+check session=s1 at +0: valid
+check session=s1 at +86399: valid
+check session=s1 at +86401: the token has expired
+check session=s1 at +-50: valid
+check session=s1 at +-1000: the token is dated in the future
+check session=s2 at +0: the token is not signed for this session
+check session= at +0: the token is not signed for this session
+token []: the token is malformed
+token [a.b.c]: the token is malformed
+token [x]: the token is malformed
+token [MDEyMzQ1Njc4OWFiY2RlZg.1800000000]: the token is malformed
+token [MDEyMzQ1Njc4OWFiY2RlZg.-1.AAAA]: the token is malformed
+token [MDEyMzQ1Njc4OWFiY2RlZg.1800000000.AAAA]: the token is not signed for this session
+token [MDEyMzQ1Njc4OWFiY2RlZg.1800000000.!!!!]: the token is malformed
+token [a.b.c.d]: the token is malformed
+true
+true
+true
+-- the token cookie on safe requests
+GET without a cookie: 200 Set-Cookie: __Host-csrf=<token>; Path=/; Secure; SameSite=Lax | done token=77
+GET with a cookie: 200 | done token=77
+GET, the cookie is for another session: 200 Set-Cookie: __Host-csrf=<token>; Path=/; Secure; SameSite=Lax | done token=77
+GET, a forged cookie: 200 Set-Cookie: __Host-csrf=<token>; Path=/; Secure; SameSite=Lax | done token=77
+HEAD: 200 | done token=77
+OPTIONS: 200 | done token=77
+GET with a planted ctx: 200 | done token=77
+-- unsafe requests
+good: origin, cookie, header: 200 | done token=77
+good: no Origin, no Sec-Fetch-Site: 200 | done token=77
+good: PUT: 200 | done token=77
+good: PATCH, Sec-Fetch-Site same-origin: 200 | done token=77
+  refused: no CSRF token submitted
+no header: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: no CSRF cookie
+no cookie: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: no CSRF cookie
+no Cookie header at all: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: the submitted token is not the cookie's
+header differs from the cookie (both valid): 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: the token is not signed for this session
+token of another session: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: the token is not signed for this session
+no session at all: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: the token has expired
+expired: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: the token is not signed for this session
+forged: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: no CSRF token submitted
+lowercase method is not a safe one: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: no CSRF cookie
+duplicate cookie: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: no CSRF cookie
+duplicate cookie, one header: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+  refused: the token is malformed
+quoted cookie value: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+-- Origin and Sec-Fetch-Site
+Origin = Host: allowed
+Origin = Host, other case: allowed
+Origin with a port: allowed
+Origin on another port: Origin is not allowed
+Origin evil: Origin is not allowed
+Origin evil prefix: Origin is not allowed
+Origin null: Origin is not allowed
+Origin without a scheme: Origin is not allowed
+Origin, no Host: Origin is not allowed
+Origin ok but Sec-Fetch-Site cross-site: allowed
+Sec-Fetch-Site same-origin: allowed
+Sec-Fetch-Site none: allowed
+Sec-Fetch-Site cross-site: Sec-Fetch-Site says the request is not from this origin
+Sec-Fetch-Site same-site: Sec-Fetch-Site says the request is not from this origin
+neither header: allowed
+same-site, allowed: allowed
+cross-site, still refused: Sec-Fetch-Site says the request is not from this origin
+neither header, require_origin: no Origin or Sec-Fetch-Site
+Origin, require_origin: allowed
+listed origin, another Host: allowed
+unlisted origin, same Host: Origin is not allowed
+-- the form flavour
+form POST, cookie ok: 200 | form handler
+form POST, no cookie: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+form POST, evil origin: 403 | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the CSRF check failed"}
+true
+true
+true
+-- cookies
+a=b; Path=/; Secure; SameSite=Lax
+sid=abc.def-ghi_jkl; Path=/app; Domain=example.com; Max-Age=3600; Secure; HttpOnly; SameSite=Strict
+csrf=x; Path=/; SameSite=Lax
+true
+x=y; Path=/; Secure; SameSite=None
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+a = 1
+b = 2
+c = 3
+d = 4
+e = (none)
+b2 = 5
+true
+false

@@ -1,0 +1,148 @@
+-- RFC 7515 A.1 (HS256)
+a1 before exp: ok alg=HS256
+a1 at exp: token expired
+a1 at exp, leeway 5: ok alg=HS256
+a1 past exp + leeway: token expired
+a1 issuer joe: ok alg=HS256
+a1 issuer jane: wrong issuer
+joe
+70
+-- jwt.io HS256
+jwt.io: ok alg=HS256 sub=1234567890
+jwt.io needs exp: missing claim exp
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+true
+-- tampering
+flipped payload: bad signature
+flipped signature: bad signature
+flipped header: malformed token: the header is not valid JSON
+wrong secret: bad signature
+truncated signature: malformed token: bad base64url in the signature
+two parts: malformed token: not three dot-separated parts
+four parts: malformed token: not three dot-separated parts
+empty: malformed token: not three dot-separated parts
+empty signature: malformed token: an empty part
+padded base64: malformed token: bad base64url in the header
+garbage: malformed token: bad base64url in the header
+too large: token too large
+-- alg none and friends
+none, no signature: malformed token: an empty part
+none, with a signature: unsupported or disallowed algorithm
+alg None: unsupported or disallowed algorithm
+alg NONE: unsupported or disallowed algorithm
+alg nOnE: unsupported or disallowed algorithm
+alg hs256: unsupported or disallowed algorithm
+alg ES512: unsupported or disallowed algorithm
+alg HS256 : unsupported or disallowed algorithm
+alg : unsupported or disallowed algorithm
+true
+true
+true
+-- algorithm confusion
+HS256 with the RSA modulus as the secret, HS256 allowed: unsupported or disallowed algorithm
+the same, only RS256 allowed: unsupported or disallowed algorithm
+RS256 token, kid rsa1 names a secret: unsupported or disallowed algorithm
+RS256 token, only HS256 allowed: unsupported or disallowed algorithm
+RS256 token as PS256 (not allowed): unsupported or disallowed algorithm
+key pinned to PS256, RS256 token: unsupported or disallowed algorithm
+key pinned to PS256, PS256 token: ok alg=PS256 sub=ada
+-- tokens from OpenSSL and python, keys from a JWKS
+4
+RS256: ok alg=RS256 sub=ada
+RS384: ok alg=RS384 sub=ada
+PS256: ok alg=PS256 sub=ada
+ES256: ok alg=ES256 sub=ada
+ES384: ok alg=ES384 sub=ada
+EdDSA: ok alg=EdDSA sub=ada
+5
+HS256 (python hmac): ok alg=HS256 sub=ada
+HS512 (python hmac): ok alg=HS512 sub=ada
+HS256 but the set has no oct key: no key for the token
+ES256 token, tampered: bad signature
+EdDSA token, tampered: bad signature
+RS256 token, tampered: bad signature
+-- claims
+https://issuer.example
+4102444800
+true
+true
+true
+false
+read|write
+rsa1
+iss and aud (array) match: ok alg=RS256 sub=ada
+aud is a prefix only: wrong audience
+iss differs by a slash: wrong issuer
+max_age exceeded: token expired
+max_age fine: ok alg=RS256 sub=ada
+iat in the future: token issued in the future
+iat in the future, big leeway: ok alg=RS256 sub=ada
+expired: token expired
+-- exp, nbf, iat, aud, iss with HS256
+fractional exp: ok alg=HS256
+fractional exp, then: token expired
+exp as a string: malformed token: exp is not a NumericDate
+exp as a negative: malformed token: exp is not a NumericDate
+exp in exponent form: malformed token: exp is not a NumericDate
+no exp: missing claim exp
+no exp, not required: ok alg=HS256 sub=x
+nbf in the future: token not yet valid
+nbf in the future, leeway: ok alg=HS256
+nbf reached: ok alg=HS256
+aud string: ok alg=HS256
+aud missing: wrong audience
+aud wrong: wrong audience
+aud numbers: wrong audience
+aud among many: ok alg=HS256
+iss missing: wrong issuer
+payload not an object: malformed token: the payload is not an object
+payload not JSON: malformed token: the payload is not valid JSON
+duplicate claim: malformed token: the payload is not valid JSON
+-- headers and keys
+kid hs1: ok alg=HS256 sub=u
+unknown kid: no key for the token
+no keys: no key for the token
+two keys, kid picks: ok alg=HS256 sub=u
+no kid, two keys: no key for the token
+no kid, one key: ok alg=HS256
+{"alg":"HS256","crit":["exp"],"exp":1}: malformed token: crit is not supported
+{"alg":"HS256","alg":"HS256"}: malformed token: the header is not valid JSON
+{"alg":"HS256","kid":5}: malformed token: kid is not a string
+{"typ":"JWT"}: malformed token: the header has no alg
+{"alg":5}: malformed token: the header has no alg
+[]: malformed token: the header is not an object
+{"alg":"HS256","b64":false}: ok alg=HS256
+{"alg":"HS256","typ":"JWT"}: ok alg=HS256
+true
+true
+false
+false
+-- signing round trips
+{"iss":"me","sub":"a \"quoted\" name","exp":1900000000,"aud":["x","y"]}
+HS256: ok alg=HS256 sub=a "quoted" name
+HS384: ok alg=HS384 sub=a "quoted" name
+HS512: ok alg=HS512 sub=a "quoted" name
+RS256: ok alg=RS256 sub=a "quoted" name
+RS384: ok alg=RS384 sub=a "quoted" name
+RS512: ok alg=RS512 sub=a "quoted" name
+PS256: ok alg=PS256 sub=a "quoted" name
+PS384: ok alg=PS384 sub=a "quoted" name
+PS512: ok alg=PS512 sub=a "quoted" name
+ES256: ok alg=ES256 sub=a "quoted" name
+ES384: ok alg=ES384 sub=a "quoted" name
+EdDSA: ok alg=EdDSA sub=a "quoted" name
+the key does not fit the algorithm
+the key does not fit the algorithm
+the key does not fit the algorithm
+-- JWKS errors
+"keys" is not an array
+the JWKS has no "keys"
+the JWKS is not valid JSON
+a JWK is not an object
+a JWK has no kty
+an RSA JWK has no e
+an RSA JWK is not a usable key (2048 bits or more)
+an EC JWK coordinate has the wrong length
+bad base64url in an oct JWK
+ok 0
+ok 0

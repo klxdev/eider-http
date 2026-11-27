@@ -1,0 +1,370 @@
+//! http/auth: the `Authorization` header (RFC 9110 section 11, Basic RFC 7617, Bearer RFC 6750),
+//! credential checks against a verifier you supply, and middleware that authenticates a request
+//! and hands the principal to the handler. It goes beyond `middleware.basic` and
+//! `middleware.bearer` (which stay as they were): a verifier answers granted, denied or
+//! forbidden (401 `invalid_token`, 403 `insufficient_scope`), malformed credentials are told apart
+//! from missing ones, an optional mode lets anonymous requests through, JWTs (http/jwt) plug in
+//! directly, and the scopes of a token can be required per route.
+//!
+//!     let users = auth.basic_table(List[(lit("ada"), lit("pa:ss"))])      // constant-time
+//!     let app = auth.basic(auth.config("admin"), users, router.handler(r))
+//!
+//!     let keys = jwt.keyset().add("k1", jwt.Secret(secret))
+//!     let v = jwt.validation(List[jwt.HS256])
+//!     let api = auth.bearer(auth.config("api"), auth.jwt_verifier(v, keys), h)
+//!     r.get("/admin", auth.require_scope(auth.config("api"), "admin", h))  // 403 without it
+//!
+//! In the handler (and, through the response's `ctx`, in the access log): `auth.principal(req)`
+//! (also `req.get_ctx("principal")`), `auth.scheme_of(req)` ("Basic" or "Bearer"), the token's
+//! scopes in `req.get_ctx("scope")` and its payload (a JWT's claims as JSON, else empty) in
+//! `req.get_ctx("claims")`. A request that came in with these names already set (they are not
+//! headers: only middleware writes them) is overwritten, never trusted.
+//!
+//! Basic over plain HTTP sends the password in the clear: use it behind TLS. Password checks
+//! are yours (`BasicVerifier`): store salted slow hashes, not passwords; `basic_table` is for
+//! small fixed tables (tests, internal tools) and compares in constant time, hashing both
+//! sides first so that neither the content nor the length of a password shows in the time taken.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.utf8
+import crypto
+import http
+import http.problem
+import http.jwt
+
+// ---- parsing
+
+/// A user and password from Basic credentials.
+pub type Basic = { user: List[u8], password: List[u8] }
+
+/// The longest `Authorization` value these parsers take (bytes).
+pub const MAX_CREDENTIALS: usize = 8192
+
+fn is_token68(c: u8) -> bool {
+    bytes.is_alpha(c) || bytes.is_digit(c) || c == 45 || c == 46 || c == 95 || c == 126 || c == 43 || c == 47
+}
+
+// the credentials after "<scheme> " when the scheme is `scheme` (case-insensitive): Ok(None)
+// for another scheme, Err when it is this scheme and malformed
+fn after_scheme(value: List[u8], scheme: str) -> Result[Option[List[u8]], String] {
+    let s = sys.lit(scheme)
+    if value.len() < s.len() || !http.eq_ci(bytes.slice(value, 0, s.len()), s) { return Ok(None) }
+    if value.len() > s.len() && value[s.len()] != 32 { return Ok(None) }
+    if value.len() > MAX_CREDENTIALS { return Err(String.from("credentials too long")) }
+    let mut i = s.len()
+    while i < value.len() && value[i] == 32 { i += 1 }
+    if i == s.len() { return Err(String.from("no credentials after the scheme")) }
+    if i >= value.len() { return Err(String.from("no credentials after the scheme")) }
+    let rest = bytes.slice(value, i, value.len())
+    // token68: no inner spaces, '=' only as trailing padding
+    let mut eq = false
+    for c in rest {
+        if c == 61 { eq = true } else if !is_token68(c) || eq { return Err(String.from("credentials are not a token68")) }
+    }
+    Ok(Some(rest))
+}
+
+/// Whether the `Authorization` value uses `scheme` (compared case-insensitively).
+pub fn has_scheme(value: List[u8], scheme: str) -> bool {
+    let s = sys.lit(scheme)
+    if value.len() < s.len() || !http.eq_ci(bytes.slice(value, 0, s.len()), s) { return false }
+    value.len() == s.len() || value[s.len()] == 32
+}
+
+/// The user and password of `Authorization: Basic <base64>` (RFC 7617): the scheme is
+/// case-insensitive, the base64 is standard and padded, the decoded text must be UTF-8 with
+/// a colon, the user is what precedes the FIRST colon (so a password may contain colons) and
+/// has no control characters. `Ok(None)`: another scheme. `Err`: Basic, but malformed.
+pub fn parse_basic(value: List[u8]) -> Result[Option[Basic], String] {
+    let raw = match after_scheme(value, "Basic")? {
+        Some(r) => r
+        None => { return Ok(None) }
+    }
+    let pair = match encoding.unbase64(raw) {
+        Ok(p) => p
+        Err(_) => { return Err(String.from("Basic credentials are not valid base64")) }
+    }
+    if !utf8.valid(pair) { return Err(String.from("Basic credentials are not UTF-8")) }
+    let colon = match bytes.find_byte(pair, 58, 0) {
+        Some(i) => i
+        None => { return Err(String.from("Basic credentials have no colon")) }
+    }
+    let user = bytes.slice(pair, 0, colon)
+    for c in user {
+        if c < 32 || c == 127 { return Err(String.from("the user has a control character")) }
+    }
+    Ok(Some(Basic(user, bytes.slice(pair, colon + 1, pair.len()))))
+}
+
+/// The token of `Authorization: Bearer <token68>` (RFC 6750 section 2.1). `Ok(None)`: another
+/// scheme. `Err`: Bearer, but malformed (no token, or characters outside the token68 set).
+pub fn parse_bearer(value: List[u8]) -> Result[Option[List[u8]], String] { after_scheme(value, "Bearer") }
+
+/// The header value `Basic <base64(user:password)>` (for clients and tests); the user must not contain a colon.
+pub fn basic_header(user: List[u8], password: List[u8]) -> List[u8] {
+    let mut v = sys.lit("Basic ")
+    let mut up = user.copy()
+    up.push(58)
+    bytes.append(inout up, password)
+    bytes.append(inout v, encoding.base64(up).bytes())
+    v
+}
+
+/// The header value `Bearer <token>`.
+pub fn bearer_header(token: List[u8]) -> List[u8] {
+    let mut v = sys.lit("Bearer ")
+    bytes.append(inout v, token)
+    v
+}
+
+/// The request's `Authorization` value: `Ok(None)` when there is none, `Err` when there are
+/// several (which one would be believed is the kind of ambiguity attacks use).
+pub fn authorization(req: http.Request) -> Result[Option[List[u8]], String] {
+    let n = http.count_s(req.headers, "authorization")
+    if n > 1 { return Err(String.from("more than one Authorization header")) }
+    Ok(req.header("authorization"))
+}
+
+// ---- constant-time checks
+
+/// Equality in constant time for secrets of any length (each side is hashed first, so the
+/// time depends on neither the bytes nor the lengths).
+pub fn secret_eq(a: List[u8], b: List[u8]) -> bool {
+    crypto.ct_equal(crypto.sha256(a), crypto.sha256(b))
+}
+
+/// What a Basic verifier says: the principal for a valid user and password, None otherwise.
+pub type BasicVerifier = fn(List[u8], List[u8]) -> Option[List[u8]]
+
+/// A verifier over a fixed list of (user, password): every entry is compared with both the
+/// user and the password in constant time, so the time says neither whether the user exists
+/// nor how much of a password was right. The principal is the user.
+pub fn basic_table(entries: List[(List[u8], List[u8])]) -> BasicVerifier {
+    |user: List[u8], password: List[u8]| -> Option[List[u8]] {
+        let mut found: Option[List[u8]] = None
+        let mut hit = false
+        for e in entries {
+            let (u, p) = e
+            let ok_u = secret_eq(u, user)
+            let ok_p = secret_eq(p, password)
+            if ok_u && ok_p { hit = true }
+        }
+        if hit { found = Some(user) }
+        found
+    }
+}
+
+/// What a Bearer verifier says about a token.
+/// `Granted`: the principal, the scopes (space-separated; "" for none) and the token's payload
+/// (a JWT's claims as JSON; "" for an opaque token). `Denied`: not a valid token (401,
+/// `invalid_token`). `Forbidden`: valid, but not enough (403, `insufficient_scope`, naming the
+/// scope that would do; "" for none).
+pub type Verdict = | Granted(principal: List[u8], scope: List[u8], claims: List[u8]) | Denied | Forbidden(scope: List[u8])
+
+/// A function from a bearer token to a verdict.
+pub type BearerVerifier = fn(List[u8]) -> Verdict
+
+/// A verifier for an opaque token from a fixed table of (token, principal), compared in constant time.
+pub fn token_table(entries: List[(List[u8], List[u8])]) -> BearerVerifier {
+    |tok: List[u8]| -> Verdict {
+        let mut found: Option[List[u8]] = None
+        for e in entries {
+            let (t, who) = e
+            if secret_eq(t, tok) && found.is_none() { found = Some(who) }
+        }
+        match found {
+            Some(who) => Granted(who, sys.lit(""), sys.lit(""))
+            None => Denied
+        }
+    }
+}
+
+/// A verifier for JWTs (http/jwt): the token is verified against `keys` and `v` at the current
+/// time. The principal is the `sub` claim (else `client_id`; a token naming neither is
+/// refused), the scopes those of `scope`/`scp`, the claims the payload. The reason for a
+/// refusal is not told to the client (jwt.error_text is for your log: call `jwt.verify`
+/// yourself in a `BearerVerifier` to log it).
+pub fn jwt_verifier(v: jwt.Validation, keys: jwt.KeySet) -> BearerVerifier uses clock {
+    |tok: List[u8]| -> Verdict {
+        match jwt.verify(v, keys, tok) {
+            Ok(c) => {
+                let who = match c.subject() {
+                    Some(s) => s
+                    None => {
+                        match c.str("client_id") {
+                            Some(s) => s
+                            None => { return Denied }
+                        }
+                    }
+                }
+                Granted(who, bytes.join(c.scopes(), sys.lit(" ")), c.raw)
+            }
+            Err(_) => Denied
+        }
+    }
+}
+
+// ---- middleware
+
+/// How a middleware challenges: the realm (RFC 7235 section 2.2) and whether authentication is
+/// `required`. When it is not, a request without an `Authorization` header goes through with no
+/// principal (the handler decides what anonymous may do); a request WITH bad credentials is
+/// refused either way.
+pub type Config = { realm: List[u8], required: bool }
+
+/// A config for `realm` (quotes, backslashes and control characters are dropped from it),
+/// authentication required.
+pub fn config(realm: str) -> Config {
+    let mut r: List[u8] = List.new()
+    for c in sys.lit(realm) {
+        if c >= 32 && c != 127 && c != 34 && c != 92 { r.push(c) }
+    }
+    Config(r, true)
+}
+
+/// `config(realm)` with authentication optional.
+pub fn optional(realm: str) -> Config {
+    let mut c = config(realm)
+    c.required = false
+    c
+}
+
+fn challenge(status: i32, scheme: str, realm: List[u8], extra: List[u8], detail: str) -> http.Response {
+    let mut r = problem.new(status, detail).response()
+    let mut v = sys.lit(scheme)
+    bytes.append(inout v, sys.lit(" realm=\""))
+    bytes.append(inout v, realm)
+    v.push(34)
+    bytes.append(inout v, extra)
+    r.set_header("WWW-Authenticate", v)
+    r
+}
+
+fn pass(req: http.Request, who: List[u8], scheme: str, scope: List[u8], claims: List[u8], h: http.Handler) -> http.Response {
+    let mut r = req.copy()
+    r.set_ctx("principal", who)
+    r.set_ctx("auth_scheme", sys.lit(scheme))
+    r.set_ctx("scope", scope)
+    r.set_ctx("claims", claims)
+    let mut resp = h(r)
+    resp.set_ctx("principal", who)
+    resp
+}
+
+// the request without what only this middleware may say
+fn scrub(req: http.Request) -> http.Request {
+    let mut r = req.copy()
+    for k in ["principal", "auth_scheme", "scope", "claims"] {
+        r.ctx = http.without(r.ctx, http.lower(sys.lit(k)))
+    }
+    r
+}
+
+/// The principal `auth.basic`, `auth.bearer` or `auth.jwt_bearer` authenticated for this request.
+pub fn principal(req: http.Request) -> Option[List[u8]] { req.get_ctx("principal") }
+
+/// "Basic" or "Bearer": how the request authenticated.
+pub fn scheme_of(req: http.Request) -> Option[List[u8]] { req.get_ctx("auth_scheme") }
+
+/// Basic authentication (RFC 7617) with `verify`. No credentials (or another scheme): 401 with
+/// `WWW-Authenticate: Basic realm="..", charset="UTF-8"` (unless `cfg.required` is false);
+/// malformed or wrong ones: 401 too. Only over TLS.
+pub fn basic(cfg: Config, verify: BasicVerifier, h: http.Handler) -> http.Handler {
+    |req: http.Request| -> http.Response {
+        let q = scrub(req)
+        let ch = sys.lit(", charset=\"UTF-8\"")
+        let hv = match authorization(q) {
+            Ok(Some(v)) => v
+            Ok(None) => {
+                if !cfg.required { return h(q) }
+                return challenge(401, "Basic", cfg.realm, ch, "this operation needs a user and password")
+            }
+            Err(_) => { return challenge(401, "Basic", cfg.realm, ch, "malformed credentials") }
+        }
+        match parse_basic(hv) {
+            Ok(Some(b)) => {
+                match verify(b.user, b.password) {
+                    Some(who) => pass(q, who, "Basic", sys.lit(""), sys.lit(""), h)
+                    None => challenge(401, "Basic", cfg.realm, ch, "wrong user or password")
+                }
+            }
+            Ok(None) => {
+                if !cfg.required && !has_scheme(hv, "Basic") { return h(q) }
+                challenge(401, "Basic", cfg.realm, ch, "this operation needs a user and password")
+            }
+            Err(_) => challenge(401, "Basic", cfg.realm, ch, "malformed credentials")
+        }
+    }
+}
+
+/// Bearer authentication (RFC 6750) with `verify`. No credentials (or another scheme): 401 with
+/// `WWW-Authenticate: Bearer realm=".."` and no error code (RFC 6750 section 3.1); a token
+/// `verify` refuses: 401 with `error="invalid_token"`; one it finds insufficient: 403 with
+/// `error="insufficient_scope"` and the scope; a malformed header (not a token68, several
+/// Authorization headers): 400 with `error="invalid_request"`.
+pub fn bearer(cfg: Config, verify: BearerVerifier, h: http.Handler) -> http.Handler {
+    |req: http.Request| -> http.Response {
+        let q = scrub(req)
+        let hv = match authorization(q) {
+            Ok(Some(v)) => v
+            Ok(None) => {
+                if !cfg.required { return h(q) }
+                return challenge(401, "Bearer", cfg.realm, sys.lit(""), "this operation needs a bearer token")
+            }
+            Err(_) => { return challenge(400, "Bearer", cfg.realm, sys.lit(", error=\"invalid_request\""), "malformed credentials") }
+        }
+        match parse_bearer(hv) {
+            Ok(Some(tok)) => {
+                match verify(tok) {
+                    Granted(who, scope, claims) => pass(q, who, "Bearer", scope, claims, h)
+                    Denied => challenge(401, "Bearer", cfg.realm, sys.lit(", error=\"invalid_token\""), "the bearer token is not valid")
+                    Forbidden(scope) => {
+                        let mut extra = sys.lit(", error=\"insufficient_scope\"")
+                        if scope.len() > 0 {
+                            bytes.append(inout extra, sys.lit(", scope=\""))
+                            for c in scope {
+                                if c >= 32 && c != 127 && c != 34 && c != 92 { extra.push(c) }
+                            }
+                            extra.push(34)
+                        }
+                        challenge(403, "Bearer", cfg.realm, extra, "the token does not grant this operation")
+                    }
+                }
+            }
+            Ok(None) => {
+                if !cfg.required && !has_scheme(hv, "Bearer") { return h(q) }
+                challenge(401, "Bearer", cfg.realm, sys.lit(""), "this operation needs a bearer token")
+            }
+            Err(_) => challenge(400, "Bearer", cfg.realm, sys.lit(", error=\"invalid_request\""), "malformed bearer credentials")
+        }
+    }
+}
+
+/// `bearer` with JWTs: `bearer(cfg, jwt_verifier(v, keys), h)`.
+pub fn jwt_bearer(cfg: Config, v: jwt.Validation, keys: jwt.KeySet, h: http.Handler) -> http.Handler uses clock {
+    bearer(cfg, jwt_verifier(v, keys), h)
+}
+
+/// Requires `scope` among the scopes the request authenticated with (inside `bearer` or
+/// `jwt_bearer`): 403 `insufficient_scope` (401 when the request is not authenticated at all).
+pub fn require_scope(cfg: Config, scope: str, h: http.Handler) -> http.Handler {
+    let want = sys.lit(scope)
+    |req: http.Request| -> http.Response {
+        if req.get_ctx("principal").is_none() {
+            return challenge(401, "Bearer", cfg.realm, sys.lit(""), "this operation needs a bearer token")
+        }
+        let have = match req.get_ctx("scope") {
+            Some(s) => s
+            None => sys.lit("")
+        }
+        for s in bytes.split(have, 32) {
+            if bytes.eq(s, want) { return h(req) }
+        }
+        let mut extra = sys.lit(", error=\"insufficient_scope\", scope=\"")
+        bytes.append(inout extra, want)
+        extra.push(34)
+        challenge(403, "Bearer", cfg.realm, extra, "the token does not grant this operation")
+    }
+}

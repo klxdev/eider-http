@@ -1,0 +1,93 @@
+-- Basic parsing
+RFC 7617: user=[Aladdin] password=[open sesame]
+lowercase scheme: user=[Aladdin] password=[open sesame]
+two spaces: user=[Aladdin] password=[open sesame]
+colon in the password: user=[ada] password=[pa:ss:word]
+empty password: user=[ada] password=[]
+empty user: user=[] password=[pw]
+UTF-8: user=[José] password=[pässwörd 🔑]
+RFC 7617 test:123: user=[test] password=[123£]
+no colon: error: Basic credentials have no colon
+not base64: error: credentials are not a token68
+missing padding: error: Basic credentials are not valid base64
+padding in the middle: error: credentials are not a token68
+space inside: error: credentials are not a token68
+url-safe alphabet: error: Basic credentials are not valid base64
+invalid UTF-8: error: Basic credentials are not UTF-8
+newline in the user: error: the user has a control character
+scheme only: error: no credentials after the scheme
+scheme and a space: error: no credentials after the scheme
+Basicx: another scheme
+Bearer: another scheme
+empty: another scheme
+too long: error: credentials too long
+true
+-- Bearer parsing
+plain: token=[abc.def-ghi_jkl~+/=]
+lowercase: token=[T]
+padding then more: error: credentials are not a token68
+space inside: error: credentials are not a token68
+quote: error: credentials are not a token68
+no token: error: no credentials after the scheme
+no token, space: error: no credentials after the scheme
+Basic: another scheme
+Bearerx: another scheme
+-- Authorization headers
+true
+true
+true
+true
+false
+false
+true
+-- basic middleware
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"this operation needs a user and password"}
+200 [principal=root] | hello root Basic scope=
+200 [principal=ada] | hello ada Basic scope=
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"wrong user or password"}
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"wrong user or password"}
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"wrong user or password"}
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"wrong user or password"}
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"wrong user or password"}
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"malformed credentials"}
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"this operation needs a user and password"}
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"malformed credentials"}
+401 Basic realm="admin area", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"malformed credentials"}
+200 | hello (nobody)
+200 | hello (nobody)
+200 | hello (nobody)
+401 Basic realm="open", charset="UTF-8" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"wrong user or password"}
+200 [principal=root] | hello root Basic scope=
+-- bearer middleware
+401 Bearer realm="api" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"this operation needs a bearer token"}
+200 [principal=ada] | hello ada Bearer scope=
+200 [principal=bob] | hello bob Bearer scope=
+401 Bearer realm="api", error="invalid_token" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"the bearer token is not valid"}
+401 Bearer realm="api", error="invalid_token" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"the bearer token is not valid"}
+400 Bearer realm="api", error="invalid_request" | {"type":"about:blank","title":"Bad Request","status":400,"detail":"malformed bearer credentials"}
+400 Bearer realm="api", error="invalid_request" | {"type":"about:blank","title":"Bad Request","status":400,"detail":"malformed bearer credentials"}
+401 Bearer realm="api" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"this operation needs a bearer token"}
+400 Bearer realm="api", error="invalid_request" | {"type":"about:blank","title":"Bad Request","status":400,"detail":"malformed credentials"}
+200 [principal=reader] | hello reader Bearer scope=read
+403 Bearer realm="api", error="insufficient_scope", scope="read" | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the token does not grant this operation"}
+403 Bearer realm="api", error="insufficient_scope" | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the token does not grant this operation"}
+401 Bearer realm="api", error="invalid_token" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"the bearer token is not valid"}
+403 Bearer realm="api", error="insufficient_scope", scope="write" [principal=reader] | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the token does not grant this operation"}
+200 [principal=writer] | hello writer Bearer scope=read write
+401 Bearer realm="api" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"this operation needs a bearer token"}
+401 Bearer realm="api" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"this operation needs a bearer token"}
+200 | hello (nobody)
+200 [principal=bob] | hello bob Bearer scope=
+401 Bearer realm="api", error="invalid_token" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"the bearer token is not valid"}
+200 | hello (nobody)
+-- JWT bearer
+200 [principal=ada] | hello ada Bearer scope=read write
+401 Bearer realm="api", error="invalid_token" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"the bearer token is not valid"}
+401 Bearer realm="api", error="invalid_token" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"the bearer token is not valid"}
+401 Bearer realm="api", error="invalid_token" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"the bearer token is not valid"}
+401 Bearer realm="api", error="invalid_token" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"the bearer token is not valid"}
+401 Bearer realm="api", error="invalid_token" | {"type":"about:blank","title":"Unauthorized","status":401,"detail":"the bearer token is not valid"}
+403 Bearer realm="api", error="insufficient_scope", scope="admin" [principal=ada] | {"type":"about:blank","title":"Forbidden","status":403,"detail":"the token does not grant this operation"}
+200 [principal=ada] | hello ada Bearer scope=read write
+200 [principal=svc-1] | hello svc-1 Bearer scope=
+true
