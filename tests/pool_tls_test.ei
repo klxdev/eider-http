@@ -1,0 +1,308 @@
+// http/pool over https against the Eider server (tests/pki certificates, ephemeral loopback ports):
+// ALPN h2 gives ONE connection that multiplexes the calls (eight calls that wait for each other
+// are all in flight at once), HTTP/1.1 over TLS is pooled like plain HTTP, `with_h2(false)`, redirects, cookies and gzip over
+// h2, a dead h2 connection is replaced, verification failures, and the https to http downgrade.
+
+import core.sys
+import std.bytes
+import std.fs
+import std.io
+import std.net
+import std.sync
+import std.task
+import std.time
+import http
+import http.router
+import http.server
+import http.compress
+import http.h2
+import http.pool
+import http.secure
+import http.cookiejar
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn num(n: i64) -> String { String.from_int(n) }
+
+type Rig = { srv: server.Server, tok: task.Token, th: Task[server.Stats], port: i32 }
+
+fn app(gate: sync.Lock[Map[List[u8], i64]]) -> http.Handler uses clock {
+    let mut r = router.new()
+    r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello") })
+    r.get("/barrier", |q: http.Request| -> http.Response {
+        let id = q.query_param("id").unwrap_or(lit("x"))
+        let n = bytes.parse_u64(q.query_param("n").unwrap_or(lit("1"))).unwrap_or(1) as i64
+        let first = gate.modify(|inout m: Map[List[u8], i64]| -> i64 {
+            let v = match m.get(id.copy()) {
+                Some(x) => x + 1
+                None => 1
+            }
+            m.insert(id.copy(), v)
+            v
+        })
+        let dl = time.after_ms(10000)
+        while true {
+            let now = gate.modify(|inout m: Map[List[u8], i64]| -> i64 { m.get(id.copy()).unwrap_or(0) })
+            if now >= n { break }
+            if dl.expired() { return http.text(504, "barrier timed out") }
+            time.sleep_ms(2)
+        }
+        http.text(200, "released")
+    })
+    r.get("/who", |q: http.Request| -> http.Response { who(q) })
+    r.post("/who", |q: http.Request| -> http.Response { who(q) })
+    r.get("/redir/:code", |q: http.Request| -> http.Response {
+        let code = bytes.parse_u64(q.param("code").unwrap_or(lit("302"))).unwrap_or(302) as i32
+        let mut x = http.response(code)
+        x.set_header("Location", q.query_param("to").unwrap_or(lit("/hello")))
+        x
+    })
+    r.post("/redir/:code", |q: http.Request| -> http.Response {
+        let code = bytes.parse_u64(q.param("code").unwrap_or(lit("302"))).unwrap_or(302) as i32
+        let mut x = http.response(code)
+        x.set_header("Location", q.query_param("to").unwrap_or(lit("/who")))
+        x
+    })
+    r.get("/set", |q: http.Request| -> http.Response {
+        let mut x = http.text(200, "set")
+        match q.query_param("a") {
+            Some(v) => { x.set_header("Set-Cookie", v) }
+            None => {}
+        }
+        match q.query_param("b") {
+            Some(v) => { x.set_header("Set-Cookie", v) }
+            None => {}
+        }
+        x
+    })
+    r.get("/text", |q: http.Request| -> http.Response {
+        let mut b: List[u8] = List.new()
+        for i in 0..(4000 as i32) { b.push(97 + ((i % 7) as u8)) }
+        http.respond(200, "text/plain", b)
+    })
+    r.get("/big", |q: http.Request| -> http.Response {
+        let mut b: List[u8] = List.new()
+        for i in 0..(300000 as i32) { b.push(((i * 7) % 256) as u8) }
+        http.respond(200, "application/octet-stream", b)
+    })
+    compress.responses(compress.options(), router.handler(r))
+}
+
+fn who(q: http.Request) -> http.Response {
+    let mut t = sys.to_string(q.method)
+    t.push_str(" path=")
+    t.append(sys.to_string(q.path))
+    t.push_str(" cookie=[")
+    t.append(sys.to_string(q.header("cookie").unwrap_or(lit("-"))))
+    t.push_str("] auth=[")
+    t.append(sys.to_string(q.header("authorization").unwrap_or(lit("-"))))
+    t.push_str("] body=[")
+    t.append(sys.to_string(q.body))
+    t.push_str("]")
+    http.respond(200, "text/plain", t.bytes())
+}
+
+fn ed(h2on: bool) -> secure.ServerTls uses fs {
+    let t = secure.server_from_files(String.from("tests/pki/edchain.pem"), String.from("tests/pki/ed.key")).unwrap()
+    if h2on { t.with_h2() } else { t }
+}
+
+fn trust(root: str) -> secure.ClientTls uses fs {
+    secure.client_roots_pem(fs.read(sys.lit(root)).unwrap()).unwrap()
+}
+
+fn start_tls(h2on: bool, any: bool) -> Rig uses io, net, clock, threads, fs {
+    let mut cfg = server.config()
+    cfg.log = None
+    cfg.workers = 64
+    cfg.secure = Some(ed(h2on).acceptor())
+    if h2on { cfg.h2 = Some(h2.options()) }
+    let addr = if any { net.ipv4(0, 0, 0, 0, 0) } else { net.ipv4(127, 0, 0, 1, 0) }
+    let srv = server.listen(addr, cfg).unwrap()
+    let h = app(sync.lock(Map.new()))
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+    Rig(srv, tok, th, srv.port())
+}
+
+fn start_plain() -> Rig uses io, net, clock, threads {
+    let mut cfg = server.config()
+    cfg.log = None
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let h = app(sync.lock(Map.new()))
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+    Rig(srv, tok, th, srv.port())
+}
+
+fn stop(r: Rig) -> server.Stats uses io {
+    r.tok.cancel()
+    r.th.join()
+}
+
+fn url(scheme: str, host: str, r: Rig, path: str) -> List[u8] {
+    let mut u = String.from(scheme)
+    u.push_str("://")
+    u.push_str(host)
+    u.push_str(":")
+    u.append(num(r.port as i64))
+    u.push_str(path)
+    u.bytes()
+}
+
+fn urlp(scheme: str, r: Rig, path: String) -> List[u8] {
+    let mut u = String.from(scheme)
+    u.push_str("://127.0.0.1:")
+    u.append(num(r.port as i64))
+    u.append(path)
+    u.bytes()
+}
+
+fn s(r: Rig, path: str) -> List[u8] { url("https", "127.0.0.1", r, path) }
+
+fn show(r: Result[http.Response, String]) uses io {
+    match r {
+        Ok(x) => {
+            let mut t = num(x.status as i64)
+            t.push_str(" ")
+            t.append(sys.to_string(x.body))
+            print(t)
+        }
+        Err(e) => {
+            let mut t = String.from("error: ")
+            t.append(e)
+            print(t)
+        }
+    }
+}
+
+fn wave(c: pool.Client, u: List[u8], n: i32) -> i32 uses io, net, clock, threads {
+    let mut ts: List[Task[i32]] = List.new()
+    for i in 0..n {
+        let cc = c
+        let uu = u.copy()
+        ts.push(spawn(|| -> i32 {
+            match cc.get(uu.copy()) {
+                Ok(r) => r.status
+                Err(e) => 0
+            }
+        }))
+    }
+    let mut oks = 0
+    for t in ts { if t.join() == 200 { oks += 1 } }
+    oks
+}
+
+fn h2_part() uses io, net, clock, threads, fs {
+    print("-- h2: eight calls that wait for each other share one connection")
+    let a = start_tls(true, false)
+    let c = pool.new().with_tls(trust("tests/pki/root.pem"))
+    show(c.get(s(a, "/hello")))
+    let first = c.get(s(a, "/hello")).unwrap()
+    print(first.version)
+    print(wave(c, s(a, "/barrier?n=8&id=one"), 8))
+    print(c.stats().opened)
+    print(c.stats().h2_conns)
+    print(c.stats().idle)
+    print("-- bodies, headers, HEAD, a large response, gzip decoded")
+    let post = c.send(pool.call("POST", s(a, "/who")).with_body("text/plain", lit("over h2")).with_header("Authorization", lit("Bearer t")))
+    print(sys.to_string(post.unwrap().body))
+    let head = c.head(s(a, "/hello")).unwrap()
+    print(head.status)
+    print(head.body.len())
+    let big = c.get(s(a, "/big")).unwrap()
+    print(big.body.len())
+    let g = c.get(s(a, "/text")).unwrap()
+    print(g.body.len())
+    print(g.header("content-encoding").is_none())
+    let small = pool.new().with_tls(trust("tests/pki/root.pem")).with_limits(http.Limits(8192, 100, 65536, 1000))
+    show(small.get(s(a, "/big")))
+    print(small.get(s(a, "/hello")).is_ok())
+    small.close()
+    print("-- redirects over h2 (same origin), cookies")
+    let r = c.get(s(a, "/redir/302?to=/hello")).unwrap()
+    print(sys.to_string(r.body))
+    print(r.get_ctx("redirects").is_some())
+    let pr = c.send(pool.call("POST", s(a, "/redir/307?to=/who")).with_body("text/plain", lit("kept")))
+    print(sys.to_string(pr.unwrap().body))
+    let jar = cookiejar.new()
+    let cj = pool.new().with_tls(trust("tests/pki/root.pem")).with_cookies(jar)
+    show(cj.get(s(a, "/set?a=sid%3Dabc%3B%20Path%3D%2F%3B%20Secure&b=plain%3D1")))
+    show(cj.get(s(a, "/who")))
+    print(jar.len())
+    print("-- the h2 connection is replaced when it is gone")
+    print(c.stats().opened)
+    c.close()
+    show(c.get(s(a, "/hello")))
+    print(c.stats().opened)
+    print(c.stats().h2_conns)
+    cj.close()
+    c.close()
+    print(stop(a).connections)
+}
+
+fn h1_part() uses io, net, clock, threads, fs {
+    print("-- a server without h2: HTTP/1.1 over TLS, pooled")
+    let a = start_tls(false, false)
+    let c = pool.new().with_tls(trust("tests/pki/root.pem"))
+    for i in 0..4 { show(c.get(s(a, "/hello"))) }
+    print(c.stats().opened)
+    print(c.stats().reused)
+    print(c.stats().h2_conns)
+    print(c.get(s(a, "/hello")).unwrap().version)
+    print(wave(c, s(a, "/barrier?n=4&id=h1"), 4))
+    print(c.stats().opened)
+    c.close()
+    print(stop(a).connections)
+
+    print("-- with_h2(false) against a server that offers h2: HTTP/1.1 and one connection per call in flight")
+    let b = start_tls(true, false)
+    let c2 = pool.new().with_tls(trust("tests/pki/root.pem")).with_h2(false)
+    print(c2.get(s(b, "/hello")).unwrap().version)
+    print(wave(c2, s(b, "/barrier?n=4&id=h1b"), 4))
+    print(c2.stats().opened)
+    print(c2.stats().h2_conns)
+    c2.close()
+    print(stop(b).connections)
+}
+
+fn refusals() uses io, net, clock, threads, fs {
+    print("-- verification")
+    let a = start_tls(true, true)
+    let good = trust("tests/pki/root.pem")
+    show(pool.new().with_tls(good).get(s(a, "/hello")))
+    show(pool.new().with_tls(good).get(url("https", "127.0.0.2", a, "/hello")))
+    show(pool.new().with_tls(trust("tests/pki/other-root.pem")).get(s(a, "/hello")))
+    show(pool.new().get(s(a, "/hello")))
+    print(pool.new().with_tls(secure.client_insecure_skip_verify_for_tests()).get(url("https", "127.0.0.2", a, "/hello")).is_ok())
+    let z = stop(a)
+    print("-- https to http is refused, unless allowed; http to https is followed")
+    let t = start_tls(true, false)
+    let p = start_plain()
+    let mut to = String.from("/redir/302?to=")
+    to.append(sys.to_string(url("http", "127.0.0.1", p, "/hello")))
+    let c = pool.new().with_tls(good)
+    show(c.get(urlp("https", t, to.copy())))
+    show(c.with_allow_downgrade(true).get(urlp("https", t, to.copy())))
+    let mut up = String.from("/redir/302?to=")
+    up.append(sys.to_string(s(t, "/hello")))
+    show(c.get(urlp("http", p, up)))
+    c.close()
+    let a1 = stop(t)
+    let a2 = stop(p)
+    print("-- a server that is gone")
+    let c2 = pool.new().with_tls(good)
+    let g = start_tls(true, false)
+    show(c2.get(s(g, "/hello")))
+    let port = g.port
+    let z2 = stop(g)
+    show(c2.get(s(g, "/hello")).map_err(|e: String| -> String { String.from("failed") }))
+}
+
+fn main() uses io, net, clock, threads, fs {
+    h2_part()
+    h1_part()
+    refusals()
+}
