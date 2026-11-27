@@ -1,0 +1,297 @@
+// http/h3frame: the RFC 9000 appendix A varint vectors, every frame type round-tripping, input fed one
+// byte at a time giving the same frames as the whole input, grease and unknown frames skipped, DATA
+// streamed, and a corpus of malformed frames refused with the error code RFC 9114 names.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import http.h3frame
+
+fn say(s: String) uses io { io.outln(s.bytes()) }
+
+fn note(s: str) uses io { say(String.from(s)) }
+
+fn msg(a: str, b: String) -> String {
+    let mut l = String.from(a)
+    l.append(b)
+    l
+}
+
+fn msg2(a: String, b: String) -> String {
+    let mut l = a.copy()
+    l.append(b)
+    l
+}
+
+fn hx(b: List[u8]) -> String { encoding.hex(b) }
+
+fn unhex(s: str) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut hi: i32 = -1
+    for c in sys.lit(s) {
+        let v: i32 = if c >= 48 && c <= 57 { (c as i32) - 48 } else if c >= 97 && c <= 102 { (c as i32) - 87 } else { -1 }
+        if v < 0 { continue }
+        if hi < 0 {
+            hi = v
+        } else {
+            out.push((hi * 16 + v) as u8)
+            hi = -1
+        }
+    }
+    out
+}
+
+fn show(f: h3frame.Frame) -> String {
+    let mut l = h3frame.kind_name(f.kind)
+    l.push_str(" id=")
+    l.append(f.id.to_string())
+    l.push_str(" payload=")
+    l.append(hx(f.payload))
+    for s in f.settings {
+        l.push_str(" [")
+        l.append(s.id.to_string())
+        l.push_str("=")
+        l.append(s.value.to_string())
+        l.push_str("]")
+    }
+    l
+}
+
+/// Everything `bytes` decodes to, fed in pieces of `step` bytes: frames, DATA pieces joined, or the failure.
+fn run(scope: u8, max: usize, input: List[u8], step: usize) -> String {
+    let mut d = h3frame.decoder(scope, max)
+    let mut out = String.from("")
+    let mut data: List[u8] = List.new()
+    let mut at: usize = 0
+    while at < input.len() {
+        let end = if at + step < input.len() { at + step } else { input.len() }
+        d.feed(input.slice(at, end))
+        at = end
+        let mut going = true
+        while going {
+            match d.next() {
+                h3frame.NeedMore => { going = false }
+                h3frame.Got(f) => {
+                    if data.len() > 0 {
+                        out.push_str("DATA ")
+                        out.append(hx(data))
+                        out.push_str("; ")
+                        data.clear()
+                    }
+                    out.append(show(f))
+                    out.push_str("; ")
+                }
+                h3frame.Chunk(b) => { data.extend(b) }
+                h3frame.Fail(code, why) => {
+                    out.push_str("FAIL ")
+                    out.append(h3frame.code_name(code))
+                    return out
+                }
+            }
+        }
+    }
+    if data.len() > 0 {
+        out.push_str("DATA ")
+        out.append(hx(data))
+        out.push_str("; ")
+    }
+    if !d.idle() { out.push_str("(partial)") }
+    out
+}
+
+fn varint_case(hexs: str, want: u64) uses io {
+    let b = unhex(hexs)
+    match h3frame.get_varint(b, 0) {
+        Some(v) => {
+            let mut l = String.from("varint ")
+            l.append(hx(b))
+            l.push_str(" -> ")
+            l.append(v.value.to_string())
+            l.push_str(" (")
+            l.append(v.next.to_string())
+            l.push_str(" bytes)")
+            if v.value != want { l.push_str(" WRONG") }
+            say(l)
+        }
+        None => { say(msg("varint truncated ", hx(b))) }
+    }
+}
+
+fn main() uses io {
+    // RFC 9000 appendix A.1: the sample values (and a non-minimal encoding of 37)
+    varint_case("c2197c5eff14e88c", 151288809941952652)
+    varint_case("9d7f3e7d", 494878333)
+    varint_case("7bbd", 15293)
+    varint_case("25", 37)
+    varint_case("4025", 37)
+    varint_case("00", 0)
+    varint_case("ffffffffffffffff", 4611686018427387903)
+    // encoding picks the shortest form; the boundaries
+    let edges: [u64; 9] = [0, 63, 64, 16383, 16384, 1073741823, 1073741824, 4611686018427387903, 37]
+    for i in 0..9 {
+        let v = edges[i as usize]
+        let e = h3frame.encode_varint(v)
+        let mut l = String.from("encode ")
+        l.append(v.to_string())
+        l.push_str(" -> ")
+        l.append(hx(e))
+        match h3frame.get_varint(e, 0) {
+            Some(r) => { if r.value != v || r.next != e.len() { l.push_str(" ROUNDTRIP-FAIL") } }
+            None => { l.push_str(" ROUNDTRIP-FAIL") }
+        }
+        say(l)
+    }
+    let mut wide: List[u8] = List.new()
+    h3frame.put_varint_n(inout wide, 37, 2)
+    say(msg("37 in two bytes: ", hx(wide)))
+    wide.clear()
+    h3frame.put_varint_n(inout wide, 37, 8)
+    say(msg("37 in eight bytes: ", hx(wide)))
+    // truncated varints
+    for n in 0..8 {
+        let full = unhex("c2197c5eff14e88c")
+        if (n as usize) < 8 {
+            match h3frame.get_varint(full.slice(0, n as usize), 0) {
+                Some(v) => { note("TRUNCATED VARINT DECODED") }
+                None => {}
+            }
+        }
+    }
+    note("truncated varints: none decode")
+
+    note("-- frames")
+    let mut all: List[u8] = List.new()
+    all.extend(h3frame.headers(unhex("0000d1")))
+    all.extend(h3frame.data("hello".bytes()))
+    all.extend(h3frame.data(List.new()))
+    all.extend(h3frame.headers(unhex("0000d9")))
+    say(msg("request stream: ", run(h3frame.REQUEST, 1024, all, 1000)))
+    say(msg("  byte by byte:   ", run(h3frame.REQUEST, 1024, all, 1)))
+    say(msg("  by threes:      ", run(h3frame.REQUEST, 1024, all, 3)))
+
+    let mut ctl: List[u8] = List.new()
+    let mut es: List[h3frame.Setting] = List.new()
+    es.push(h3frame.Setting(h3frame.SETTING_QPACK_MAX_TABLE_CAPACITY, 4096))
+    es.push(h3frame.Setting(h3frame.SETTING_MAX_FIELD_SECTION_SIZE, 65536))
+    es.push(h3frame.Setting(h3frame.SETTING_QPACK_BLOCKED_STREAMS, 16))
+    es.push(h3frame.Setting(h3frame.grease(3), 7))
+    ctl.extend(h3frame.settings(es))
+    ctl.extend(h3frame.goaway(12))
+    ctl.extend(h3frame.max_push_id(5))
+    ctl.extend(h3frame.cancel_push(2))
+    ctl.extend(h3frame.goaway(4611686018427387903))
+    say(msg("control stream: ", run(h3frame.CONTROL, 1024, ctl, 1000)))
+    say(msg("  byte by byte:  ", run(h3frame.CONTROL, 1024, ctl, 1)))
+    say(msg("empty SETTINGS: ", run(h3frame.CONTROL, 1024, h3frame.settings(List.new()), 1000)))
+
+    note("-- grease and unknown frames are skipped")
+    let mut g: List[u8] = List.new()
+    g.extend(h3frame.grease_frame(0, "ignore me".bytes()))
+    g.extend(h3frame.headers(unhex("0000d1")))
+    g.extend(h3frame.grease_frame(7, List.new()))
+    g.extend(h3frame.frame(1000, "x".bytes()))
+    g.extend(h3frame.data("ok".bytes()))
+    say(msg("request: ", run(h3frame.REQUEST, 1024, g, 1000)))
+    say(msg("  byte by byte: ", run(h3frame.REQUEST, 1024, g, 1)))
+    let mut gc: List[u8] = List.new()
+    gc.extend(h3frame.settings(List.new()))
+    gc.extend(h3frame.grease_frame(1, "zzzz".bytes()))
+    gc.extend(h3frame.goaway(0))
+    say(msg("control: ", run(h3frame.CONTROL, 1024, gc, 1)))
+    // an unknown frame bigger than the limit is skipped, not buffered
+    let mut big: List[u8] = List.new()
+    big.extend(h3frame.data_header(0))
+    big.extend(h3frame.encode_varint(h3frame.grease(2)))
+    big.extend(h3frame.encode_varint(100000))
+    let mut d = h3frame.decoder(h3frame.REQUEST, 64)
+    d.feed(big)
+    let mut left: usize = 100000
+    let mut skipped_ok = true
+    while left > 0 {
+        match d.next() {
+            h3frame.NeedMore => {}
+            h3frame.Got(f) => { skipped_ok = false }
+            h3frame.Chunk(b) => { skipped_ok = false }
+            h3frame.Fail(c, w) => { skipped_ok = false }
+        }
+        let n: usize = if left > 4000 { 4000 } else { left }
+        d.feed(List.filled(0, n))
+        left -= n
+    }
+    match d.next() {
+        h3frame.NeedMore => {}
+        h3frame.Got(f) => { skipped_ok = false }
+        h3frame.Chunk(b) => { skipped_ok = false }
+        h3frame.Fail(c, w) => { skipped_ok = false }
+    }
+    say(msg("100000-byte unknown frame, limit 64, skipped with nothing buffered: ", String.from(if skipped_ok && d.idle() && d.buffered() == 0 { "yes" } else { "NO" })))
+
+    note("-- DATA is streamed, whatever its size")
+    let mut dd = h3frame.decoder(h3frame.REQUEST, 64)
+    let mut hdr: List[u8] = h3frame.data_header(300000)
+    hdr.extend("abc".bytes())
+    dd.feed(hdr)
+    match dd.next() {
+        h3frame.Chunk(b) => { say(msg("first piece: ", hx(b))) }
+        _ => { note("NO PIECE") }
+    }
+    say(msg("idle in the middle of a DATA frame: ", String.from(if dd.idle() { "yes" } else { "no" })))
+
+    note("-- refused")
+    // frame types HTTP/2 had
+    for k in [2, 6, 8, 9] {
+        let b = h3frame.frame(k as u64, List.new())
+        say(msg("type ", msg2(k.to_string(), msg(" on a request stream: ", run(h3frame.REQUEST, 1024, b, 1000)))))
+    }
+    // control frames on a request stream, request frames on the control stream
+    say(msg("SETTINGS on a request stream: ", run(h3frame.REQUEST, 1024, h3frame.settings(List.new()), 1000)))
+    say(msg("GOAWAY on a request stream: ", run(h3frame.REQUEST, 1024, h3frame.goaway(0), 1000)))
+    say(msg("MAX_PUSH_ID on a request stream: ", run(h3frame.REQUEST, 1024, h3frame.max_push_id(0), 1000)))
+    say(msg("CANCEL_PUSH on a request stream: ", run(h3frame.REQUEST, 1024, h3frame.cancel_push(0), 1000)))
+    say(msg("DATA on the control stream: ", run(h3frame.CONTROL, 1024, h3frame.data("x".bytes()), 1000)))
+    say(msg("HEADERS on the control stream: ", run(h3frame.CONTROL, 1024, h3frame.headers("x".bytes()), 1000)))
+    say(msg("GOAWAY first on the control stream: ", run(h3frame.CONTROL, 1024, h3frame.goaway(0), 1000)))
+    say(msg("a grease frame first on the control stream: ", run(h3frame.CONTROL, 1024, h3frame.grease_frame(0, List.new()), 1000)))
+    let mut two: List[u8] = h3frame.settings(List.new())
+    two.extend(h3frame.settings(List.new()))
+    say(msg("a second SETTINGS: ", run(h3frame.CONTROL, 1024, two, 1000)))
+    // sizes
+    let mut ga: List[u8] = h3frame.settings(List.new())
+    ga.extend(h3frame.frame(h3frame.GOAWAY, List.new()))
+    say(msg("empty GOAWAY: ", run(h3frame.CONTROL, 1024, ga, 1000)))
+    let mut gb: List[u8] = h3frame.settings(List.new())
+    gb.extend(h3frame.frame(h3frame.GOAWAY, unhex("0102")))
+    say(msg("GOAWAY with two integers: ", run(h3frame.CONTROL, 1024, gb, 1000)))
+    let mut gc2: List[u8] = h3frame.settings(List.new())
+    gc2.extend(h3frame.frame(h3frame.MAX_PUSH_ID, unhex("4001")))
+    say(msg("MAX_PUSH_ID 1 in two bytes: ", run(h3frame.CONTROL, 1024, gc2, 1000)))
+    let mut gd: List[u8] = h3frame.settings(List.new())
+    gd.extend(h3frame.frame(h3frame.MAX_PUSH_ID, unhex("4001ff")))
+    say(msg("MAX_PUSH_ID with trailing bytes: ", run(h3frame.CONTROL, 1024, gd, 1000)))
+    say(msg("truncated setting (one byte): ", run(h3frame.CONTROL, 1024, h3frame.frame(h3frame.SETTINGS, unhex("01")), 1000)))
+    say(msg("truncated setting (value cut): ", run(h3frame.CONTROL, 1024, h3frame.frame(h3frame.SETTINGS, unhex("0140")), 1000)))
+    let mut dup: List[h3frame.Setting] = List.new()
+    dup.push(h3frame.Setting(6, 1))
+    dup.push(h3frame.Setting(6, 2))
+    say(msg("repeated setting: ", run(h3frame.CONTROL, 1024, h3frame.settings(dup), 1000)))
+    for id in [0, 2, 3, 4, 5] {
+        let mut one: List[h3frame.Setting] = List.new()
+        one.push(h3frame.Setting(id as u64, 1))
+        say(msg("HTTP/2 setting ", msg2(id.to_string(), msg(": ", run(h3frame.CONTROL, 1024, h3frame.settings(one), 1000)))))
+    }
+    let mut many: List[h3frame.Setting] = List.new()
+    for i in 0..65 { many.push(h3frame.Setting(h3frame.grease(i as u64), 0)) }
+    say(msg("65 settings: ", run(h3frame.CONTROL, 100000, h3frame.settings(many), 1000)))
+    // limits
+    say(msg("HEADERS over the limit: ", run(h3frame.REQUEST, 8, h3frame.headers(List.filled(1, 9)), 1000)))
+    say(msg("HEADERS at the limit: ", run(h3frame.REQUEST, 8, h3frame.headers(List.filled(1, 8)), 1000)))
+    let mut huge: List[u8] = List.new()
+    huge.extend(h3frame.encode_varint(h3frame.HEADERS))
+    huge.extend(h3frame.encode_varint(4611686018427387903))
+    say(msg("HEADERS of 2^62-1 bytes: ", run(h3frame.REQUEST, 65536, huge, 1000)))
+    // a stream that ends mid-frame
+    say(msg("a cut HEADERS: ", run(h3frame.REQUEST, 1024, h3frame.headers("abcdef".bytes()).slice(0, 5), 1000)))
+    say(msg("a cut frame header: ", run(h3frame.REQUEST, 1024, unhex("4001").slice(0, 1), 1000)))
+    note("done")
+}

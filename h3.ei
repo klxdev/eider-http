@@ -1,0 +1,887 @@
+//! http/h3: HTTP/3 (RFC 9114) over streams, without the transport. A `Conn` is the whole HTTP/3
+//! state of one connection, client or server: the control stream and the SETTINGS exchange, the two
+//! QPACK streams (http/qpack), request streams carrying HEADERS, DATA and trailers (http/h3frame),
+//! interim responses, GOAWAY, and every connection and stream error of RFC 9114 section 8.
+//!
+//! It is a state machine with no I/O of its own ("sans-IO"). The transport under it, QUIC, gives it
+//! stream data and takes its output; a test gives it in-memory pipes (`pump`). The stream interface it
+//! needs is the usual one for QUIC:
+//!
+//!   in:  `recv(stream, data, fin)`  bytes read from a stream the peer opened or that we opened
+//!        (`fin`: the peer finished sending on it); `recv_reset(stream, code)` the peer reset a stream
+//!        (RESET_STREAM); `recv_stop_sending(stream, code)` the peer asked us to stop sending
+//!   out: `poll()` the `Action`s to carry out, in order: `Write(stream, data, fin)`,
+//!        `ResetStream(stream, code)` (RESET_STREAM), `StopSending(stream, code)`, and
+//!        `CloseConn(code, why)` (CONNECTION_CLOSE with an application error code)
+//!
+//! Stream ids are QUIC's: a client opens request streams 0, 4, 8, ... (bidirectional) and, first,
+//! the unidirectional streams 2 (control), 6 (QPACK encoder) and 10 (QPACK decoder); a server's
+//! unidirectional streams are 3, 7 and 11. A transport must carry exactly those ids: `Conn` writes to
+//! them from the start (the stream types and our SETTINGS go out as the first `poll()`). The transport
+//! must not hand a stream bytes after the fin it reported.
+//!
+//!     let mut srv = h3.server(h3.config())
+//!     let mut cli = h3.client(h3.config())
+//!     let id = cli.send_request(fields, false)?       // fields: :method :scheme :authority :path and the rest
+//!     cli.send_data(id, body, true)?
+//!     h3.pump(inout cli, inout srv)                   // moves bytes both ways until quiet (tests); events are in `events`
+//!     for ev in srv.take_events() { ... h3.Headers(stream, fields), h3.Data(stream, bytes), h3.Finished(stream) ... }
+//!     srv.send_headers(id, response_fields, false)?
+//!
+//! `Event`s report what the peer did: its SETTINGS, a request or response head (`Headers`; `Informational`
+//! for a 1xx before the final response), `Data`, `Trailers`, the end of the message (`Finished`), a
+//! stream reset by the peer, a malformed message (`StreamError`: this side has already queued the
+//! RESET_STREAM and STOP_SENDING), GOAWAY, and `Closed` (a connection error: this side has queued
+//! CONNECTION_CLOSE; nothing more is read).
+//!
+//! Checked, with the error RFC 9114 names: the control stream starts with one SETTINGS and is never closed
+//! (H3_MISSING_SETTINGS, H3_FRAME_UNEXPECTED, H3_CLOSED_CRITICAL_STREAM), one control stream and one of each
+//! QPACK stream per peer (H3_STREAM_CREATION_ERROR), frame order on request streams (DATA before HEADERS,
+//! anything after the trailers: H3_FRAME_UNEXPECTED), a stream that ends in the middle of a frame
+//! (H3_FRAME_ERROR), GOAWAY ids that do not decrease (H3_ID_ERROR), server push (not supported: a client sends no
+//! MAX_PUSH_ID, so any push is H3_ID_ERROR), QPACK failures (their own codes). Message rules (section 4.1 to 4.3,
+//! stream errors with H3_MESSAGE_ERROR): pseudo-header order, presence and repetition, lowercase names, no
+//! connection-specific fields, `te` only `trailers`, a request with :method, :scheme and a non-empty :path
+//! (CONNECT only :method and :authority), a response with a :status of three digits, content-length equal to the
+//! DATA received. A field section over our MAX_FIELD_SECTION_SIZE is a stream error H3_EXCESSIVE_LOAD. A server
+//! that has sent GOAWAY rejects requests at or above its id (H3_REQUEST_REJECTED).
+//!
+//! Not done, and why: server push (RFC 9114 section 4.6; hyper's h3 has none either, and nothing needs it),
+//! extended CONNECT / WebTransport / datagrams (they need the transport's DATAGRAM frames), 0-RTT
+//! (SETTINGS memory), prioritisation (RFC 9218 is a header and a frame this does not read). The transport itself
+//! (QUIC) is not here: see docs/h3.md.
+
+import std.bytes
+import http
+import http.h3frame
+import http.qpack
+
+pub const CLIENT: u8 = 0
+pub const SERVER: u8 = 1
+
+/// What a connection is set up with.
+pub type Config = {
+    /// MAX_FIELD_SECTION_SIZE we advertise and enforce: a field section is the sum of name + value + 32 per field
+    max_field_section: u64,
+    /// QPACK_MAX_TABLE_CAPACITY we advertise (the table the peer's encoder may build in our decoder), and the
+    /// largest table our own encoder builds
+    qpack_capacity: u64,
+    /// QPACK_BLOCKED_STREAMS we advertise
+    qpack_blocked: u64,
+    /// the largest HEADERS (or other whole-read) frame accepted
+    max_frame: usize,
+    /// send a reserved SETTINGS identifier and a reserved frame on the control stream, as RFC 9114 section 7.2.8 asks
+    /// implementations to, so that a peer that does not ignore them is found out
+    grease: bool,
+}
+
+/// The defaults: 64 KiB field sections, a 4 KiB QPACK table, 16 blocked streams, frames of at most 64 KiB, grease on.
+pub fn config() -> Config { Config(65536, 4096, 16, 65536, true) }
+
+/// What the transport must do, in order.
+pub type Action =
+    | Write(stream: u64, data: List[u8], fin: bool)
+    | ResetStream(stream: u64, code: u64)
+    | StopSending(stream: u64, code: u64)
+    | CloseConn(code: u64, why: String)
+
+/// What the peer did.
+pub type Event =
+    | PeerSettings(settings: List[h3frame.Setting])
+    | Informational(stream: u64, fields: List[http.Header])
+    | Headers(stream: u64, fields: List[http.Header])
+    | Data(stream: u64, data: List[u8])
+    | Trailers(stream: u64, fields: List[http.Header])
+    | Finished(stream: u64)
+    | StreamReset(stream: u64, code: u64)
+    | StreamError(stream: u64, code: u64, why: String)
+    | GoAway(id: u64)
+    | Closed(code: u64, why: String)
+
+// a peer's unidirectional stream: its type (-1 until the type varint is complete) and the bytes of that varint so far
+type Uni = { id: u64, kind: i64, head: List[u8], fdec: h3frame.Decoder }
+
+// a request stream. `recv`: 0 awaiting the head, 1 head received, 2 trailers received, 3 done (finished, reset or refused).
+// `sent`: 0 nothing, 1 head sent, 2 final head sent, 3 finished.
+type Req = {
+    id: u64,
+    fdec: h3frame.Decoder,
+    recv: u8,
+    sent: u8,
+    blocked: bool,
+    held: List[u8],
+    held_fin: bool,
+    expect: i64,
+    got: u64,
+    head_only: bool,
+}
+
+/// The HTTP/3 state of one connection.
+pub type Conn = {
+    role: u8,
+    cfg: Config,
+    closed: bool,
+    actions: List[Action],
+    events: List[Event],
+    enc: qpack.Encoder,
+    dec: qpack.Decoder,
+    uni: List[Uni],
+    streams: List[Req],
+    peer_settings: bool,
+    peer_max_field: u64,
+    /// the ids of the peer's control and QPACK streams (-1: not opened yet)
+    peer_control: i64,
+    peer_qenc: i64,
+    peer_qdec: i64,
+    next_bidi: u64,
+    top_peer_bidi: i64,
+    goaway_sent: i64,
+    goaway_recv: i64,
+    max_push_id: i64,
+}
+
+const NO_LIMIT: u64 = 4611686018427387903
+
+/// A client connection (its first `poll()` has the stream types and SETTINGS).
+pub fn client(cfg: Config) -> Conn { start(CLIENT, cfg) }
+
+/// A server connection.
+pub fn server(cfg: Config) -> Conn { start(SERVER, cfg) }
+
+fn start(role: u8, cfg: Config) -> Conn {
+    let mut c = Conn(role, cfg.copy(), false, List.new(), List.new(), qpack.encoder(0, 0), qpack.decoder(cfg.qpack_capacity as usize, cfg.qpack_blocked as usize, cfg.max_field_section as usize), List.new(), List.new(), false, NO_LIMIT, -1, -1, -1, 0, -1, -1, -1, -1)
+    let mut s: List[h3frame.Setting] = List.new()
+    s.push(h3frame.Setting(h3frame.SETTING_QPACK_MAX_TABLE_CAPACITY, cfg.qpack_capacity))
+    s.push(h3frame.Setting(h3frame.SETTING_QPACK_BLOCKED_STREAMS, cfg.qpack_blocked))
+    s.push(h3frame.Setting(h3frame.SETTING_MAX_FIELD_SECTION_SIZE, cfg.max_field_section))
+    if cfg.grease { s.push(h3frame.Setting(h3frame.grease(5), 1)) }
+    let mut ctl = h3frame.stream_type(h3frame.STREAM_CONTROL)
+    ctl.extend(h3frame.settings(s))
+    if cfg.grease { ctl.extend(h3frame.grease_frame(2, "grease".bytes())) }
+    let cid = c.control_id()
+    c.actions.push(Write(cid, ctl, false))
+    c.actions.push(Write(cid + 4, h3frame.stream_type(h3frame.STREAM_QPACK_ENCODER), false))
+    c.actions.push(Write(cid + 8, h3frame.stream_type(h3frame.STREAM_QPACK_DECODER), false))
+    c
+}
+
+// ---- message rules (RFC 9114 sections 4.1 to 4.3) ----
+
+fn conn_specific(n: List[u8]) -> bool {
+    http.eq_s(n, "connection") || http.eq_s(n, "keep-alive") || http.eq_s(n, "proxy-connection") || http.eq_s(n, "transfer-encoding") || http.eq_s(n, "upgrade")
+}
+
+fn pseudo_ok(n: List[u8], kind: i32) -> bool {
+    if kind == 0 { return http.eq_s(n, ":method") || http.eq_s(n, ":scheme") || http.eq_s(n, ":path") || http.eq_s(n, ":authority") || http.eq_s(n, ":protocol") }
+    if kind == 1 { return http.eq_s(n, ":status") }
+    false
+}
+
+/// A field list as HTTP/3 allows it: `kind` 0 a request, 1 a response, 2 trailers (see the module comment).
+fn check_fields(hs: List[http.Header], kind: i32) -> Result[(), String] {
+    let mut regular = false
+    let mut seen: List[List[u8]] = List.new()
+    for f in hs {
+        let n = f.name
+        if n.len() == 0 { return Err(String.from("an empty field name")) }
+        for ch in n {
+            if ch >= 65 && ch <= 90 { return Err(String.from("an uppercase field name")) }
+        }
+        if n[0] == 58 {
+            if kind == 2 { return Err(String.from("a pseudo-header in trailers")) }
+            if regular { return Err(String.from("a pseudo-header after a regular field")) }
+            if !pseudo_ok(n, kind) { return Err(String.from("a pseudo-header that does not belong here")) }
+            for s in seen {
+                if bytes.eq(s, n) { return Err(String.from("a repeated pseudo-header")) }
+            }
+            seen.push(n)
+        } else {
+            regular = true
+            if !http.is_token(n) { return Err(String.from("a bad field name")) }
+            if conn_specific(n) { return Err(String.from("a connection-specific field")) }
+            if http.eq_s(n, "te") && !http.eq_s(f.value, "trailers") { return Err(String.from("te may only be trailers")) }
+        }
+        if !http.valid_value(f.value) { return Err(String.from("a bad field value")) }
+    }
+    if kind == 0 {
+        let m = match http.find_s(hs, ":method") {
+            Some(v) => v
+            None => { return Err(String.from("a request without :method")) }
+        }
+        if http.eq_s(m, "CONNECT") {
+            if http.find_s(hs, ":authority").is_none() { return Err(String.from("CONNECT without :authority")) }
+            if http.find_s(hs, ":path").is_some() || http.find_s(hs, ":scheme").is_some() { return Err(String.from("CONNECT with :path or :scheme")) }
+        } else {
+            if http.find_s(hs, ":scheme").is_none() { return Err(String.from("a request without :scheme")) }
+            match http.find_s(hs, ":path") {
+                Some(p) => { if p.len() == 0 { return Err(String.from("an empty :path")) } }
+                None => { return Err(String.from("a request without :path")) }
+            }
+        }
+    }
+    if kind == 1 {
+        match http.find_s(hs, ":status") {
+            Some(v) => {
+                if v.len() != 3 { return Err(String.from("a bad :status")) }
+                for ch in v {
+                    if ch < 48 || ch > 57 { return Err(String.from("a bad :status")) }
+                }
+            }
+            None => { return Err(String.from("a response without :status")) }
+        }
+    }
+    Ok(())
+}
+
+/// The content-length of a message (-1: none); an error when it is not a number or the copies differ.
+fn content_length(hs: List[http.Header]) -> Result[i64, String] {
+    let mut out: i64 = -1
+    for f in hs {
+        if http.eq_s(f.name, "content-length") {
+            if f.value.len() == 0 || f.value.len() > 18 { return Err(String.from("a bad content-length")) }
+            let mut n: i64 = 0
+            for ch in f.value {
+                if ch < 48 || ch > 57 { return Err(String.from("a bad content-length")) }
+                n = n * 10 + ((ch - 48) as i64)
+            }
+            if out >= 0 && out != n { return Err(String.from("content-length twice, differently")) }
+            out = n
+        }
+    }
+    Ok(out)
+}
+
+fn status_of(hs: List[http.Header]) -> i32 {
+    match http.find_s(hs, ":status") {
+        Some(v) => ((v[0] - 48) as i32) * 100 + ((v[1] - 48) as i32) * 10 + ((v[2] - 48) as i32)
+        None => 0
+    }
+}
+
+fn section_size(hs: List[http.Header]) -> u64 {
+    let mut n: u64 = 0
+    for f in hs { n += (f.name.len() + f.value.len() + 32) as u64 }
+    n
+}
+
+fn is_head(hs: List[http.Header]) -> bool {
+    match http.find_s(hs, ":method") {
+        Some(m) => http.eq_s(m, "HEAD")
+        None => false
+    }
+}
+
+impl Conn {
+    fn control_id(self) -> u64 { if self.role == CLIENT { 2 } else { 3 } }
+    fn qenc_id(self) -> u64 { self.control_id() + 4 }
+    fn qdec_id(self) -> u64 { self.control_id() + 8 }
+
+    /// The actions to carry out, in order; empties the queue.
+    fn poll(inout self) -> List[Action] {
+        let a = self.actions.copy()
+        self.actions = List.new()
+        a
+    }
+
+    /// The events so far; empties the list.
+    fn take_events(inout self) -> List[Event] {
+        let e = self.events.copy()
+        self.events = List.new()
+        e
+    }
+
+    /// Whether a connection error happened (nothing is read after it).
+    fn is_closed(self) -> bool { self.closed }
+
+    /// The peer's SETTINGS have arrived.
+    fn has_peer_settings(self) -> bool { self.peer_settings }
+
+    /// Requests in flight (streams not yet finished both ways).
+    fn open_streams(self) -> usize {
+        let mut n: usize = 0
+        for s in self.streams {
+            if s.recv != 3 || s.sent != 3 { n += 1 }
+        }
+        n
+    }
+
+    // ---- errors ----
+
+    // a connection error: queue CONNECTION_CLOSE once and stop reading
+    fn fail(inout self, code: u64, why: str) {
+        if self.closed { return }
+        self.closed = true
+        self.actions.push(CloseConn(code, String.from(why)))
+        self.events.push(Closed(code, String.from(why)))
+    }
+
+    /// Closes the connection with H3_NO_ERROR (a graceful close, after GOAWAY and the requests are done) or `code`.
+    fn close(inout self, code: u64, why: str) { self.fail(code, why) }
+
+    fn find(self, id: u64) -> i64 {
+        for i in 0..self.streams.len() {
+            if self.streams[i as usize].id == id { return i as i64 }
+        }
+        -1
+    }
+
+    // a stream error: reset both directions of the stream, tell the user
+    fn stream_error(inout self, id: u64, code: u64, why: str) {
+        let i = self.find(id)
+        if i >= 0 {
+            self.streams[i as usize].recv = 3
+            self.streams[i as usize].sent = 3
+            self.streams[i as usize].blocked = false
+            self.streams[i as usize].held = List.new()
+        }
+        self.actions.push(ResetStream(id, code))
+        self.actions.push(StopSending(id, code))
+        self.dec.cancel_stream(id)
+        self.events.push(StreamError(id, code, String.from(why)))
+    }
+
+    fn gc(inout self) {
+        let mut i: usize = 0
+        while i < self.streams.len() {
+            if self.streams[i].recv == 3 && self.streams[i].sent == 3 {
+                self.streams.remove_range(i, i + 1)
+            } else {
+                i += 1
+            }
+        }
+    }
+
+    // ---- sending ----
+
+    fn write_qpack(inout self, instr: List[u8]) {
+        if instr.len() > 0 { self.actions.push(Write(self.qenc_id(), instr, false)) }
+    }
+
+    /// Sends a request (a client): the fields (pseudo-headers `:method`, `:scheme`, `:authority`, `:path` first, then the
+    /// rest), and `fin` when there is no body. Returns the stream id to send the body and trailers on and to read the
+    /// response from. An error when the peer sent GOAWAY, the connection is closed, the fields are malformed or exceed
+    /// the peer's MAX_FIELD_SECTION_SIZE.
+    fn send_request(inout self, fields: List[http.Header], fin: bool) -> Result[u64, String] {
+        if self.role != CLIENT { return Err(String.from("only a client sends requests")) }
+        if self.closed { return Err(String.from("the connection is closed")) }
+        if self.goaway_recv >= 0 { return Err(String.from("the server sent GOAWAY")) }
+        check_fields(fields, 0)?
+        if section_size(fields) > self.peer_max_field { return Err(String.from("the field section is over the peer's MAX_FIELD_SECTION_SIZE")) }
+        let id = self.next_bidi
+        self.next_bidi += 4
+        let e = self.enc.encode(id, fields)
+        self.write_qpack(e.instructions)
+        self.actions.push(Write(id, h3frame.headers(e.section), fin))
+        self.streams.push(Req(id, h3frame.decoder(h3frame.REQUEST, self.cfg.max_frame), 0, if fin { 3 } else { 2 }, false, List.new(), false, -1, 0, is_head(fields)))
+        Ok(id)
+    }
+
+    /// Sends a head or trailers on `stream`: a server's interim (1xx) or final response head, the trailers after a
+    /// body (either side; no pseudo-headers). `fin` ends the stream (trailers end it by themselves in HTTP/3 only if
+    /// you say so).
+    fn send_headers(inout self, stream: u64, fields: List[http.Header], fin: bool) -> Result[(), String] {
+        if self.closed { return Err(String.from("the connection is closed")) }
+        let i = self.find(stream)
+        if i < 0 { return Err(String.from("no such stream")) }
+        let st = self.streams[i as usize].copy()
+        if st.sent == 3 { return Err(String.from("the stream is finished")) }
+        let mut trailers = false
+        let mut final_head = false
+        if self.role == SERVER {
+            if st.sent == 0 {
+                check_fields(fields, 1)?
+                if !(fields.len() > 0 && http.eq_s(fields[0].name, ":status")) { return Err(String.from(":status must be the first field")) }
+                let code = status_of(fields)
+                if code < 200 {
+                    if fin { return Err(String.from("an interim response cannot end the stream")) }
+                    if code == 101 { return Err(String.from("101 does not exist in HTTP/3")) }
+                } else {
+                    final_head = true
+                }
+            } else {
+                trailers = true
+            }
+        } else {
+            // a client: the request head went out in send_request, so this is trailers
+            trailers = true
+        }
+        if trailers {
+            if st.sent != 2 { return Err(String.from("trailers need the head sent first")) }
+            check_fields(fields, 2)?
+            if !fin { return Err(String.from("trailers end the message: pass fin")) }
+        }
+        if section_size(fields) > self.peer_max_field { return Err(String.from("the field section is over the peer's MAX_FIELD_SECTION_SIZE")) }
+        let e = self.enc.encode(stream, fields)
+        self.write_qpack(e.instructions)
+        self.actions.push(Write(stream, h3frame.headers(e.section), fin))
+        if final_head { self.streams[i as usize].sent = 2 }
+        if fin { self.streams[i as usize].sent = 3 }
+        Ok(())
+    }
+
+    /// Sends body bytes on `stream` (a request body from a client, a response body from a server); `fin` ends the
+    /// message. The head must have been sent (a server: the final one).
+    fn send_data(inout self, stream: u64, data: List[u8], fin: bool) -> Result[(), String] {
+        if self.closed { return Err(String.from("the connection is closed")) }
+        let i = self.find(stream)
+        if i < 0 { return Err(String.from("no such stream")) }
+        let sent = self.streams[i as usize].sent
+        if sent == 3 { return Err(String.from("the stream is finished")) }
+        if sent != 2 { return Err(String.from("the head must be sent before the body")) }
+        let mut out: List[u8] = List.new()
+        if data.len() > 0 {
+            out = h3frame.data_header(data.len())
+            out.extend(data)
+        }
+        self.actions.push(Write(stream, out, fin))
+        if fin { self.streams[i as usize].sent = 3 }
+        Ok(())
+    }
+
+    /// Ends the sending side of `stream` (a message with no trailers).
+    fn finish(inout self, stream: u64) -> Result[(), String] { self.send_data(stream, List.new(), true) }
+
+    /// Abandons the sending side of `stream` (RESET_STREAM with `code`): H3_REQUEST_CANCELLED for a client giving up,
+    /// H3_NO_ERROR for a server that answered early and does not want the rest of the request body.
+    fn reset(inout self, stream: u64, code: u64) {
+        let i = self.find(stream)
+        if i >= 0 { self.streams[i as usize].sent = 3 }
+        self.actions.push(ResetStream(stream, code))
+    }
+
+    /// Stops reading `stream` (STOP_SENDING with `code`).
+    fn stop_reading(inout self, stream: u64, code: u64) {
+        let i = self.find(stream)
+        if i >= 0 {
+            self.streams[i as usize].recv = 3
+            self.streams[i as usize].held = List.new()
+            self.streams[i as usize].blocked = false
+        }
+        self.dec.cancel_stream(stream)
+        self.flush_qpack()
+        self.actions.push(StopSending(stream, code))
+    }
+
+    /// Starts a graceful shutdown (RFC 9114 section 5.2): a server announces the first request stream id it will not
+    /// process (requests at or above it are rejected from now on), a client sends the push id 0 (it never accepts
+    /// push). Requests already in flight finish; call `close` when they have.
+    fn goaway(inout self) {
+        if self.closed { return }
+        let mut id: u64 = 0
+        if self.role == SERVER {
+            id = if self.top_peer_bidi < 0 { 0 } else { (self.top_peer_bidi as u64) + 4 }
+            if self.goaway_sent >= 0 && (self.goaway_sent as u64) < id { id = self.goaway_sent as u64 }
+        }
+        self.goaway_sent = id as i64
+        self.actions.push(Write(self.control_id(), h3frame.goaway(id), false))
+    }
+
+    /// A client's MAX_PUSH_ID is never sent (push is not supported), so a server that gets a PUSH_PROMISE or a push
+    /// stream fails the connection: nothing to call here.
+    fn flush_qpack(inout self) {
+        let o = self.dec.take_output()
+        if o.len() > 0 { self.actions.push(Write(self.qdec_id(), o, false)) }
+    }
+
+    // ---- receiving ----
+
+    /// The transport reset `stream` (RESET_STREAM from the peer). A request stream ends with `StreamReset`; a control or
+    /// QPACK stream cannot be reset (H3_CLOSED_CRITICAL_STREAM).
+    fn recv_reset(inout self, stream: u64, code: u64) {
+        if self.closed { return }
+        if stream % 4 >= 2 {
+            let i = self.uni_index(stream)
+            if i >= 0 && self.uni[i as usize].kind >= 0 && self.uni[i as usize].kind <= 3 && self.uni[i as usize].kind != 1 {
+                self.fail(h3frame.H3_CLOSED_CRITICAL_STREAM, "a critical stream was reset")
+            }
+            return
+        }
+        let i = self.find(stream)
+        if i < 0 { return }
+        if self.streams[i as usize].recv != 3 {
+            self.streams[i as usize].recv = 3
+            self.streams[i as usize].held = List.new()
+            self.streams[i as usize].blocked = false
+            self.dec.cancel_stream(stream)
+            self.flush_qpack()
+            self.events.push(StreamReset(stream, code))
+        }
+    }
+
+    /// The peer sent STOP_SENDING for `stream`: we stop sending on it (a server that gets H3_REQUEST_REJECTED or
+    /// H3_NO_ERROR has no more to say; the user sees `StreamReset` only for the peer's own reset).
+    fn recv_stop_sending(inout self, stream: u64, code: u64) {
+        if self.closed { return }
+        let i = self.find(stream)
+        if i >= 0 && self.streams[i as usize].sent != 3 {
+            self.streams[i as usize].sent = 3
+            self.actions.push(ResetStream(stream, code))
+        }
+    }
+
+    fn uni_index(self, id: u64) -> i64 {
+        for i in 0..self.uni.len() {
+            if self.uni[i as usize].id == id { return i as i64 }
+        }
+        -1
+    }
+
+    /// Bytes read from `stream` (`fin`: the peer finished sending on it).
+    fn recv(inout self, stream: u64, data: List[u8], fin: bool) {
+        if self.closed { return }
+        self.gc()
+        let k = stream % 4
+        if k < 2 {
+            self.recv_request(stream, data, fin)
+        } else {
+            let mine: u64 = if self.role == CLIENT { 3 } else { 2 }
+            if k != mine {
+                self.fail(h3frame.H3_STREAM_CREATION_ERROR, "data on a unidirectional stream we opened")
+                return
+            }
+            self.recv_uni(stream, data, fin)
+        }
+        if !self.closed { self.flush_qpack() }
+    }
+
+    // ---- unidirectional streams ----
+
+    fn recv_uni(inout self, id: u64, data: List[u8], fin: bool) {
+        let mut i = self.uni_index(id)
+        if i < 0 {
+            self.uni.push(Uni(id, -1, List.new(), h3frame.decoder(h3frame.CONTROL, self.cfg.max_frame)))
+            i = (self.uni.len() as i64) - 1
+        }
+        let ix = i as usize
+        let mut rest = data.copy()
+        if self.uni[ix].kind < 0 {
+            self.uni[ix].head.extend(data)
+            match h3frame.get_varint(self.uni[ix].head, 0) {
+                None => {
+                    if fin { self.fail(h3frame.H3_GENERAL_PROTOCOL_ERROR, "a unidirectional stream ended before its type") }
+                    return
+                }
+                Some(v) => {
+                    rest = self.uni[ix].head.slice(v.next, self.uni[ix].head.len())
+                    self.uni[ix].head = List.new()
+                    self.open_uni(ix, v.value)
+                    if self.closed { return }
+                }
+            }
+        }
+        let kind = self.uni[ix].kind
+        if kind == 0 {
+            self.uni[ix].fdec.feed(rest)
+            self.drain_control(ix)
+            if self.closed { return }
+            if fin { self.fail(h3frame.H3_CLOSED_CRITICAL_STREAM, "the control stream was closed") }
+        } else if kind == 2 {
+            match self.dec.receive_encoder(rest) {
+                Ok(ready) => {
+                    for s in ready { self.section_ready(s) }
+                }
+                Err(e) => { self.fail(e.code, "the QPACK encoder stream is malformed") }
+            }
+            if !self.closed && fin { self.fail(h3frame.H3_CLOSED_CRITICAL_STREAM, "the QPACK encoder stream was closed") }
+        } else if kind == 3 {
+            match self.enc.receive_decoder(rest) {
+                Ok(x) => {}
+                Err(e) => { self.fail(e.code, "the QPACK decoder stream is malformed") }
+            }
+            if !self.closed && fin { self.fail(h3frame.H3_CLOSED_CRITICAL_STREAM, "the QPACK decoder stream was closed") }
+        }
+        // any other type: discarded (a STOP_SENDING was queued when the type was read)
+    }
+
+    // the type of a new unidirectional stream is known
+    fn open_uni(inout self, ix: usize, t: u64) {
+        let id = self.uni[ix].id
+        self.uni[ix].kind = t as i64
+        if t == h3frame.STREAM_CONTROL {
+            if self.peer_control >= 0 { self.fail(h3frame.H3_STREAM_CREATION_ERROR, "a second control stream"); return }
+            self.peer_control = id as i64
+        } else if t == h3frame.STREAM_QPACK_ENCODER {
+            if self.peer_qenc >= 0 { self.fail(h3frame.H3_STREAM_CREATION_ERROR, "a second QPACK encoder stream"); return }
+            self.peer_qenc = id as i64
+        } else if t == h3frame.STREAM_QPACK_DECODER {
+            if self.peer_qdec >= 0 { self.fail(h3frame.H3_STREAM_CREATION_ERROR, "a second QPACK decoder stream"); return }
+            self.peer_qdec = id as i64
+        } else if t == h3frame.STREAM_PUSH {
+            if self.role == SERVER {
+                self.fail(h3frame.H3_STREAM_CREATION_ERROR, "a client opened a push stream")
+            } else {
+                self.fail(h3frame.H3_ID_ERROR, "a push stream, but no MAX_PUSH_ID was sent")
+            }
+        } else {
+            // unknown (and the reserved grease types): ask the peer to stop, discard what arrives meanwhile
+            self.actions.push(StopSending(id, h3frame.H3_STREAM_CREATION_ERROR))
+        }
+    }
+
+    fn drain_control(inout self, ix: usize) {
+        while !self.closed {
+            match self.uni[ix].fdec.next() {
+                h3frame.NeedMore => { return }
+                h3frame.Chunk(b) => { self.fail(h3frame.H3_FRAME_UNEXPECTED, "DATA on the control stream") }
+                h3frame.Fail(code, why) => { self.fail(code, "the control stream is malformed") }
+                h3frame.Got(f) => { self.on_control_frame(f) }
+            }
+        }
+    }
+
+    fn on_control_frame(inout self, f: h3frame.Frame) {
+        if f.kind == h3frame.SETTINGS {
+            self.peer_settings = true
+            let mut cap: u64 = 0
+            let mut blocked: u64 = 0
+            for s in f.settings {
+                if s.id == h3frame.SETTING_QPACK_MAX_TABLE_CAPACITY { cap = s.value }
+                if s.id == h3frame.SETTING_QPACK_BLOCKED_STREAMS { blocked = s.value }
+                if s.id == h3frame.SETTING_MAX_FIELD_SECTION_SIZE { self.peer_max_field = s.value }
+            }
+            self.enc.set_peer_limits(cap as usize, blocked as usize)
+            let want: u64 = if cap < self.cfg.qpack_capacity { cap } else { self.cfg.qpack_capacity }
+            if want > 0 {
+                match self.enc.set_capacity(want as usize) {
+                    Ok(i) => { self.write_qpack(i) }
+                    Err(e) => { self.fail(h3frame.H3_INTERNAL_ERROR, "could not set the QPACK table capacity") }
+                }
+            }
+            self.events.push(PeerSettings(f.settings))
+        } else if f.kind == h3frame.GOAWAY {
+            if self.role == CLIENT {
+                if f.id % 4 != 0 { self.fail(h3frame.H3_ID_ERROR, "GOAWAY with an id that is not a client-initiated bidirectional stream"); return }
+                if self.goaway_recv >= 0 && f.id > (self.goaway_recv as u64) { self.fail(h3frame.H3_ID_ERROR, "GOAWAY with an id that grew"); return }
+            } else {
+                if self.goaway_recv >= 0 && f.id > (self.goaway_recv as u64) { self.fail(h3frame.H3_ID_ERROR, "GOAWAY with a push id that grew"); return }
+            }
+            self.goaway_recv = f.id as i64
+            self.events.push(GoAway(f.id))
+        } else if f.kind == h3frame.MAX_PUSH_ID {
+            if self.role == CLIENT { self.fail(h3frame.H3_FRAME_UNEXPECTED, "MAX_PUSH_ID from a server"); return }
+            if self.max_push_id >= 0 && f.id < (self.max_push_id as u64) { self.fail(h3frame.H3_ID_ERROR, "MAX_PUSH_ID decreased"); return }
+            self.max_push_id = f.id as i64
+        } else if f.kind == h3frame.CANCEL_PUSH {
+            if self.max_push_id < 0 || f.id > (self.max_push_id as u64) {
+                self.fail(h3frame.H3_ID_ERROR, "CANCEL_PUSH for a push id that was not allowed")
+            }
+        }
+    }
+
+    // ---- request streams ----
+
+    fn recv_request(inout self, id: u64, data: List[u8], fin: bool) {
+        let mut i = self.find(id)
+        if i < 0 {
+            if self.role == CLIENT {
+                // our own request streams are in `streams` until both directions are done: anything else is a stray
+                if id % 4 != 0 || id >= self.next_bidi { self.fail(h3frame.H3_STREAM_CREATION_ERROR, "data on a bidirectional stream we did not open") }
+                return
+            }
+            if id % 4 != 0 { self.fail(h3frame.H3_STREAM_CREATION_ERROR, "a server-initiated bidirectional stream"); return }
+            if self.top_peer_bidi < (id as i64) { self.top_peer_bidi = id as i64 }
+            let mut r = Req(id, h3frame.decoder(h3frame.REQUEST, self.cfg.max_frame), 0, 0, false, List.new(), false, -1, 0, false)
+            if self.goaway_sent >= 0 && id >= (self.goaway_sent as u64) {
+                r.recv = 3
+                r.sent = 3
+                self.streams.push(r)
+                self.actions.push(ResetStream(id, h3frame.H3_REQUEST_REJECTED))
+                self.actions.push(StopSending(id, h3frame.H3_REQUEST_REJECTED))
+                return
+            }
+            self.streams.push(r)
+            i = (self.streams.len() as i64) - 1
+        }
+        let ix = i as usize
+        if self.streams[ix].recv == 3 { return }
+        if self.streams[ix].blocked {
+            self.streams[ix].held.extend(data)
+            if fin { self.streams[ix].held_fin = true }
+            if self.streams[ix].held.len() > 2 * self.cfg.max_frame + 65536 { self.fail(h3frame.H3_EXCESSIVE_LOAD, "too much data on a stream blocked on QPACK") }
+            return
+        }
+        self.pump(id, data, fin)
+    }
+
+    // reads frames from the stream's decoder until it needs more, is blocked, or is done
+    fn pump(inout self, id: u64, data: List[u8], fin: bool) {
+        let i0 = self.find(id)
+        if i0 < 0 { return }
+        self.streams[i0 as usize].fdec.feed(data)
+        while !self.closed {
+            let i = self.find(id)
+            if i < 0 { return }
+            let ix = i as usize
+            if self.streams[ix].recv == 3 || self.streams[ix].blocked { return }
+            match self.streams[ix].fdec.next() {
+                h3frame.NeedMore => { break }
+                h3frame.Fail(code, why) => {
+                    self.fail(code, "a malformed frame on a request stream")
+                    return
+                }
+                h3frame.Chunk(b) => {
+                    let st = self.streams[ix].recv
+                    if st == 0 { self.fail(h3frame.H3_FRAME_UNEXPECTED, "DATA before HEADERS"); return }
+                    if st == 2 { self.fail(h3frame.H3_FRAME_UNEXPECTED, "DATA after the trailers"); return }
+                    self.streams[ix].got += b.len() as u64
+                    if self.streams[ix].expect >= 0 && self.streams[ix].got > (self.streams[ix].expect as u64) {
+                        self.stream_error(id, h3frame.H3_MESSAGE_ERROR, "more DATA than content-length")
+                        return
+                    }
+                    self.events.push(Data(id, b))
+                }
+                h3frame.Got(f) => {
+                    if f.kind == h3frame.PUSH_PROMISE {
+                        if self.role == SERVER {
+                            self.fail(h3frame.H3_FRAME_UNEXPECTED, "PUSH_PROMISE from a client")
+                        } else {
+                            self.fail(h3frame.H3_ID_ERROR, "PUSH_PROMISE, but no MAX_PUSH_ID was sent")
+                        }
+                        return
+                    }
+                    // HEADERS
+                    if self.streams[ix].recv == 2 { self.fail(h3frame.H3_FRAME_UNEXPECTED, "HEADERS after the trailers"); return }
+                    match self.dec.decode_section(id, f.payload) {
+                        Err(e) => {
+                            self.fail(e.code, "a field section does not decode")
+                            return
+                        }
+                        Ok(o) => {
+                            match o {
+                                qpack.Blocked => {
+                                    self.streams[ix].blocked = true
+                                    // the fin, if it comes with these bytes, waits for the section
+                                    if fin { self.streams[ix].held_fin = true }
+                                    return
+                                }
+                                qpack.Ready(s) => { self.section(id, s) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if self.closed { return }
+        let i = self.find(id)
+        if i < 0 { return }
+        let ix = i as usize
+        if self.streams[ix].recv == 3 || self.streams[ix].blocked { return }
+        if fin { self.end_of_stream(id) }
+    }
+
+    // the peer finished sending on a request stream
+    fn end_of_stream(inout self, id: u64) {
+        let i = self.find(id)
+        if i < 0 { return }
+        let ix = i as usize
+        if !self.streams[ix].fdec.idle() {
+            self.fail(h3frame.H3_FRAME_ERROR, "a stream ended inside a frame")
+            return
+        }
+        if self.streams[ix].recv == 0 {
+            self.stream_error(id, h3frame.H3_REQUEST_INCOMPLETE, "the stream ended before a head")
+            return
+        }
+        let ex = self.streams[ix].expect
+        if ex >= 0 && self.streams[ix].got != (ex as u64) {
+            self.stream_error(id, h3frame.H3_MESSAGE_ERROR, "less DATA than content-length")
+            return
+        }
+        self.streams[ix].recv = 3
+        self.events.push(Finished(id))
+    }
+
+    // a decoded field section arrived for stream `id`: a head, an interim response, or trailers
+    fn section(inout self, id: u64, s: qpack.Section) {
+        let i = self.find(id)
+        if i < 0 { return }
+        let ix = i as usize
+        if s.too_large {
+            self.stream_error(id, h3frame.H3_EXCESSIVE_LOAD, "a field section over MAX_FIELD_SECTION_SIZE")
+            return
+        }
+        let st = self.streams[ix].recv
+        if st == 1 {
+            // trailers
+            match check_fields(s.fields, 2) {
+                Ok(x) => {}
+                Err(e) => { self.stream_error(id, h3frame.H3_MESSAGE_ERROR, "malformed trailers"); return }
+            }
+            self.streams[ix].recv = 2
+            self.events.push(Trailers(id, s.fields))
+            return
+        }
+        // st == 0: a request head (server) or a response head (client)
+        let kind: i32 = if self.role == SERVER { 0 } else { 1 }
+        match check_fields(s.fields, kind) {
+            Ok(x) => {}
+            Err(e) => { self.stream_error(id, h3frame.H3_MESSAGE_ERROR, "a malformed message head"); return }
+        }
+        if kind == 1 && !(s.fields.len() > 0 && http.eq_s(s.fields[0].name, ":status")) {
+            self.stream_error(id, h3frame.H3_MESSAGE_ERROR, ":status must be the first field")
+            return
+        }
+        if kind == 1 {
+            let code = status_of(s.fields)
+            if code == 101 {
+                self.stream_error(id, h3frame.H3_MESSAGE_ERROR, "101 does not exist in HTTP/3")
+                return
+            }
+            if code < 200 {
+                self.events.push(Informational(id, s.fields))
+                return
+            }
+        }
+        let cl = match content_length(s.fields) {
+            Ok(n) => n
+            Err(e) => { self.stream_error(id, h3frame.H3_MESSAGE_ERROR, "a bad content-length"); return }
+        }
+        self.streams[ix].recv = 1
+        let bodyless = kind == 1 && (self.streams[ix].head_only || status_of(s.fields) == 204 || status_of(s.fields) == 304)
+        self.streams[ix].expect = if bodyless { -1 } else { cl }
+        self.events.push(Headers(id, s.fields))
+    }
+
+    // QPACK entries arrived that unblock a stream's section
+    fn section_ready(inout self, s: qpack.Section) {
+        let id = s.stream
+        let i = self.find(id)
+        if i < 0 { return }
+        let ix = i as usize
+        if !self.streams[ix].blocked { return }
+        self.streams[ix].blocked = false
+        self.section(id, s)
+        if self.closed { return }
+        let held = self.streams[ix].held.copy()
+        let hfin = self.streams[ix].held_fin
+        self.streams[ix].held = List.new()
+        self.streams[ix].held_fin = false
+        // the bytes that waited, then the end of the stream; the frames still in the decoder come first
+        self.pump(id, held, hfin)
+    }
+}
+
+/// Moves what `a` and `b` want to send to the other until neither has anything to say: every `Write` becomes a
+/// `recv` on the other side (a fin is reported with the last bytes written to it), `ResetStream` a `recv_reset`,
+/// `StopSending` a `recv_stop_sending`, `CloseConn` stops that direction. For tests and for running two
+/// connections in one process.
+pub fn pump(inout a: Conn, inout b: Conn) {
+    let mut rounds: usize = 0
+    while rounds < 10000 {
+        rounds += 1
+        let from_a = a.poll()
+        let from_b = b.poll()
+        if from_a.len() == 0 && from_b.len() == 0 { return }
+        for x in from_a { deliver(x, inout b) }
+        for x in from_b { deliver(x, inout a) }
+    }
+}
+
+fn deliver(x: Action, inout to: Conn) {
+    match x {
+        Write(stream, data, fin) => { to.recv(stream, data, fin) }
+        ResetStream(stream, code) => { to.recv_reset(stream, code) }
+        StopSending(stream, code) => { to.recv_stop_sending(stream, code) }
+        CloseConn(code, why) => {}
+    }
+}

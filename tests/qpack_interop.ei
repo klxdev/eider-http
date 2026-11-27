@@ -1,0 +1,116 @@
+// http/qpack against libnghttp3 (tests/qpack_oracle.c, tests/qpack_interop.sh). Reads stdin, writes stdout:
+//   decode CAP BLOCKED: "E hex" / "P hex" lines (encoder stream bytes; a field section on streams 0, 4, 8, ...) -> the fields,
+//                       "hex(name) hex(value)" per line, "--" after a section
+//   encode CAP BLOCKED: those fields (blocks ended by "--") -> "E hex" and "P hex" per block
+// The tables persist across sections, as on a connection. The encoder is told each section is acknowledged as soon as it is
+// written (the decoder processes the sections in order, with the instructions before each).
+
+import core.sys
+import std.bytes
+import std.io
+import http
+import http.hpack
+import http.qpack
+
+fn unhex(b: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut hi: i32 = -1
+    for c in b {
+        let v: i32 = if c >= 48 && c <= 57 { (c as i32) - 48 } else if c >= 97 && c <= 102 { (c as i32) - 87 } else { -1 }
+        if v < 0 { continue }
+        if hi < 0 {
+            hi = v
+        } else {
+            out.push((hi * 16 + v) as u8)
+            hi = -1
+        }
+    }
+    out
+}
+
+fn num(b: List[u8]) -> usize {
+    let mut n: usize = 0
+    for c in b { n = n * 10 + ((c - 48) as usize) }
+    n
+}
+
+fn line(tag: str, data: List[u8]) -> List[u8] { bytes.concat(bytes.concat(sys.lit(tag), bytes.hex(data)), List.new()) }
+
+fn main() uses io {
+    let all = io.read_all().unwrap()
+    let ls = bytes.lines(all)
+    let args = bytes.split(ls[0], 32)
+    let mode = args[0]
+    let cap = num(args[1])
+    let blocked = num(args[2])
+    if bytes.eq(mode, sys.lit("decode")) {
+        let mut d = qpack.decoder(cap, blocked, 100000000)
+        d.max_string = 1000000
+        let mut stream: u64 = 0
+        for i in 1..ls.len() {
+            let l = ls[i]
+            if l.len() < 2 { continue }
+            let data = unhex(l.slice(2, l.len()))
+            if l[0] == 69 {
+                match d.receive_encoder(data) {
+                    Ok(r) => {}
+                    Err(e) => {
+                        io.outln(e.why.bytes())
+                        return
+                    }
+                }
+            } else {
+                match d.decode_section(stream, data) {
+                    Ok(o) => {
+                        match o {
+                            qpack.Ready(s) => {
+                                for f in s.fields { io.outln(bytes.concat(bytes.concat(bytes.hex(f.name), sys.lit(" ")), bytes.hex(f.value))) }
+                                io.outln(sys.lit("--"))
+                            }
+                            qpack.Blocked => {
+                                io.outln(sys.lit("BLOCKED"))
+                                return
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        io.outln(e.why.bytes())
+                        return
+                    }
+                }
+                stream += 4
+            }
+        }
+    } else {
+        let mut e = qpack.encoder(cap, blocked)
+        let mut stream: u64 = 0
+        let mut pre: List[u8] = List.new()
+        match e.set_capacity(cap) {
+            Ok(i) => { pre = i }
+            Err(x) => { io.outln(x.why.bytes()) }
+        }
+        let mut fs: List[http.Header] = List.new()
+        for i in 1..ls.len() {
+            let l = ls[i]
+            if l.len() > 0 && l[0] == 45 {
+                let r = e.encode(stream, fs)
+                let mut ins = pre.copy()
+                ins.extend(r.instructions)
+                pre = List.new()
+                io.outln(line("E ", ins))
+                io.outln(line("P ", r.section))
+                if e.outstanding(stream) {
+                    match e.receive_decoder(hpack.encode_int(7, 128, stream)) {
+                        Ok(x) => {}
+                        Err(x) => { io.outln(x.why.bytes()) }
+                    }
+                }
+                stream += 4
+                fs = List.new()
+            } else {
+                let sp = bytes.find_byte(l, 32, 0).unwrap()
+                fs.push(http.Header(unhex(l.slice(0, sp)), unhex(l.slice(sp + 1, l.len()))))
+            }
+        }
+    }
+}

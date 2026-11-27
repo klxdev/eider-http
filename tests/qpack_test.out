@@ -1,0 +1,243 @@
+-- static table
+entries: 99
+0 :authority: 
+1 :path: /
+2 age: 0
+3 content-disposition: 
+4 content-length: 0
+5 cookie: 
+6 date: 
+7 etag: 
+8 if-modified-since: 
+9 if-none-match: 
+10 last-modified: 
+11 link: 
+12 location: 
+13 referer: 
+14 set-cookie: 
+15 :method: CONNECT
+16 :method: DELETE
+17 :method: GET
+18 :method: HEAD
+19 :method: OPTIONS
+20 :method: POST
+21 :method: PUT
+22 :scheme: http
+23 :scheme: https
+24 :status: 103
+25 :status: 200
+26 :status: 304
+27 :status: 404
+28 :status: 503
+29 accept: */*
+30 accept: application/dns-message
+31 accept-encoding: gzip, deflate, br
+32 accept-ranges: bytes
+33 access-control-allow-headers: cache-control
+34 access-control-allow-headers: content-type
+35 access-control-allow-origin: *
+36 cache-control: max-age=0
+37 cache-control: max-age=2592000
+38 cache-control: max-age=604800
+39 cache-control: no-cache
+40 cache-control: no-store
+41 cache-control: public, max-age=31536000
+42 content-encoding: br
+43 content-encoding: gzip
+44 content-type: application/dns-message
+45 content-type: application/javascript
+46 content-type: application/json
+47 content-type: application/x-www-form-urlencoded
+48 content-type: image/gif
+49 content-type: image/jpeg
+50 content-type: image/png
+51 content-type: text/css
+52 content-type: text/html; charset=utf-8
+53 content-type: text/plain
+54 content-type: text/plain;charset=utf-8
+55 range: bytes=0-
+56 strict-transport-security: max-age=31536000
+57 strict-transport-security: max-age=31536000; includesubdomains
+58 strict-transport-security: max-age=31536000; includesubdomains; preload
+59 vary: accept-encoding
+60 vary: origin
+61 x-content-type-options: nosniff
+62 x-xss-protection: 1; mode=block
+63 :status: 100
+64 :status: 204
+65 :status: 206
+66 :status: 302
+67 :status: 400
+68 :status: 403
+69 :status: 421
+70 :status: 425
+71 :status: 500
+72 accept-language: 
+73 access-control-allow-credentials: FALSE
+74 access-control-allow-credentials: TRUE
+75 access-control-allow-headers: *
+76 access-control-allow-methods: get
+77 access-control-allow-methods: get, post, options
+78 access-control-allow-methods: options
+79 access-control-expose-headers: content-length
+80 access-control-request-headers: content-type
+81 access-control-request-method: get
+82 access-control-request-method: post
+83 alt-svc: clear
+84 authorization: 
+85 content-security-policy: script-src 'none'; object-src 'none'; base-uri 'none'
+86 early-data: 1
+87 expect-ct: 
+88 forwarded: 
+89 if-range: 
+90 origin: 
+91 purpose: prefetch
+92 server: 
+93 timing-allow-origin: *
+94 upgrade-insecure-requests: 1
+95 user-agent: 
+96 x-forwarded-for: 
+97 x-frame-options: deny
+98 x-frame-options: sameorigin
+-- RFC 9204 appendix B, the decoder reading the RFC's bytes
+B.1
+section on stream 0: :path=/index.html; 
+B.2
+encoder stream: ok, unblocked 0
+  table: [1] :path=/sample/path [0] :authority=www.example.com
+section on stream 4: :authority=www.example.com; :path=/sample/path; 
+  decoder stream: 84
+B.3
+encoder stream: ok, unblocked 0
+  decoder stream: 01
+B.4
+encoder stream: ok, unblocked 0
+section on stream 8: :authority=www.example.com; :path=/; custom-key=custom-value; 
+  table: [3] :authority=www.example.com [2] custom-key=custom-value [1] :path=/sample/path [0] :authority=www.example.com
+B.5
+encoder stream: ok, unblocked 0
+  table: [4] custom-key=custom-value2 [3] :authority=www.example.com [2] custom-key=custom-value [1] :path=/sample/path
+  table size: 215
+section on stream 8: blocked
+B.4 with the duplicate delayed, blocked streams: 1
+  after the cancellation: 0
+  decoder stream: 4803
+the delayed duplicate: ok, unblocked 0
+-- RFC 9204 appendix B, the encoder writing the RFC's bytes (no Huffman coding, as in the RFC)
+B.1 section: 0000510b2f696e6465782e68746d6c
+  instructions: 
+B.2 set capacity: 3fbd01
+B.2 encoder stream: c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f70617468
+B.2 section: 03811011
+  known received after the acknowledgment: 2
+B.3 speculative insert: 4a637573746f6d2d6b65790c637573746f6d2d76616c7565
+  known received after the increment: 3
+B.4 duplicate: 02
+B.4 section: 050080c181
+  instructions: 
+  streams blocked (the section names the unacknowledged duplicate): 1
+  after the cancellation, blocked: 0
+B.5 insert with a name reference, evicting the oldest: 810d637573746f6d2d76616c756532
+  table: [4] custom-key=custom-value2 [3] :authority=www.example.com [2] custom-key=custom-value [1] :path=/sample/path
+  table size: 215
+-- a section that arrives before its table entries blocks, and comes out of receive_encoder
+section on stream 4: blocked
+section on stream 8: blocked
+section on stream 12:  -> error 512
+blocked streams: 2
+half the instructions: ok, unblocked 0
+blocked streams: 2
+the instruction split mid-string: ok, unblocked 0
+its rest: ok, unblocked 2 [stream 4: :authority=www.example.com; :path=/sample/path; ] [stream 8: :authority=www.example.com; :path=/sample/path; ]
+  decoder stream: 8488
+-- every proper prefix of the encoder stream is accepted and gives the same table
+splits that did not give four entries of 217 bytes: 0
+-- malformed and unusual field sections (table: 0 :authority=www.example.com, 1 :path=/sample/path; one blocked stream allowed)
+empty:  -> error 512
+a Required Insert Count and no Base:  -> error 512
+a truncated static index:  -> error 512
+static index 63: :status=100; 
+static index 0: :authority=; 
+static index 98, the last: x-frame-options=sameorigin; 
+static index 99:  -> error 512
+a truncated name index:  -> error 512
+a truncated string:  -> error 512
+dynamic index 0 with Base 0:  -> error 512
+post-base index 0 with no entries required:  -> error 512
+RIC 1, Base 1, dynamic index 0 (entry 0): :authority=www.example.com; 
+RIC 2, post-base index 2 (past the RIC):  -> error 512
+RIC 2, the same field line three times: :path=/sample/path; :path=/sample/path; :path=/sample/path; 
+RIC 3 (entry 2 not inserted yet): blocks: blocked
+a second blocked stream (the limit is 1):  -> error 512
+an encoded RIC over twice the maximum entries:  -> error 512
+RIC 2, Base 4, post-base 0 is entry 4:  -> error 512
+RIC 1, S=1, delta 1: a negative Base:  -> error 512
+an encoded RIC of 1 with no table at all:  -> error 512
+a literal name cut short:  -> error 512
+a Huffman string with the EOS code:  -> error 512
+a Huffman string with bad padding:  -> error 512
+an integer over 2^62:  -> error 512
+a literal with a post-base name past the RIC:  -> error 512
+blocked streams: 1
+a decoder with no table, RIC 1:  -> error 512
+-- malformed encoder stream
+3fff03 -> error 513
+3fbd01 c000: ok, unblocked 0
+3fbd01 c05b: ok, unblocked 0
+3fbd01 8100 -> error 513
+3fbd01 01 -> error 513
+3fbd01 c10c 2f73616d706c652f70617468 05 -> error 513
+3fbd01 c10c 2f73616d706c652f70617468 0200 -> error 513
+20 c00f 7777772e6578616d706c652e636f6d -> error 513
+3fbd01 4a637573746f6d2d6b6579 ffffffffffffffffffff01 -> error 513
+3fbd01 c1ff: ok, unblocked 0
+3fbd01 7f: ok, unblocked 0
+capacity 221 -> error 513
+an entry of 221 bytes (capacity 220) -> error 513
+an entry of 220 bytes (capacity 220): ok, unblocked 0
+-- the decoder's limits
+two fields of 57 and 49 bytes: limit 120, then limit 100 (decoded to the end, the fields over the limit dropped)
+section on stream 0: :authority=www.example.com; :path=/sample/path; 
+section on stream 0: :authority=www.example.com; (too large)
+max_string 4: an 11-byte value, then a 3-byte one
+section on stream 0:  -> error 512
+section on stream 0: :path=/in; 
+-- the decoder stream
+  a section that names the new entry: 028010
+  blocked streams: 1
+  a second stream may not block (limit 1): 00012df2b1d3396c03646566
+  instructions: 65f2b1d3396c03646566
+decoder stream 88 -> error 514
+decoder stream 89 -> error 514
+decoder stream 00 -> error 514
+decoder stream 01: accepted
+decoder stream 05 -> error 514
+decoder stream 3f: accepted
+decoder stream c0 -> error 514
+decoder stream ff: accepted
+  an acknowledgment of stream 130 split across reads, pending sections after the first half: 1
+  accepted, known received: 1
+  capacity over the maximum: refused
+-- credentials are never indexed
+instructions (only x-secret and x-plain are indexed): 66f2b20a4b0a9f017366f2b5740cd57f0170
+section (cookie and authorization are never-indexed literals with a static name): 03817503613d627f4586ba51d85b14f31011
+instructions with x-secret sensitive: 
+  table: [1] x-plain=p [0] x-secret=s
+-- entries named by an unacknowledged section are not evicted
+insert a: 43782d610131
+insert b: 43782d620132
+a section naming entry 0: 020181
+insert c (needs room: 0 is in use, so nothing may be evicted): 
+shrinking the table below what is in use -> error 513
+after the acknowledgment, insert c evicts entry 0: 43782d630133
+  table: [2] x-c=3 [1] x-b=2
+known received: 1
+-- many sections through a small table (eviction, unacknowledged sections, blocked streams)
+sections: 300
+mismatches: 0
+failures: 0
+both tables agree on the insert count: yes
+both tables agree on the size: yes
+blocked at some point: yes
+table within capacity: yes
+done

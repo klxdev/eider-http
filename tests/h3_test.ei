@@ -1,0 +1,766 @@
+// http/h3: a full HTTP/3 exchange between two Eider connections over in-memory streams (SETTINGS, QPACK streams,
+// requests, responses, bodies, trailers, interim responses, GOAWAY), delivery in odd orders (a section before the QPACK
+// entries it needs, one byte at a time), and a corpus of connection errors and malformed messages with the error codes
+// RFC 9114 names. No transport is involved: the streams are the `Action`s of one side fed to `recv` of the other.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import http
+import http.h3
+import http.h3frame
+import http.qpack
+
+fn say(s: String) uses io { io.outln(s.bytes()) }
+fn note(s: str) uses io { say(String.from(s)) }
+
+fn cat(a: String, b: String) -> String {
+    let mut l = a.copy()
+    l.append(b)
+    l
+}
+
+fn msg(a: str, b: String) -> String { cat(String.from(a), b) }
+
+fn hx(b: List[u8]) -> String { encoding.hex(b) }
+
+fn unhex(s: str) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut hi: i32 = -1
+    for c in sys.lit(s) {
+        let v: i32 = if c >= 48 && c <= 57 { (c as i32) - 48 } else if c >= 97 && c <= 102 { (c as i32) - 87 } else { -1 }
+        if v < 0 { continue }
+        if hi < 0 {
+            hi = v
+        } else {
+            out.push((hi * 16 + v) as u8)
+            hi = -1
+        }
+    }
+    out
+}
+
+fn txt(b: List[u8]) -> String { sys.to_string(b) }
+
+/// "name=value|name=value": a field list (the first = of each splits it)
+fn fl(spec: str) -> List[http.Header] { fl_b(sys.lit(spec)) }
+
+fn fl_b(spec: List[u8]) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    let mut name: List[u8] = List.new()
+    let mut value: List[u8] = List.new()
+    let mut in_value = false
+    for c in spec {
+        if c == 124 {
+            out.push(http.Header(name.copy(), value.copy()))
+            name.clear()
+            value.clear()
+            in_value = false
+        } else if c == 61 && !in_value {
+            in_value = true
+        } else if in_value {
+            value.push(c)
+        } else {
+            name.push(c)
+        }
+    }
+    out.push(http.Header(name.copy(), value.copy()))
+    out
+}
+
+fn fields_text(fs: List[http.Header]) -> String {
+    let mut l = String.from("")
+    for f in fs {
+        l.append(txt(f.name))
+        l.push_str("=")
+        l.append(txt(f.value))
+        l.push_str(" ")
+    }
+    l
+}
+
+fn show_ev(e: h3.Event) -> String {
+    match e {
+        h3.PeerSettings(s) => {
+            let mut l = String.from("settings")
+            for x in s {
+                l.push_str(" ")
+                l.append(x.id.to_string())
+                l.push_str("=")
+                l.append(x.value.to_string())
+            }
+            l
+        }
+        h3.Informational(id, f) => msg("informational ", cat(id.to_string(), msg(": ", fields_text(f))))
+        h3.Headers(id, f) => msg("headers ", cat(id.to_string(), msg(": ", fields_text(f))))
+        h3.Data(id, d) => msg("data ", cat(id.to_string(), msg(": ", txt(d))))
+        h3.Trailers(id, f) => msg("trailers ", cat(id.to_string(), msg(": ", fields_text(f))))
+        h3.Finished(id) => msg("finished ", id.to_string())
+        h3.StreamReset(id, c) => msg("stream reset ", cat(id.to_string(), msg(" ", h3frame.code_name(c))))
+        h3.StreamError(id, c, why) => msg("stream error ", cat(id.to_string(), msg(" ", cat(h3frame.code_name(c), msg(": ", why)))))
+        h3.GoAway(id) => msg("goaway ", id.to_string())
+        h3.Closed(c, why) => msg("closed ", cat(h3frame.code_name(c), msg(": ", why)))
+    }
+}
+
+fn show_act(a: h3.Action) -> String {
+    match a {
+        h3.Write(s, d, fin) => {
+            let mut l = String.from("write ")
+            l.append(s.to_string())
+            l.push_str(" ")
+            l.append(hx(d))
+            if fin { l.push_str(" fin") }
+            l
+        }
+        h3.ResetStream(s, c) => msg("reset ", cat(s.to_string(), msg(" ", h3frame.code_name(c))))
+        h3.StopSending(s, c) => msg("stop sending ", cat(s.to_string(), msg(" ", h3frame.code_name(c))))
+        h3.CloseConn(c, why) => msg("close ", cat(h3frame.code_name(c), msg(": ", why)))
+    }
+}
+
+fn events(who: str, inout c: h3.Conn) uses io {
+    for e in c.take_events() { say(msg(who, msg(": ", show_ev(e)))) }
+}
+
+fn actions(who: str, inout c: h3.Conn) uses io {
+    for a in c.poll() { say(msg(who, msg(": ", show_act(a)))) }
+}
+
+/// The Write actions of `a`, delivered to `b` one byte at a time (the fin with the last byte).
+fn pump_bytes(inout a: h3.Conn, inout b: h3.Conn) {
+    let mut rounds: usize = 0
+    while rounds < 1000 {
+        rounds += 1
+        let fa = a.poll()
+        let fb = b.poll()
+        if fa.len() == 0 && fb.len() == 0 { return }
+        for x in fa { deliver_bytes(x, inout b) }
+        for x in fb { deliver_bytes(x, inout a) }
+    }
+}
+
+fn deliver_bytes(x: h3.Action, inout to: h3.Conn) {
+    match x {
+        h3.Write(stream, data, fin) => {
+            if data.len() == 0 {
+                to.recv(stream, data, fin)
+            } else {
+                for i in 0..data.len() {
+                    to.recv(stream, data.slice(i as usize, (i as usize) + 1), fin && (i as usize) + 1 == data.len())
+                }
+            }
+        }
+        h3.ResetStream(stream, code) => { to.recv_reset(stream, code) }
+        h3.StopSending(stream, code) => { to.recv_stop_sending(stream, code) }
+        h3.CloseConn(code, why) => {}
+    }
+}
+
+fn req(path: str) -> List[http.Header] {
+    req_s(String.from(path))
+}
+
+fn req_s(path: String) -> List[http.Header] {
+    let mut s = String.from(":method=GET|:scheme=https|:authority=example.com|:path=")
+    s.append(path)
+    s.push_str("|user-agent=eider-test/1.0|accept=*/*|x-request-id=abc123")
+    fl_b(s.bytes())
+}
+
+/// A HEADERS frame for `fields`, QPACK-encoded with the static table only.
+fn headers_frame(fields: List[http.Header]) -> List[u8] {
+    let mut e = qpack.encoder(0, 0)
+    h3frame.headers(e.encode(0, fields).section)
+}
+
+fn server_with_settings() -> h3.Conn {
+    let mut s = h3.server(h3.config())
+    let _a = s.poll()
+    let mut ctl = h3frame.stream_type(h3frame.STREAM_CONTROL)
+    ctl.extend(h3frame.settings(List.new()))
+    s.recv(2, ctl, false)
+    let _b = s.take_events()
+    s
+}
+
+fn client_with_settings() -> h3.Conn {
+    let mut c = h3.client(h3.config())
+    let _a = c.poll()
+    let mut ctl = h3frame.stream_type(h3frame.STREAM_CONTROL)
+    ctl.extend(h3frame.settings(List.new()))
+    c.recv(3, ctl, false)
+    let _b = c.take_events()
+    c
+}
+
+fn res(label: str, r: Result[(), String]) uses io {
+    match r {
+        Ok(x) => { say(msg(label, String.from("sent"))) }
+        Err(m) => { say(msg(label, m)) }
+    }
+}
+
+fn res_id(label: str, r: Result[u64, String]) uses io {
+    match r {
+        Ok(x) => { say(msg(label, String.from("sent"))) }
+        Err(m) => { say(msg(label, m)) }
+    }
+}
+
+fn main() uses io {
+    note("-- startup: what each side sends first")
+    let mut cli = h3.client(h3.config())
+    let mut srv = h3.server(h3.config())
+    actions("client", inout cli)
+    actions("server", inout srv)
+
+    note("-- SETTINGS and the QPACK streams")
+    let mut cli_2 = h3.client(h3.config())
+    let mut srv_2 = h3.server(h3.config())
+    h3.pump(inout cli_2, inout srv_2)
+    events("client", inout cli_2)
+    events("server", inout srv_2)
+    say(msg("peer settings seen: ", cat(String.from(if cli_2.has_peer_settings() { "client " } else { "client NO " }), String.from(if srv_2.has_peer_settings() { "server" } else { "server NO" }))))
+
+    note("-- GET and a response with a body and trailers")
+    let id = cli_2.send_request(req("/index.html"), true).unwrap()
+    say(msg("request stream: ", id.to_string()))
+    h3.pump(inout cli_2, inout srv_2)
+    events("server", inout srv_2)
+    let _r = srv_2.send_headers(id, fl(":status=200|content-type=text/html|content-length=11"), false)
+    let _d1 = srv_2.send_data(id, "hello ".bytes(), false)
+    let _d2 = srv_2.send_data(id, "world".bytes(), false)
+    let _t = srv_2.send_headers(id, fl("x-checksum=abc"), true)
+    h3.pump(inout cli_2, inout srv_2)
+    events("client", inout cli_2)
+    say(msg("open streams: ", cat(cli_2.open_streams().to_string(), msg(" ", srv_2.open_streams().to_string()))))
+
+    note("-- POST with a body, an interim response, a second request on the same connection")
+    let id2 = cli_2.send_request(fl(":method=POST|:scheme=https|:authority=example.com|:path=/upload|content-type=text/plain|content-length=9"), false).unwrap()
+    let _b1 = cli_2.send_data(id2, "abc".bytes(), false)
+    let _b2 = cli_2.send_data(id2, "defghi".bytes(), true)
+    h3.pump(inout cli_2, inout srv_2)
+    events("server", inout srv_2)
+    let _i = srv_2.send_headers(id2, fl(":status=103|link=</style.css>; rel=preload"), false)
+    let _f = srv_2.send_headers(id2, fl(":status=201|location=/upload/1"), false)
+    let _e = srv_2.finish(id2)
+    h3.pump(inout cli_2, inout srv_2)
+    events("client", inout cli_2)
+
+    note("-- the same exchange fed one byte at a time")
+    let mut c1 = h3.client(h3.config())
+    let mut s1 = h3.server(h3.config())
+    pump_bytes(inout c1, inout s1)
+    let ia = c1.send_request(fl(":method=POST|:scheme=https|:authority=example.com|:path=/x|content-length=4"), false).unwrap()
+    let _x1 = c1.send_data(ia, "ab".bytes(), false)
+    let _x2 = c1.send_headers(ia, fl("x-end=1"), true)
+    pump_bytes(inout c1, inout s1)
+    events("server", inout s1)
+    note("(trailers before the whole body: a content-length of 4 with 2 bytes)")
+
+    let mut c1_2 = h3.client(h3.config())
+    let mut s1_2 = h3.server(h3.config())
+    pump_bytes(inout c1_2, inout s1_2)
+    let ib = c1_2.send_request(fl(":method=POST|:scheme=https|:authority=example.com|:path=/x|content-length=4"), false).unwrap()
+    let _y1 = c1_2.send_data(ib, "ab".bytes(), false)
+    let _y2 = c1_2.send_data(ib, "cd".bytes(), true)
+    pump_bytes(inout c1_2, inout s1_2)
+    events("server", inout s1_2)
+    let _y3 = s1_2.send_headers(ib, fl(":status=200|content-length=2"), false)
+    let _y4 = s1_2.send_data(ib, "ok".bytes(), true)
+    pump_bytes(inout c1_2, inout s1_2)
+    events("client", inout c1_2)
+
+    note("-- the dynamic table at work: the first request carries the table instructions (stream 6), the next ones only 11 bytes")
+    let mut c2 = h3.client(h3.config())
+    let mut s2 = h3.server(h3.config())
+    h3.pump(inout c2, inout s2)
+    let _e0 = s2.take_events()
+    for n in 0..4 {
+        let sid = c2.send_request(req("/page"), true).unwrap()
+        let mut sizes = String.from("")
+        for a in c2.poll() {
+            match a {
+                h3.Write(st, d, fin) => {
+                    sizes.append(st.to_string())
+                    sizes.push_str(":")
+                    sizes.append(d.len().to_string())
+                    sizes.push_str(" ")
+                    s2.recv(st, d, fin)
+                }
+                h3.ResetStream(st, c) => {}
+                h3.StopSending(st, c) => {}
+                h3.CloseConn(c, w) => {}
+            }
+        }
+        say(msg("request ", cat(sid.to_string(), msg(" bytes per stream: ", sizes))))
+        h3.pump(inout c2, inout s2)
+        let _e1 = s2.take_events()
+        let _a1 = s2.send_headers(sid, fl(":status=200|content-type=text/html"), true)
+        h3.pump(inout c2, inout s2)
+        let _e2 = c2.take_events()
+    }
+
+    note("-- the same with a peer that allows no table: every request is the full size")
+    let mut c2b = h3.client(h3.config())
+    let mut nocap = h3.config()
+    nocap.qpack_capacity = 0
+    let mut s2b = h3.server(nocap)
+    h3.pump(inout c2b, inout s2b)
+    let _f0 = s2b.take_events()
+    for m in 0..4 {
+        let sid2 = c2b.send_request(req("/page"), true).unwrap()
+        let mut sizes2 = String.from("")
+        for a2 in c2b.poll() {
+            match a2 {
+                h3.Write(st, d, fin) => {
+                    sizes2.append(st.to_string())
+                    sizes2.push_str(":")
+                    sizes2.append(d.len().to_string())
+                    sizes2.push_str(" ")
+                    s2b.recv(st, d, fin)
+                }
+                h3.ResetStream(st, c) => {}
+                h3.StopSending(st, c) => {}
+                h3.CloseConn(c, w) => {}
+            }
+        }
+        say(msg("request ", cat(sid2.to_string(), msg(" bytes per stream: ", sizes2))))
+        h3.pump(inout c2b, inout s2b)
+        let _f1 = s2b.take_events()
+        let _b1 = s2b.send_headers(sid2, fl(":status=200|content-type=text/html"), true)
+        h3.pump(inout c2b, inout s2b)
+        let _f2 = c2b.take_events()
+    }
+
+    note("-- a request section that arrives before the QPACK entries it names blocks its stream")
+    let mut c3 = h3.client(h3.config())
+    let mut s3 = h3.server(h3.config())
+    h3.pump(inout c3, inout s3)
+    let _e3 = s3.take_events()
+    let _e4 = c3.take_events()
+    let b1 = c3.send_request(req("/a"), true).unwrap()
+    // the encoder stream bytes are held back; the request stream goes first
+    let acts = c3.poll()
+    let mut held: List[h3.Action] = List.new()
+    for a in acts {
+        match a {
+            h3.Write(st, d, fin) => {
+                if st == 6 { held.push(a) } else { s3.recv(st, d, fin) }
+            }
+            h3.ResetStream(st, c) => {}
+            h3.StopSending(st, c) => {}
+            h3.CloseConn(c, w) => {}
+        }
+    }
+    say(msg("held back instructions: ", hx(match held[0] { h3.Write(st, d, f) => d, _ => List.new() })))
+    events("server", inout s3)
+    note("(nothing yet: the stream is blocked)")
+    for a in held {
+        match a {
+            h3.Write(st, d, fin) => { s3.recv(st, d, fin) }
+            h3.ResetStream(st, c) => {}
+            h3.StopSending(st, c) => {}
+            h3.CloseConn(c, w) => {}
+        }
+    }
+    events("server", inout s3)
+    actions("server", inout s3)
+
+    note("-- GOAWAY")
+    let mut c4 = h3.client(h3.config())
+    let mut s4 = h3.server(h3.config())
+    h3.pump(inout c4, inout s4)
+    let _e5 = c4.take_events()
+    let _e6 = s4.take_events()
+    let g1 = c4.send_request(req("/1"), true).unwrap()
+    h3.pump(inout c4, inout s4)
+    events("server", inout s4)
+    s4.goaway()
+    h3.pump(inout c4, inout s4)
+    events("client", inout c4)
+    match c4.send_request(req("/2"), true) {
+        Ok(x) => { note("request after GOAWAY: sent") }
+        Err(e) => { say(msg("request after GOAWAY: ", e)) }
+    }
+    // a request the client sent before it saw the GOAWAY: at the goaway id or above, so the server rejects it
+    let mut c5 = h3.client(h3.config())
+    let mut s5 = h3.server(h3.config())
+    h3.pump(inout c5, inout s5)
+    let _e7 = s5.take_events()
+    s5.goaway()
+    let late = c5.send_request(req("/late"), true).unwrap()
+    h3.pump(inout c5, inout s5)
+    events("server", inout s5)
+    events("client", inout c5)
+    let _l1 = s5.take_events()
+    note("a server can answer what it accepted after GOAWAY:")
+    let _rr = s4.send_headers(g1, fl(":status=200"), true)
+    h3.pump(inout c4, inout s4)
+    events("client", inout c4)
+    c4.close(h3frame.H3_NO_ERROR, "done")
+    actions("client", inout c4)
+
+    note("-- the peer's limits: MAX_FIELD_SECTION_SIZE")
+    let mut small = h3.config()
+    small.max_field_section = 200
+    let mut c6 = h3.client(h3.config())
+    let mut s6 = h3.server(small)
+    h3.pump(inout c6, inout s6)
+    let _e8 = c6.take_events()
+    let _e9 = s6.take_events()
+    match c6.send_request(fl(":method=GET|:scheme=https|:authority=example.com|:path=/|x-pad=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), true) {
+        Ok(x) => { note("an oversized request: sent") }
+        Err(e) => { say(msg("an oversized request: ", e)) }
+    }
+    note("(and a peer that ignores the limit gets a stream error:)")
+    let mut c7 = h3.client(h3.config())
+    let mut s7 = h3.server(small)
+    // the client never reads s7's SETTINGS here, so it does not know the limit
+    let big = c7.send_request(fl(":method=GET|:scheme=https|:authority=example.com|:path=/|x-pad=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), true).unwrap()
+    h3.pump(inout c7, inout s7)
+    events("server", inout s7)
+
+    note("-- connection errors")
+    let mut x = server_with_settings()
+    let cs = h3frame.stream_type(h3frame.STREAM_CONTROL)
+    // control streams
+    let mut e = h3.server(h3.config())
+    e.recv(2, cs, false)
+    e.recv(2, h3frame.goaway(0), false)
+    events("no SETTINGS first", inout e)
+    let mut e_2 = h3.server(h3.config())
+    let mut cs2 = h3frame.stream_type(h3frame.STREAM_CONTROL)
+    cs2.extend(h3frame.settings(List.new()))
+    e_2.recv(2, cs2, true)
+    events("control stream closed", inout e_2)
+    let mut e_3 = server_with_settings()
+    e_3.recv(6, h3frame.stream_type(h3frame.STREAM_CONTROL), false)
+    events("a second control stream", inout e_3)
+    let mut e_4 = server_with_settings()
+    e_4.recv(2, h3frame.settings(List.new()), false)
+    events("a second SETTINGS", inout e_4)
+    let mut e_5 = server_with_settings()
+    e_5.recv(2, h3frame.frame(h3frame.DATA, "x".bytes()), false)
+    events("DATA on the control stream", inout e_5)
+    let mut e_6 = server_with_settings()
+    e_6.recv(2, h3frame.frame(2, List.new()), false)
+    events("an HTTP/2 frame type on the control stream", inout e_6)
+    let mut e_7 = server_with_settings()
+    e_7.recv(2, h3frame.grease_frame(1, "ignored".bytes()), false)
+    e_7.recv(2, h3frame.max_push_id(4), false)
+    e_7.recv(2, h3frame.max_push_id(8), false)
+    events("grease and MAX_PUSH_ID 4, 8 (accepted)", inout e_7)
+    e_7.recv(2, h3frame.max_push_id(4), false)
+    events("MAX_PUSH_ID decreasing", inout e_7)
+    let mut e_8 = server_with_settings()
+    e_8.recv(2, h3frame.cancel_push(0), false)
+    events("CANCEL_PUSH for a push never allowed", inout e_8)
+    let mut e_9 = server_with_settings()
+    e_9.recv(6, h3frame.stream_type(h3frame.STREAM_PUSH), false)
+    events("a push stream from a client", inout e_9)
+    let mut e_10 = client_with_settings()
+    e_10.recv(7, h3frame.stream_type(h3frame.STREAM_PUSH), false)
+    events("a push stream, no MAX_PUSH_ID sent", inout e_10)
+    let mut e_11 = client_with_settings()
+    e_11.recv(3, h3frame.max_push_id(1), false)
+    events("MAX_PUSH_ID from a server", inout e_11)
+    let mut e_12 = client_with_settings()
+    e_12.recv(3, h3frame.goaway(5), false)
+    events("GOAWAY with an id that is not a client bidirectional stream", inout e_12)
+    let mut e_13 = client_with_settings()
+    e_13.recv(3, h3frame.goaway(8), false)
+    e_13.recv(3, h3frame.goaway(4), false)
+    e_13.recv(3, h3frame.goaway(8), false)
+    events("GOAWAY 8, 4, then 8 again", inout e_13)
+    let mut e_14 = server_with_settings()
+    e_14.recv(6, unhex("40 21 aa bb"), false)
+    actions("an unknown (grease) unidirectional stream type", inout e_14)
+    events("  events", inout e_14)
+    let mut e_15 = server_with_settings()
+    e_15.recv(6, unhex("02"), false)
+    e_15.recv(10, unhex("03"), false)
+    events("QPACK streams opened (nothing to report)", inout e_15)
+    e_15.recv(6, unhex("02"), false)
+    events("  a second QPACK encoder stream", inout e_15)
+    let mut e_16 = server_with_settings()
+    e_16.recv(6, unhex("02"), false)
+    e_16.recv(6, unhex("3f ff ff"), false)
+    events("a QPACK encoder stream with a bad capacity", inout e_16)
+    let mut e_17 = server_with_settings()
+    e_17.recv(10, unhex("03"), false)
+    e_17.recv(10, unhex("88"), false)
+    events("an acknowledgment on the decoder stream for a section never sent", inout e_17)
+    let mut e_18 = server_with_settings()
+    e_18.recv(10, unhex("03"), true)
+    events("the QPACK decoder stream closed", inout e_18)
+    let mut e_19 = server_with_settings()
+    e_19.recv(10, unhex("03"), false)
+    e_19.recv_reset(10, 0)
+    events("the QPACK decoder stream reset", inout e_19)
+    let mut e_20 = server_with_settings()
+    e_20.recv(3, unhex("00"), false)
+    events("data on a unidirectional stream we opened", inout e_20)
+    let mut e_21 = server_with_settings()
+    e_21.recv(1, unhex("00"), false)
+    events("a server-initiated bidirectional stream", inout e_21)
+    let mut e_22 = client_with_settings()
+    e_22.recv(4, unhex("00"), false)
+    events("data on a bidirectional stream the client never opened", inout e_22)
+    let mut e_23 = server_with_settings()
+    e_23.recv(6, unhex("0a"), false)
+    e_23.recv(6, unhex("ff"), true)
+    events("a unidirectional stream that ends before its type is complete", inout e_23)
+
+    note("-- request stream frames")
+    let mut e_24 = server_with_settings()
+    e_24.recv(0, h3frame.data("x".bytes()), false)
+    events("DATA before HEADERS", inout e_24)
+    let mut e_25 = server_with_settings()
+    let mut p = headers_frame(req("/"))
+    p.extend(h3frame.headers(List.new()))
+    e_25.recv(0, headers_frame(req("/")), false)
+    e_25.recv(0, headers_frame(fl("x-t=1")), false)
+    e_25.recv(0, headers_frame(fl("x-u=2")), false)
+    events("HEADERS, trailers, then a third HEADERS", inout e_25)
+    let mut e_26 = server_with_settings()
+    e_26.recv(0, headers_frame(req("/")), false)
+    e_26.recv(0, headers_frame(fl("x-t=1")), false)
+    e_26.recv(0, h3frame.data("x".bytes()), false)
+    events("DATA after the trailers", inout e_26)
+    let mut e_27 = server_with_settings()
+    e_27.recv(0, h3frame.settings(List.new()), false)
+    events("SETTINGS on a request stream", inout e_27)
+    let mut e_28 = server_with_settings()
+    e_28.recv(0, h3frame.frame(h3frame.PUSH_PROMISE, unhex("00")), false)
+    events("PUSH_PROMISE from a client", inout e_28)
+    let mut e_29 = client_with_settings()
+    let _q = e_29.send_request(req("/"), true)
+    e_29.recv(0, h3frame.frame(h3frame.PUSH_PROMISE, unhex("00")), false)
+    events("PUSH_PROMISE to a client that allowed no push", inout e_29)
+    let mut e_30 = server_with_settings()
+    let hf = headers_frame(req("/"))
+    e_30.recv(0, hf.slice(0, hf.len() - 1), true)
+    events("a stream that ends inside a frame", inout e_30)
+    let mut e_31 = server_with_settings()
+    e_31.recv(0, List.new(), true)
+    events("an empty request stream that ends", inout e_31)
+    actions("  actions", inout e_31)
+    let mut e_32 = server_with_settings()
+    let mut grease_first: List[u8] = h3frame.grease_frame(3, "zz".bytes())
+    grease_first.extend(headers_frame(req("/")))
+    grease_first.extend(h3frame.grease_frame(4, List.new()))
+    grease_first.extend(h3frame.data("body".bytes()))
+    e_32.recv(0, grease_first, true)
+    events("reserved frames before, between and after (skipped)", inout e_32)
+    let mut e_33 = server_with_settings()
+    e_33.recv(0, headers_frame(req("/")), false)
+    e_33.recv_reset(0, h3frame.H3_REQUEST_CANCELLED)
+    events("the peer resets a request stream", inout e_33)
+    e_33.recv(0, List.new(), false)
+    let mut e_34 = server_with_settings()
+    e_34.recv(0, unhex("0001 ff"), false)
+    events("a HEADERS frame whose field section is garbage", inout e_34)
+    let mut e_35 = server_with_settings()
+    e_35.recv(0, h3frame.frame(h3frame.HEADERS, List.filled(1, 70000)), false)
+    events("a HEADERS frame over max_frame", inout e_35)
+
+    note("-- malformed messages: stream errors (the connection survives)")
+    let heads: [str; 14] = [
+        ":method=GET|:scheme=https|:path=/|X-Upper=1",
+        ":method=GET|:scheme=https|:authority=a|x=1|:path=/",
+        ":method=GET|:scheme=https|:authority=a|:path=/|:method=POST",
+        ":method=GET|:scheme=https|:authority=a|:path=/|:status=200",
+        ":scheme=https|:authority=a|:path=/",
+        ":method=GET|:authority=a|:path=/",
+        ":method=GET|:scheme=https|:authority=a",
+        ":method=GET|:scheme=https|:authority=a|:path=",
+        ":method=CONNECT|:scheme=https|:authority=a|:path=/",
+        ":method=GET|:scheme=https|:authority=a|:path=/|connection=close",
+        ":method=GET|:scheme=https|:authority=a|:path=/|transfer-encoding=chunked",
+        ":method=GET|:scheme=https|:authority=a|:path=/|te=gzip",
+        ":method=POST|:scheme=https|:authority=a|:path=/|content-length=abc",
+        ":method=POST|:scheme=https|:authority=a|:path=/|content-length=3|content-length=4",
+    ]
+    for k in 0..14 {
+        let mut e_36 = server_with_settings()
+        e_36.recv(0, headers_frame(fl(heads[k as usize])), false)
+        let mut l = String.from(heads[k as usize])
+        l.push_str(" -> ")
+        for ev in e_36.take_events() { l.append(show_ev(ev)) }
+        say(l)
+    }
+    let mut e_37 = server_with_settings()
+    e_37.recv(0, headers_frame(fl(":method=GET|:scheme=https|:authority=a|:path=/")), false)
+    e_37.recv(0, headers_frame(fl(":status=200")), false)
+    events("pseudo-header in trailers", inout e_37)
+    let mut e_38 = server_with_settings()
+    e_38.recv(0, headers_frame(fl(":method=POST|:scheme=https|:authority=a|:path=/|content-length=3")), false)
+    e_38.recv(0, h3frame.data("abcd".bytes()), false)
+    events("more DATA than content-length", inout e_38)
+    actions("  actions", inout e_38)
+    let mut e_39 = server_with_settings()
+    e_39.recv(0, headers_frame(fl(":method=POST|:scheme=https|:authority=a|:path=/|content-length=3")), false)
+    e_39.recv(0, h3frame.data("ab".bytes()), true)
+    events("less DATA than content-length", inout e_39)
+    e_39.recv(4, headers_frame(req("/after")), true)
+    events("  the next request on the same connection", inout e_39)
+    let mut e_40 = client_with_settings()
+    let q0 = e_40.send_request(req("/"), true).unwrap()
+    e_40.recv(q0, headers_frame(fl(":status=200|content-length=2")), false)
+    e_40.recv(q0, h3frame.data("ok".bytes()), true)
+    events("a good response", inout e_40)
+    let cases: [str; 5] = [":status=20", ":status=abc", "content-type=text/html", ":status=200|:status=200", ":status=101"]
+    for k in 0..5 {
+        let mut e_41 = client_with_settings()
+        let q = e_41.send_request(req("/"), true).unwrap()
+        e_41.recv(q, headers_frame(fl(cases[k as usize])), false)
+        let mut l = String.from(cases[k as usize])
+        l.push_str(" -> ")
+        for ev in e_41.take_events() { l.append(show_ev(ev)) }
+        say(l)
+    }
+    let mut e_42 = client_with_settings()
+    let hq = e_42.send_request(fl(":method=HEAD|:scheme=https|:authority=a|:path=/"), true).unwrap()
+    e_42.recv(hq, headers_frame(fl(":status=200|content-length=1000")), true)
+    events("a response to HEAD with a content-length and no body", inout e_42)
+    let mut e_43 = client_with_settings()
+    let nq = e_43.send_request(req("/"), true).unwrap()
+    e_43.recv(nq, headers_frame(fl(":status=200")), false)
+    e_43.recv(nq, headers_frame(fl(":status=204")), false)
+    events("a second head after a final response is trailers", inout e_43)
+
+    note("-- sending errors")
+    let mut s = server_with_settings()
+    res("a response on an unknown stream: ", s.send_headers(0, fl(":status=200"), true))
+    s.recv(0, headers_frame(req("/")), true)
+    let _g = s.take_events()
+    res("DATA before the response head: ", s.send_data(0, "x".bytes(), false))
+    res("status 99: ", s.send_headers(0, fl(":status=99"), false))
+    res("a response without :status: ", s.send_headers(0, fl("content-type=x"), false))
+    res("101: ", s.send_headers(0, fl(":status=101"), false))
+    res("an interim response ending the stream: ", s.send_headers(0, fl(":status=103"), true))
+    res("a connection header: ", s.send_headers(0, fl(":status=200|connection=close"), false))
+    res("the head: ", s.send_headers(0, fl(":status=200"), false))
+    res("trailers without fin: ", s.send_headers(0, fl("x-t=1"), false))
+    res("trailers with a pseudo-header: ", s.send_headers(0, fl(":x=1"), true))
+    res("trailers: ", s.send_headers(0, fl("x-t=1"), true))
+    res("DATA after the end: ", s.send_data(0, "x".bytes(), false))
+    res_id("a server sending a request: ", s.send_request(req("/"), true))
+    let mut c = client_with_settings()
+    res_id("an uppercase name: ", c.send_request(fl(":method=GET|:scheme=https|:path=/|Bad=1"), true))
+    res_id("no :path: ", c.send_request(fl(":method=GET|:scheme=https"), true))
+    c.close(h3frame.H3_NO_ERROR, "bye")
+    res_id("a request on a closed connection: ", c.send_request(req("/"), true))
+    c.recv(3, unhex("00"), false)
+    say(msg("closed connections ignore input: ", String.from(if c.take_events().len() == 1 { "yes" } else { "NO" })))
+
+    note("-- reset and stop sending")
+    let mut c8 = h3.client(h3.config())
+    let mut s8 = h3.server(h3.config())
+    h3.pump(inout c8, inout s8)
+    let _e10 = c8.take_events()
+    let _e11 = s8.take_events()
+    let r8 = c8.send_request(fl(":method=POST|:scheme=https|:authority=a|:path=/big"), false).unwrap()
+    let _z1 = c8.send_data(r8, "part".bytes(), false)
+    h3.pump(inout c8, inout s8)
+    events("server", inout s8)
+    // the server has what it needs: it answers and tells the client to stop sending
+    let _z2 = s8.send_headers(r8, fl(":status=413"), true)
+    s8.stop_reading(r8, h3frame.H3_NO_ERROR)
+    h3.pump(inout c8, inout s8)
+    events("client", inout c8)
+    res("sending after STOP_SENDING: ", c8.send_data(r8, "more".bytes(), false))
+    let r9 = c8.send_request(fl(":method=POST|:scheme=https|:authority=a|:path=/slow"), false).unwrap()
+    let _z3 = c8.send_data(r9, "half".bytes(), false)
+    h3.pump(inout c8, inout s8)
+    events("server", inout s8)
+    c8.reset(r9, h3frame.H3_REQUEST_CANCELLED)
+    h3.pump(inout c8, inout s8)
+    events("server", inout s8)
+
+    note("-- many requests at once")
+    let mut c9 = h3.client(h3.config())
+    let mut s9 = h3.server(h3.config())
+    h3.pump(inout c9, inout s9)
+    let _e12 = c9.take_events()
+    let _e13 = s9.take_events()
+    let mut ids: List[u64] = List.new()
+    for n in 0..20 {
+        let mut path = String.from("/item/")
+        path.append(n.to_string())
+        ids.push(c9.send_request(req_s(path), true).unwrap())
+    }
+    h3.pump(inout c9, inout s9)
+    let mut seen: usize = 0
+    for ev in s9.take_events() {
+        match ev {
+            h3.Headers(id, f) => { seen += 1 }
+            _ => {}
+        }
+    }
+    say(msg("requests the server saw: ", seen.to_string()))
+    for id in ids {
+        let _h = s9.send_headers(id, fl(":status=200|content-length=3"), false)
+        let _b = s9.send_data(id, "abc".bytes(), true)
+    }
+    h3.pump(inout c9, inout s9)
+    let mut fin: usize = 0
+    let mut data: usize = 0
+    for ev in c9.take_events() {
+        match ev {
+            h3.Finished(id) => { fin += 1 }
+            h3.Data(id, d) => { data += d.len() }
+            _ => {}
+        }
+    }
+    say(msg("responses finished: ", fin.to_string()))
+    say(msg("body bytes: ", data.to_string()))
+    say(msg("open streams after: ", cat(c9.open_streams().to_string(), msg(" ", s9.open_streams().to_string()))))
+    note("-- random bytes on the streams of a connection never trap (a fixed seed)")
+    let mut seed: u64 = 7
+    let mut closed: usize = 0
+    let mut stream_errors: usize = 0
+    let mut ok_heads: usize = 0
+    for round in 0..600 {
+        let mut f = if round % 2 == 0 { server_with_settings() } else { client_with_settings() }
+        // a valid prefix some of the time, so that the garbage reaches the deeper states
+        if round % 3 == 0 {
+            if round % 2 == 0 {
+                f.recv(0, headers_frame(req("/")), false)
+            } else {
+                let _q = f.send_request(req("/"), true)
+                f.recv(0, headers_frame(fl(":status=200")), false)
+            }
+        }
+        for k in 0..6 {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            let n = ((seed >> (8 as u64)) % 24) as usize
+            let mut junk: List[u8] = List.new()
+            for j in 0..n {
+                seed = (seed * 1103515245 + 12345) % 2147483648
+                // bias to small values: frame types, lengths, instruction opcodes
+                let v = (seed >> (10 as u64)) % 256
+                junk.push(if v < 128 { (v % 24) as u8 } else { v as u8 })
+            }
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            let which = (seed >> (12 as u64)) % 5
+            let sid: u64 = if which == 0 { 0 } else if which == 1 { 4 } else if which == 2 { if round % 2 == 0 { 2 } else { 3 } } else if which == 3 { if round % 2 == 0 { 6 } else { 7 } } else { if round % 2 == 0 { 10 } else { 11 } }
+            let fin = ((seed >> (16 as u64)) % 7) == 0
+            f.recv(sid, junk, fin)
+        }
+        for ev in f.take_events() {
+            match ev {
+                h3.Closed(c, w) => { closed += 1 }
+                h3.StreamError(i, c, w) => { stream_errors += 1 }
+                h3.Headers(i, fs) => { ok_heads += 1 }
+                _ => {}
+            }
+        }
+        let _acts = f.poll()
+    }
+    say(msg("rounds: 600, connection errors: ", cat(closed.to_string(), msg(", stream errors: ", cat(stream_errors.to_string(), msg(", heads that decoded: ", ok_heads.to_string()))))))
+    note("done")
+}

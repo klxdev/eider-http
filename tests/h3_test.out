@@ -1,0 +1,204 @@
+-- startup: what each side sends first
+client: write 2 00040d0150000710068001000040bc01405f06677265617365
+client: write 6 02
+client: write 10 03
+server: write 3 00040d0150000710068001000040bc01405f06677265617365
+server: write 7 02
+server: write 11 03
+-- SETTINGS and the QPACK streams
+client: settings 1=4096 7=16 6=65536 188=1
+server: settings 1=4096 7=16 6=65536 188=1
+peer settings seen: client server
+-- GET and a response with a body and trailers
+request stream: 0
+server: headers 0: :method=GET :scheme=https :authority=example.com :path=/index.html user-agent=eider-test/1.0 accept=*/* x-request-id=abc123 
+server: finished 0
+client: headers 0: :status=200 content-type=text/html content-length=11 
+client: data 0: hello 
+client: data 0: world
+client: trailers 0: x-checksum=abc 
+client: finished 0
+open streams: 0 0
+-- POST with a body, an interim response, a second request on the same connection
+server: headers 4: :method=POST :scheme=https :authority=example.com :path=/upload content-type=text/plain content-length=9 
+server: data 4: abc
+server: data 4: defghi
+server: finished 4
+client: informational 4: :status=103 link=</style.css>; rel=preload 
+client: headers 4: :status=201 location=/upload/1 
+client: finished 4
+-- the same exchange fed one byte at a time
+server: settings 1=4096 7=16 6=65536 188=1
+server: headers 0: :method=POST :scheme=https :authority=example.com :path=/x content-length=4 
+server: data 0: a
+server: data 0: b
+server: trailers 0: x-end=1 
+server: stream error 0 H3_MESSAGE_ERROR: less DATA than content-length
+(trailers before the whole body: a content-length of 4 with 2 bytes)
+server: settings 1=4096 7=16 6=65536 188=1
+server: headers 0: :method=POST :scheme=https :authority=example.com :path=/x content-length=4 
+server: data 0: a
+server: data 0: b
+server: data 0: c
+server: data 0: d
+server: finished 0
+client: settings 1=4096 7=16 6=65536 188=1
+client: headers 0: :status=200 content-length=2 
+client: data 0: o
+client: data 0: k
+client: finished 0
+-- the dynamic table at work: the first request carries the table instructions (stream 6), the next ones only 11 bytes
+request 0 bytes per stream: 6:44 0:11 
+request 4 bytes per stream: 4:11 
+request 8 bytes per stream: 8:11 
+request 12 bytes per stream: 12:11 
+-- the same with a peer that allows no table: every request is the full size
+request 0 bytes per stream: 0:52 
+request 4 bytes per stream: 4:52 
+request 8 bytes per stream: 8:52 
+request 12 bytes per stream: 12:52 
+-- a request section that arrives before the QPACK entries it names blocks its stream
+held back instructions: c0882f91d35d055c87a7c1022f61ff208a29a42d8b24a84b015c1f69f2b585ed6950958d27841c640899
+(nothing yet: the stream is blocked)
+server: headers 0: :method=GET :scheme=https :authority=example.com :path=/a user-agent=eider-test/1.0 accept=*/* x-request-id=abc123 
+server: finished 0
+server: write 11 80
+-- GOAWAY
+server: headers 0: :method=GET :scheme=https :authority=example.com :path=/1 user-agent=eider-test/1.0 accept=*/* x-request-id=abc123 
+server: finished 0
+client: goaway 4
+request after GOAWAY: the server sent GOAWAY
+client: settings 1=4096 7=16 6=65536 188=1
+client: goaway 0
+client: stream reset 0 H3_REQUEST_REJECTED
+a server can answer what it accepted after GOAWAY:
+client: headers 0: :status=200 
+client: finished 0
+client: close H3_NO_ERROR: done
+-- the peer's limits: MAX_FIELD_SECTION_SIZE
+an oversized request: the field section is over the peer's MAX_FIELD_SECTION_SIZE
+(and a peer that ignores the limit gets a stream error:)
+server: settings 1=4096 7=16 6=65536 188=1
+server: stream error 0 H3_EXCESSIVE_LOAD: a field section over MAX_FIELD_SECTION_SIZE
+-- connection errors
+no SETTINGS first: closed H3_MISSING_SETTINGS: the control stream is malformed
+control stream closed: settings
+control stream closed: closed H3_CLOSED_CRITICAL_STREAM: the control stream was closed
+a second control stream: closed H3_STREAM_CREATION_ERROR: a second control stream
+a second SETTINGS: closed H3_FRAME_UNEXPECTED: the control stream is malformed
+DATA on the control stream: closed H3_FRAME_UNEXPECTED: the control stream is malformed
+an HTTP/2 frame type on the control stream: closed H3_FRAME_UNEXPECTED: the control stream is malformed
+MAX_PUSH_ID decreasing: closed H3_ID_ERROR: MAX_PUSH_ID decreased
+CANCEL_PUSH for a push never allowed: closed H3_ID_ERROR: CANCEL_PUSH for a push id that was not allowed
+a push stream from a client: closed H3_STREAM_CREATION_ERROR: a client opened a push stream
+a push stream, no MAX_PUSH_ID sent: closed H3_ID_ERROR: a push stream, but no MAX_PUSH_ID was sent
+MAX_PUSH_ID from a server: closed H3_FRAME_UNEXPECTED: MAX_PUSH_ID from a server
+GOAWAY with an id that is not a client bidirectional stream: closed H3_ID_ERROR: GOAWAY with an id that is not a client-initiated bidirectional stream
+GOAWAY 8, 4, then 8 again: goaway 8
+GOAWAY 8, 4, then 8 again: goaway 4
+GOAWAY 8, 4, then 8 again: closed H3_ID_ERROR: GOAWAY with an id that grew
+an unknown (grease) unidirectional stream type: stop sending 6 H3_STREAM_CREATION_ERROR
+  a second QPACK encoder stream: closed QPACK_ENCODER_STREAM_ERROR: the QPACK encoder stream is malformed
+an acknowledgment on the decoder stream for a section never sent: closed QPACK_DECODER_STREAM_ERROR: the QPACK decoder stream is malformed
+the QPACK decoder stream closed: closed H3_CLOSED_CRITICAL_STREAM: the QPACK decoder stream was closed
+the QPACK decoder stream reset: closed H3_CLOSED_CRITICAL_STREAM: a critical stream was reset
+data on a unidirectional stream we opened: closed H3_STREAM_CREATION_ERROR: data on a unidirectional stream we opened
+a server-initiated bidirectional stream: closed H3_STREAM_CREATION_ERROR: a server-initiated bidirectional stream
+data on a bidirectional stream the client never opened: closed H3_STREAM_CREATION_ERROR: data on a bidirectional stream we did not open
+-- request stream frames
+DATA before HEADERS: closed H3_FRAME_UNEXPECTED: DATA before HEADERS
+HEADERS, trailers, then a third HEADERS: headers 0: :method=GET :scheme=https :authority=example.com :path=/ user-agent=eider-test/1.0 accept=*/* x-request-id=abc123 
+HEADERS, trailers, then a third HEADERS: trailers 0: x-t=1 
+HEADERS, trailers, then a third HEADERS: closed H3_FRAME_UNEXPECTED: HEADERS after the trailers
+DATA after the trailers: headers 0: :method=GET :scheme=https :authority=example.com :path=/ user-agent=eider-test/1.0 accept=*/* x-request-id=abc123 
+DATA after the trailers: trailers 0: x-t=1 
+DATA after the trailers: closed H3_FRAME_UNEXPECTED: DATA after the trailers
+SETTINGS on a request stream: closed H3_FRAME_UNEXPECTED: a malformed frame on a request stream
+PUSH_PROMISE from a client: closed H3_FRAME_UNEXPECTED: PUSH_PROMISE from a client
+PUSH_PROMISE to a client that allowed no push: closed H3_ID_ERROR: PUSH_PROMISE, but no MAX_PUSH_ID was sent
+a stream that ends inside a frame: closed H3_FRAME_ERROR: a stream ended inside a frame
+an empty request stream that ends: stream error 0 H3_REQUEST_INCOMPLETE: the stream ended before a head
+  actions: reset 0 H3_REQUEST_INCOMPLETE
+  actions: stop sending 0 H3_REQUEST_INCOMPLETE
+  actions: write 11 40
+reserved frames before, between and after (skipped): headers 0: :method=GET :scheme=https :authority=example.com :path=/ user-agent=eider-test/1.0 accept=*/* x-request-id=abc123 
+reserved frames before, between and after (skipped): data 0: body
+reserved frames before, between and after (skipped): finished 0
+the peer resets a request stream: headers 0: :method=GET :scheme=https :authority=example.com :path=/ user-agent=eider-test/1.0 accept=*/* x-request-id=abc123 
+the peer resets a request stream: stream reset 0 H3_REQUEST_CANCELLED
+a HEADERS frame whose field section is garbage: closed H3_FRAME_UNEXPECTED: DATA before HEADERS
+a HEADERS frame over max_frame: closed H3_EXCESSIVE_LOAD: a malformed frame on a request stream
+-- malformed messages: stream errors (the connection survives)
+:method=GET|:scheme=https|:path=/|X-Upper=1 -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=GET|:scheme=https|:authority=a|x=1|:path=/ -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=GET|:scheme=https|:authority=a|:path=/|:method=POST -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=GET|:scheme=https|:authority=a|:path=/|:status=200 -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:scheme=https|:authority=a|:path=/ -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=GET|:authority=a|:path=/ -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=GET|:scheme=https|:authority=a -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=GET|:scheme=https|:authority=a|:path= -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=CONNECT|:scheme=https|:authority=a|:path=/ -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=GET|:scheme=https|:authority=a|:path=/|connection=close -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=GET|:scheme=https|:authority=a|:path=/|transfer-encoding=chunked -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=GET|:scheme=https|:authority=a|:path=/|te=gzip -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:method=POST|:scheme=https|:authority=a|:path=/|content-length=abc -> stream error 0 H3_MESSAGE_ERROR: a bad content-length
+:method=POST|:scheme=https|:authority=a|:path=/|content-length=3|content-length=4 -> stream error 0 H3_MESSAGE_ERROR: a bad content-length
+pseudo-header in trailers: headers 0: :method=GET :scheme=https :authority=a :path=/ 
+pseudo-header in trailers: stream error 0 H3_MESSAGE_ERROR: malformed trailers
+more DATA than content-length: headers 0: :method=POST :scheme=https :authority=a :path=/ content-length=3 
+more DATA than content-length: stream error 0 H3_MESSAGE_ERROR: more DATA than content-length
+  actions: reset 0 H3_MESSAGE_ERROR
+  actions: stop sending 0 H3_MESSAGE_ERROR
+  actions: write 11 40
+less DATA than content-length: headers 0: :method=POST :scheme=https :authority=a :path=/ content-length=3 
+less DATA than content-length: data 0: ab
+less DATA than content-length: stream error 0 H3_MESSAGE_ERROR: less DATA than content-length
+  the next request on the same connection: headers 4: :method=GET :scheme=https :authority=example.com :path=/after user-agent=eider-test/1.0 accept=*/* x-request-id=abc123 
+  the next request on the same connection: finished 4
+a good response: headers 0: :status=200 content-length=2 
+a good response: data 0: ok
+a good response: finished 0
+:status=20 -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:status=abc -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+content-type=text/html -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:status=200|:status=200 -> stream error 0 H3_MESSAGE_ERROR: a malformed message head
+:status=101 -> stream error 0 H3_MESSAGE_ERROR: 101 does not exist in HTTP/3
+a response to HEAD with a content-length and no body: headers 0: :status=200 content-length=1000 
+a response to HEAD with a content-length and no body: finished 0
+a second head after a final response is trailers: headers 0: :status=200 
+a second head after a final response is trailers: stream error 0 H3_MESSAGE_ERROR: malformed trailers
+-- sending errors
+a response on an unknown stream: no such stream
+DATA before the response head: the head must be sent before the body
+status 99: a bad :status
+a response without :status: a response without :status
+101: 101 does not exist in HTTP/3
+an interim response ending the stream: an interim response cannot end the stream
+a connection header: a connection-specific field
+the head: sent
+trailers without fin: trailers end the message: pass fin
+trailers with a pseudo-header: a pseudo-header in trailers
+trailers: sent
+DATA after the end: the stream is finished
+a server sending a request: only a client sends requests
+an uppercase name: an uppercase field name
+no :path: a request without :path
+a request on a closed connection: the connection is closed
+closed connections ignore input: yes
+-- reset and stop sending
+server: headers 0: :method=POST :scheme=https :authority=a :path=/big 
+server: data 0: part
+client: headers 0: :status=413 
+client: finished 0
+sending after STOP_SENDING: the stream is finished
+server: headers 4: :method=POST :scheme=https :authority=a :path=/slow 
+server: data 4: half
+server: stream reset 4 H3_REQUEST_CANCELLED
+-- many requests at once
+requests the server saw: 20
+responses finished: 20
+body bytes: 60
+open streams after: 0 0
+-- random bytes on the streams of a connection never trap (a fixed seed)
+rounds: 600, connection errors: 519, stream errors: 5, heads that decoded: 200
+done

@@ -1,0 +1,67 @@
+varint c2197c5eff14e88c -> 151288809941952652 (8 bytes)
+varint 9d7f3e7d -> 494878333 (4 bytes)
+varint 7bbd -> 15293 (2 bytes)
+varint 25 -> 37 (1 bytes)
+varint 4025 -> 37 (2 bytes)
+varint 00 -> 0 (1 bytes)
+varint ffffffffffffffff -> 4611686018427387903 (8 bytes)
+encode 0 -> 00
+encode 63 -> 3f
+encode 64 -> 4040
+encode 16383 -> 7fff
+encode 16384 -> 80004000
+encode 1073741823 -> bfffffff
+encode 1073741824 -> c000000040000000
+encode 4611686018427387903 -> ffffffffffffffff
+encode 37 -> 25
+37 in two bytes: 4025
+37 in eight bytes: c000000000000025
+truncated varints: none decode
+-- frames
+request stream: HEADERS id=0 payload=0000d1; DATA 68656c6c6f; HEADERS id=0 payload=0000d9; 
+  byte by byte:   HEADERS id=0 payload=0000d1; DATA 68656c6c6f; HEADERS id=0 payload=0000d9; 
+  by threes:      HEADERS id=0 payload=0000d1; DATA 68656c6c6f; HEADERS id=0 payload=0000d9; 
+control stream: SETTINGS id=0 payload=01500006800100000710407e07 [1=4096] [6=65536] [7=16] [126=7]; GOAWAY id=12 payload=0c; MAX_PUSH_ID id=5 payload=05; CANCEL_PUSH id=2 payload=02; GOAWAY id=4611686018427387903 payload=ffffffffffffffff; 
+  byte by byte:  SETTINGS id=0 payload=01500006800100000710407e07 [1=4096] [6=65536] [7=16] [126=7]; GOAWAY id=12 payload=0c; MAX_PUSH_ID id=5 payload=05; CANCEL_PUSH id=2 payload=02; GOAWAY id=4611686018427387903 payload=ffffffffffffffff; 
+empty SETTINGS: SETTINGS id=0 payload=; 
+-- grease and unknown frames are skipped
+request: HEADERS id=0 payload=0000d1; DATA 6f6b; 
+  byte by byte: HEADERS id=0 payload=0000d1; DATA 6f6b; 
+control: SETTINGS id=0 payload=; GOAWAY id=0 payload=00; 
+100000-byte unknown frame, limit 64, skipped with nothing buffered: yes
+-- DATA is streamed, whatever its size
+first piece: 616263
+idle in the middle of a DATA frame: no
+-- refused
+type 2 on a request stream: FAIL H3_FRAME_UNEXPECTED
+type 6 on a request stream: FAIL H3_FRAME_UNEXPECTED
+type 8 on a request stream: FAIL H3_FRAME_UNEXPECTED
+type 9 on a request stream: FAIL H3_FRAME_UNEXPECTED
+SETTINGS on a request stream: FAIL H3_FRAME_UNEXPECTED
+GOAWAY on a request stream: FAIL H3_FRAME_UNEXPECTED
+MAX_PUSH_ID on a request stream: FAIL H3_FRAME_UNEXPECTED
+CANCEL_PUSH on a request stream: FAIL H3_FRAME_UNEXPECTED
+DATA on the control stream: FAIL H3_FRAME_UNEXPECTED
+HEADERS on the control stream: FAIL H3_FRAME_UNEXPECTED
+GOAWAY first on the control stream: FAIL H3_MISSING_SETTINGS
+a grease frame first on the control stream: FAIL H3_MISSING_SETTINGS
+a second SETTINGS: SETTINGS id=0 payload=; FAIL H3_FRAME_UNEXPECTED
+empty GOAWAY: SETTINGS id=0 payload=; FAIL H3_FRAME_ERROR
+GOAWAY with two integers: SETTINGS id=0 payload=; FAIL H3_FRAME_ERROR
+MAX_PUSH_ID 1 in two bytes: SETTINGS id=0 payload=; MAX_PUSH_ID id=1 payload=4001; 
+MAX_PUSH_ID with trailing bytes: SETTINGS id=0 payload=; FAIL H3_FRAME_ERROR
+truncated setting (one byte): FAIL H3_FRAME_ERROR
+truncated setting (value cut): FAIL H3_FRAME_ERROR
+repeated setting: FAIL H3_SETTINGS_ERROR
+HTTP/2 setting 0: FAIL H3_SETTINGS_ERROR
+HTTP/2 setting 2: FAIL H3_SETTINGS_ERROR
+HTTP/2 setting 3: FAIL H3_SETTINGS_ERROR
+HTTP/2 setting 4: FAIL H3_SETTINGS_ERROR
+HTTP/2 setting 5: FAIL H3_SETTINGS_ERROR
+65 settings: FAIL H3_EXCESSIVE_LOAD
+HEADERS over the limit: FAIL H3_EXCESSIVE_LOAD
+HEADERS at the limit: HEADERS id=0 payload=0101010101010101; 
+HEADERS of 2^62-1 bytes: FAIL H3_EXCESSIVE_LOAD
+a cut HEADERS: (partial)
+a cut frame header: (partial)
+done
