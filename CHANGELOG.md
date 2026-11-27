@@ -3,6 +3,10 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.8.0
+
+For Eider 0.8: the version and the `eider` series move to 0.8 with the toolchain; no source changes.
+
 ## 0.7.8
 
 - **`http/h2`**: RST_STREAM(NO_ERROR) from a peer that has already sent its whole message no longer fails the stream: what it sent stays

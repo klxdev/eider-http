@@ -92,11 +92,11 @@ export EIDER_PKG_OVERRIDE
 
 # crypto is the toolchain's own package (eider.toml's `[deps.crypto] toolchain = true`, Eider 0.7.6
 # and later: the toolchain's packages/crypto and its libeider_crypto backend): nothing to link.
-[ -d "$toolchain/packages/crypto" ] || die "$toolchain ($chosen) is Eider $theirs, which does not ship packages/crypto; eider-$pkg_name $mine needs Eider 0.7.6 or later (\`eider toolchain install 0.7\`)"
+[ -d "$toolchain/packages/crypto" ] || die "$toolchain ($chosen) is Eider $theirs, which does not ship packages/crypto; eider-$pkg_name $mine needs Eider 0.7.6 or later (\`eider toolchain install 0.8\`)"
 # the server waits on a connection's socket and its own parker (`fd.wait_ready_or_unpark`) and the socket writer sends with
 # `net.try_send`: both are Eider 0.7.8's std (eider-http 0.7.5 and later); 0.7.8 itself is refused by the next check
-grep -q "wait_ready_or_unpark" "$toolchain/std/fd.ei" 2>/dev/null && grep -q "try_send" "$toolchain/std/net.ei" 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs, whose std has no fd.wait_ready_or_unpark and net.try_send; eider-$pkg_name $mine needs Eider 0.7.9 or later (\`eider toolchain install 0.7\`)"
+grep -q "wait_ready_or_unpark" "$toolchain/std/fd.ei" 2>/dev/null && grep -q "try_send" "$toolchain/std/net.ei" 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs, whose std has no fd.wait_ready_or_unpark and net.try_send; eider-$pkg_name $mine needs Eider 0.7.9 or later (\`eider toolchain install 0.8\`)"
 # a toolchain before 0.7.9 can crash a server (a use-after-free of task stacks in the runtime: a finished task's stack was cached
 # before its pages were discarded, so a new task's live frames could be zeroed; present in 0.7.7 and 0.7.8, far likelier with
 # 0.7.8's faster task turnover; eider-http 0.7.6 and later)
-[ "${theirs##*.}" -ge 10 ] 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs: eider-$pkg_name $mine needs Eider 0.7.10 or later (the compiler crashed on a break after a closure that holds a closure, #248, which http/h2 and rpc/grpc use; 0.7.7 and 0.7.8 also have a task-stack use-after-free fixed in 0.7.9) (\`eider toolchain install 0.7\`)"
+[ "${theirs##*.}" -ge 10 ] 2>/dev/null || die "$toolchain ($chosen) is Eider $theirs: eider-$pkg_name $mine needs Eider 0.7.10 or later (the compiler crashed on a break after a closure that holds a closure, #248, which http/h2 and rpc/grpc use; 0.7.7 and 0.7.8 also have a task-stack use-after-free fixed in 0.7.9) (\`eider toolchain install 0.8\`)"
