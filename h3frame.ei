@@ -1,0 +1,417 @@
+//! http/h3frame: the HTTP/3 frame layer (RFC 9114 sections 7 and 8, RFC 9000 section 16): the
+//! variable-length integer, an incremental frame decoder that checks each frame type's size and
+//! stream rules before anything else sees it, the encoders for every frame type, SETTINGS, the
+//! stream types and the error codes. Pure Eider, no capability. http/h3 builds the connection on it
+//! and http/qpack supplies the header blocks the HEADERS frames carry.
+//!
+//!     let mut d = h3frame.decoder(h3frame.REQUEST, 65536)
+//!     d.feed(bytes)
+//!     loop {
+//!         match d.next() {
+//!             h3frame.NeedMore => { break }
+//!             h3frame.Got(f) => { ... f.kind, f.payload, f.id, f.settings ... }
+//!             h3frame.Chunk(b) => { ... a piece of the DATA frame being read ... }
+//!             h3frame.Fail(code, why) => { ... a connection error: close with `code` ... }
+//!         }
+//!     }
+//!
+//! Frames (RFC 9114 section 7.2) are a type and a length (both varints) and a payload, with no
+//! flags and no padding. What the decoder does:
+//!
+//!   - DATA is never buffered: it is handed out as `Chunk`s as bytes arrive, so the size of a
+//!     body is not bounded by memory. Every other frame whose payload is read whole (HEADERS,
+//!     SETTINGS, GOAWAY, MAX_PUSH_ID, CANCEL_PUSH, PUSH_PROMISE) is refused with
+//!     H3_EXCESSIVE_LOAD as soon as its header says it is over `max_payload`; the payload is never
+//!     buffered.
+//!   - Unknown frame types, among them the reserved "grease" types `0x1f * N + 0x21` (section
+//!     7.2.8), are skipped without being buffered, wherever they occur.
+//!   - The frame types HTTP/2 had and HTTP/3 does not (0x02, 0x06, 0x08, 0x09) are
+//!     H3_FRAME_UNEXPECTED. On a control stream DATA, HEADERS and PUSH_PROMISE are
+//!     H3_FRAME_UNEXPECTED; on a request stream SETTINGS, CANCEL_PUSH, GOAWAY and MAX_PUSH_ID are.
+//!     The first frame of a control stream must be SETTINGS (H3_MISSING_SETTINGS) and there is
+//!     only one (H3_FRAME_UNEXPECTED).
+//!   - GOAWAY, MAX_PUSH_ID and CANCEL_PUSH carry exactly one varint (H3_FRAME_ERROR otherwise).
+//!     SETTINGS is a list of (identifier, value) varint pairs; a truncated pair is
+//!     H3_FRAME_ERROR, a repeated identifier or one of the HTTP/2 settings that do not exist in
+//!     HTTP/3 (0x00, 0x02 to 0x05) is H3_SETTINGS_ERROR, more than 64 entries is
+//!     H3_EXCESSIVE_LOAD. Unknown identifiers are kept in `Frame.settings`: the caller ignores them.
+//!
+//! The stream's end in the middle of a frame is H3_FRAME_ERROR: check `Decoder.idle` when the
+//! transport reports the end of the stream.
+
+import std.bytes
+
+// ---- frame types (RFC 9114 section 7.2) ----
+
+pub const DATA: u64 = 0
+pub const HEADERS: u64 = 1
+pub const CANCEL_PUSH: u64 = 3
+pub const SETTINGS: u64 = 4
+pub const PUSH_PROMISE: u64 = 5
+pub const GOAWAY: u64 = 7
+pub const MAX_PUSH_ID: u64 = 13
+
+// ---- stream types (section 6.2) ----
+
+pub const STREAM_CONTROL: u64 = 0
+pub const STREAM_PUSH: u64 = 1
+pub const STREAM_QPACK_ENCODER: u64 = 2
+pub const STREAM_QPACK_DECODER: u64 = 3
+
+// ---- settings (section 7.2.4.1; the QPACK ones are RFC 9204 section 5) ----
+
+pub const SETTING_QPACK_MAX_TABLE_CAPACITY: u64 = 1
+pub const SETTING_MAX_FIELD_SECTION_SIZE: u64 = 6
+pub const SETTING_QPACK_BLOCKED_STREAMS: u64 = 7
+
+// ---- error codes (section 8.1; QPACK's are RFC 9204 section 6) ----
+
+pub const H3_NO_ERROR: u64 = 256
+pub const H3_GENERAL_PROTOCOL_ERROR: u64 = 257
+pub const H3_INTERNAL_ERROR: u64 = 258
+pub const H3_STREAM_CREATION_ERROR: u64 = 259
+pub const H3_CLOSED_CRITICAL_STREAM: u64 = 260
+pub const H3_FRAME_UNEXPECTED: u64 = 261
+pub const H3_FRAME_ERROR: u64 = 262
+pub const H3_EXCESSIVE_LOAD: u64 = 263
+pub const H3_ID_ERROR: u64 = 264
+pub const H3_SETTINGS_ERROR: u64 = 265
+pub const H3_MISSING_SETTINGS: u64 = 266
+pub const H3_REQUEST_REJECTED: u64 = 267
+pub const H3_REQUEST_CANCELLED: u64 = 268
+pub const H3_REQUEST_INCOMPLETE: u64 = 269
+pub const H3_MESSAGE_ERROR: u64 = 270
+pub const H3_CONNECT_ERROR: u64 = 271
+pub const H3_VERSION_FALLBACK: u64 = 272
+pub const QPACK_DECOMPRESSION_FAILED: u64 = 512
+pub const QPACK_ENCODER_STREAM_ERROR: u64 = 513
+pub const QPACK_DECODER_STREAM_ERROR: u64 = 514
+
+/// Which stream a decoder reads: a control stream or a request stream.
+pub const CONTROL: u8 = 0
+pub const REQUEST: u8 = 1
+
+/// The largest value of a varint (2^62 - 1).
+pub const VARINT_MAX: u64 = 4611686018427387903
+
+/// The name of an error code, for messages and logs.
+pub fn code_name(c: u64) -> String {
+    let s = if c == 256 { "H3_NO_ERROR" }
+        else if c == 257 { "H3_GENERAL_PROTOCOL_ERROR" }
+        else if c == 258 { "H3_INTERNAL_ERROR" }
+        else if c == 259 { "H3_STREAM_CREATION_ERROR" }
+        else if c == 260 { "H3_CLOSED_CRITICAL_STREAM" }
+        else if c == 261 { "H3_FRAME_UNEXPECTED" }
+        else if c == 262 { "H3_FRAME_ERROR" }
+        else if c == 263 { "H3_EXCESSIVE_LOAD" }
+        else if c == 264 { "H3_ID_ERROR" }
+        else if c == 265 { "H3_SETTINGS_ERROR" }
+        else if c == 266 { "H3_MISSING_SETTINGS" }
+        else if c == 267 { "H3_REQUEST_REJECTED" }
+        else if c == 268 { "H3_REQUEST_CANCELLED" }
+        else if c == 269 { "H3_REQUEST_INCOMPLETE" }
+        else if c == 270 { "H3_MESSAGE_ERROR" }
+        else if c == 271 { "H3_CONNECT_ERROR" }
+        else if c == 272 { "H3_VERSION_FALLBACK" }
+        else if c == 512 { "QPACK_DECOMPRESSION_FAILED" }
+        else if c == 513 { "QPACK_ENCODER_STREAM_ERROR" }
+        else if c == 514 { "QPACK_DECODER_STREAM_ERROR" }
+        else { "UNKNOWN_ERROR" }
+    String.from(s)
+}
+
+/// The name of a frame type.
+pub fn kind_name(k: u64) -> String {
+    let s = if k == 0 { "DATA" }
+        else if k == 1 { "HEADERS" }
+        else if k == 3 { "CANCEL_PUSH" }
+        else if k == 4 { "SETTINGS" }
+        else if k == 5 { "PUSH_PROMISE" }
+        else if k == 7 { "GOAWAY" }
+        else if k == 13 { "MAX_PUSH_ID" }
+        else if is_grease(k) { "GREASE" }
+        else { "UNKNOWN" }
+    String.from(s)
+}
+
+/// Whether `v` is one of the reserved "grease" values `0x1f * N + 0x21` (frame types, stream types,
+/// settings identifiers and error codes all reserve them, RFC 9114 sections 7.2.8, 6.2.3, 7.2.4.1, 8.1).
+pub fn is_grease(v: u64) -> bool { v >= 33 && (v - 33) % 31 == 0 }
+
+/// The `n`th grease value, `0x1f * n + 0x21`.
+pub fn grease(n: u64) -> u64 { 31 * n + 33 }
+
+// ---- variable-length integers (RFC 9000 section 16) ----
+
+/// The bytes `v` takes as a varint in its shortest form: 1, 2, 4 or 8 (`v` must be at most VARINT_MAX).
+pub fn varint_len(v: u64) -> usize {
+    if v < 64 { return 1 }
+    if v < 16384 { return 2 }
+    if v < 1073741824 { return 4 }
+    8
+}
+
+/// Appends `v` (at most VARINT_MAX) in `n` bytes (1, 2, 4 or 8, and wide enough): the shortest form
+/// is `varint_len(v)`; a longer one is legal on the wire (RFC 9000 section 16) and the tests use it.
+pub fn put_varint_n(inout out: List[u8], v: u64, n: usize) {
+    if n == 1 {
+        out.push(v as u8)
+    } else if n == 2 {
+        out.push((((v >> (8 as u64)) & 63) as u8) | 64)
+        out.push((v & 255) as u8)
+    } else if n == 4 {
+        out.push((((v >> (24 as u64)) & 63) as u8) | 128)
+        out.push(((v >> (16 as u64)) & 255) as u8)
+        out.push(((v >> (8 as u64)) & 255) as u8)
+        out.push((v & 255) as u8)
+    } else {
+        out.push((((v >> (56 as u64)) & 63) as u8) | 192)
+        let mut s: u64 = 48
+        while true {
+            out.push(((v >> s) & 255) as u8)
+            if s == 0 { break }
+            s -= 8
+        }
+    }
+}
+
+/// Appends `v` (at most VARINT_MAX) as a varint in its shortest form.
+pub fn put_varint(inout out: List[u8], v: u64) { put_varint_n(inout out, v, varint_len(v)) }
+
+/// `v` as a varint.
+pub fn encode_varint(v: u64) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    put_varint(inout out, v)
+    out
+}
+
+/// A varint read from a buffer: its value and the position after it.
+pub type Varint = { value: u64, next: usize }
+
+/// The varint at `pos` in `b`; `None` if `b` ends inside it.
+pub fn get_varint(b: List[u8], pos: usize) -> Option[Varint] {
+    if pos >= b.len() { return None }
+    let first = b[pos]
+    let n: usize = 1 << ((first >> (6 as u8)) as usize)
+    if b.len() - pos < n { return None }
+    let mut v: u64 = (first & 63) as u64
+    let mut i: usize = 1
+    while i < n {
+        v = (v << (8 as u64)) | (b[pos + i] as u64)
+        i += 1
+    }
+    Some(Varint(v, pos + n))
+}
+
+// ---- frames ----
+
+/// A decoded frame other than DATA. `kind` is the frame type. For HEADERS and PUSH_PROMISE
+/// `payload` is the field section (PUSH_PROMISE: after the push id, which is `id`); for SETTINGS
+/// `settings` has the entries; for GOAWAY (a stream id, or a push id from a client), MAX_PUSH_ID
+/// and CANCEL_PUSH `id` is the varint they carry.
+pub type Frame = { kind: u64, payload: List[u8], id: u64, settings: List[Setting] }
+
+/// One SETTINGS entry.
+pub type Setting = { id: u64, value: u64 }
+
+pub type Step = | NeedMore | Got(f: Frame) | Chunk(data: List[u8]) | Fail(code: u64, why: String)
+
+fn fail(code: u64, why: str) -> Step { Fail(code, String.from(why)) }
+
+fn is_h2_only(k: u64) -> bool { k == 2 || k == 6 || k == 8 || k == 9 }
+
+/// An incremental frame decoder: `feed` bytes, call `next` until it says `NeedMore`.
+pub type Decoder = {
+    buf: List[u8],
+    pos: usize,
+    scope: u8,
+    max_payload: usize,
+    /// the bytes of the DATA frame being read that are still to come
+    data_left: u64,
+    /// the bytes of the unknown frame being skipped that are still to come
+    skip_left: u64,
+    /// a control stream: the first frame has been read
+    started: bool,
+}
+
+/// A decoder for a control stream (`CONTROL`) or a request stream (`REQUEST`); frames other than
+/// DATA over `max_payload` bytes are refused.
+pub fn decoder(scope: u8, max_payload: usize) -> Decoder {
+    Decoder(List.new(), 0, scope, max_payload, 0, 0, false)
+}
+
+impl Decoder {
+    /// Adds bytes read from the stream.
+    fn feed(inout self, data: List[u8]) {
+        if self.pos > 0 && self.pos == self.buf.len() {
+            self.buf.clear()
+            self.pos = 0
+        } else if self.pos > 65536 {
+            self.buf.remove_range(0, self.pos)
+            self.pos = 0
+        }
+        bytes.append(inout self.buf, data)
+    }
+
+    /// Bytes buffered and not yet consumed.
+    fn buffered(self) -> usize { self.buf.len() - self.pos }
+
+    /// True when no frame is partly read: the stream may end here without it being an error.
+    fn idle(self) -> bool { self.buf.len() == self.pos && self.data_left == 0 && self.skip_left == 0 }
+
+    /// The next frame, or the next piece of a DATA frame, if the bytes so far hold one.
+    fn next(inout self) -> Step {
+        while true {
+            let avail = self.buf.len() - self.pos
+            if self.skip_left > 0 {
+                if avail == 0 { return NeedMore }
+                let n: usize = if (avail as u64) < self.skip_left { avail } else { self.skip_left as usize }
+                self.pos += n
+                self.skip_left -= n as u64
+                continue
+            }
+            if self.data_left > 0 {
+                if avail == 0 { return NeedMore }
+                let n: usize = if (avail as u64) < self.data_left { avail } else { self.data_left as usize }
+                let piece = self.buf.slice(self.pos, self.pos + n)
+                self.pos += n
+                self.data_left -= n as u64
+                return Chunk(piece)
+            }
+            let k = match get_varint(self.buf, self.pos) {
+                Some(x) => x
+                None => { return NeedMore }
+            }
+            let l = match get_varint(self.buf, k.next) {
+                Some(x) => x
+                None => { return NeedMore }
+            }
+            let kind = k.value
+            let len = l.value
+            let p2 = l.next
+            if is_h2_only(kind) { return fail(H3_FRAME_UNEXPECTED, "an HTTP/2 frame type") }
+            if self.scope == CONTROL {
+                if kind == DATA || kind == HEADERS || kind == PUSH_PROMISE { return fail(H3_FRAME_UNEXPECTED, "a request frame on the control stream") }
+                if !self.started && kind != SETTINGS { return fail(H3_MISSING_SETTINGS, "the control stream does not start with SETTINGS") }
+                if self.started && kind == SETTINGS { return fail(H3_FRAME_UNEXPECTED, "a second SETTINGS") }
+            } else {
+                if kind == SETTINGS || kind == CANCEL_PUSH || kind == GOAWAY || kind == MAX_PUSH_ID { return fail(H3_FRAME_UNEXPECTED, "a control frame on a request stream") }
+            }
+            if kind == DATA {
+                self.pos = p2
+                self.data_left = len
+                continue
+            }
+            let known = kind == HEADERS || kind == CANCEL_PUSH || kind == SETTINGS || kind == PUSH_PROMISE || kind == GOAWAY || kind == MAX_PUSH_ID
+            if !known {
+                self.pos = p2
+                self.skip_left = len
+                if self.scope == CONTROL { self.started = true }
+                continue
+            }
+            if len > (self.max_payload as u64) { return fail(H3_EXCESSIVE_LOAD, "a frame over the size limit") }
+            if ((self.buf.len() - p2) as u64) < len { return NeedMore }
+            let end = p2 + (len as usize)
+            let payload = self.buf.slice(p2, end)
+            self.pos = end
+            if self.scope == CONTROL { self.started = true }
+            return parse_frame(kind, payload)
+        }
+        NeedMore
+    }
+}
+
+fn parse_frame(kind: u64, payload: List[u8]) -> Step {
+    let mut f = Frame(kind, payload, 0, List.new())
+    if kind == GOAWAY || kind == MAX_PUSH_ID || kind == CANCEL_PUSH {
+        match get_varint(payload, 0) {
+            Some(x) => {
+                if x.next != payload.len() { return fail(H3_FRAME_ERROR, "a frame with more than one integer") }
+                f.id = x.value
+            }
+            None => { return fail(H3_FRAME_ERROR, "a frame without its integer") }
+        }
+    } else if kind == PUSH_PROMISE {
+        match get_varint(payload, 0) {
+            Some(x) => {
+                f.id = x.value
+                f.payload = payload.slice(x.next, payload.len())
+            }
+            None => { return fail(H3_FRAME_ERROR, "PUSH_PROMISE without a push id") }
+        }
+    } else if kind == SETTINGS {
+        let mut p: usize = 0
+        while p < payload.len() {
+            let a = match get_varint(payload, p) {
+                Some(x) => x
+                None => { return fail(H3_FRAME_ERROR, "a truncated setting") }
+            }
+            let b = match get_varint(payload, a.next) {
+                Some(x) => x
+                None => { return fail(H3_FRAME_ERROR, "a truncated setting") }
+            }
+            let id = a.value
+            let v = b.value
+            p = b.next
+            if id == 0 || (id >= 2 && id <= 5) { return fail(H3_SETTINGS_ERROR, "a setting HTTP/2 had and HTTP/3 does not") }
+            for s in f.settings {
+                if s.id == id { return fail(H3_SETTINGS_ERROR, "a repeated setting") }
+            }
+            if f.settings.len() >= 64 { return fail(H3_EXCESSIVE_LOAD, "more than 64 settings") }
+            f.settings.push(Setting(id, v))
+        }
+    }
+    Got(f)
+}
+
+// ---- encoders ----
+
+/// A frame of type `kind` with `payload`.
+pub fn frame(kind: u64, payload: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    put_varint(inout out, kind)
+    put_varint(inout out, payload.len() as u64)
+    out.extend(payload)
+    out
+}
+
+/// The header of a DATA frame of `len` bytes (write the bytes after it, without copying them
+/// into the frame).
+pub fn data_header(len: usize) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    put_varint(inout out, DATA)
+    put_varint(inout out, len as u64)
+    out
+}
+
+/// DATA carrying `data`.
+pub fn data(data: List[u8]) -> List[u8] { frame(DATA, data) }
+
+/// HEADERS carrying a field section (from http/qpack).
+pub fn headers(section: List[u8]) -> List[u8] { frame(HEADERS, section) }
+
+/// SETTINGS with `entries`.
+pub fn settings(entries: List[Setting]) -> List[u8] {
+    let mut p: List[u8] = List.new()
+    for e in entries {
+        put_varint(inout p, e.id)
+        put_varint(inout p, e.value)
+    }
+    frame(SETTINGS, p)
+}
+
+/// GOAWAY: a server's is the stream id of the first request it did not and will not process; a client's
+/// is a push id.
+pub fn goaway(id: u64) -> List[u8] { frame(GOAWAY, encode_varint(id)) }
+
+/// MAX_PUSH_ID.
+pub fn max_push_id(id: u64) -> List[u8] { frame(MAX_PUSH_ID, encode_varint(id)) }
+
+/// CANCEL_PUSH.
+pub fn cancel_push(id: u64) -> List[u8] { frame(CANCEL_PUSH, encode_varint(id)) }
+
+/// A reserved frame (`grease(n)` as its type) with `payload`: a peer must ignore it.
+pub fn grease_frame(n: u64, payload: List[u8]) -> List[u8] { frame(grease(n), payload) }
+
+/// The first bytes of a unidirectional stream: its type.
+pub fn stream_type(t: u64) -> List[u8] { encode_varint(t) }

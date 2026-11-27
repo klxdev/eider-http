@@ -1,0 +1,989 @@
+//! http/qpack: QPACK (RFC 9204), the header compression of HTTP/3, in both directions: the 99-entry
+//! static table, the dynamic table with its absolute, relative and post-base indexing and its
+//! eviction, the encoder and decoder streams, field sections with the Required Insert Count and the
+//! Base, streams that block on table entries that have not arrived, and the limits that bound all
+//! of it. Pure Eider, no capability: it takes and gives bytes. The Huffman code and the prefix
+//! integers are HPACK's (http/hpack), the string literal differs only in where the Huffman flag sits.
+//!
+//! QPACK differs from HPACK in that the peer's table is updated on a stream of its own, so a field
+//! section can name an entry the decoder has not received yet: that stream is "blocked" until the
+//! entry arrives, and a decoder promises to support only so many blocked streams.
+//!
+//! Decoder (what a peer's HEADERS frames and its encoder stream feed):
+//!
+//!     let mut dec = qpack.decoder(4096, 16, 65536)       // table capacity, blocked streams, field section size
+//!     let ready = dec.receive_encoder(bytes_from_the_peers_encoder_stream)?   // List[qpack.Section]: streams now unblocked
+//!     match dec.decode_section(stream_id, header_block)? {
+//!         qpack.Ready(s) => { ... s.fields, s.too_large ... }
+//!         qpack.Blocked => { ... wait: `receive_encoder` returns the section when its entries arrive ... }
+//!     }
+//!     let out = dec.take_output()                        // bytes for our own decoder stream (acks, cancellations, increments)
+//!     dec.cancel_stream(stream_id)                       // a request stream was reset: Stream Cancellation
+//!
+//! Encoder (what our HEADERS frames and our encoder stream are made of):
+//!
+//!     let mut enc = qpack.encoder(peer_max_capacity, peer_blocked_streams)    // from the peer's SETTINGS
+//!     let instr0 = enc.set_capacity(4096)?               // bytes for our encoder stream
+//!     let e = enc.encode(stream_id, fields)              // e.section for a HEADERS frame, e.instructions for the encoder stream
+//!     enc.receive_decoder(bytes_from_the_peers_decoder_stream)?
+//!
+//! The encoder indexes a field in the dynamic table when it fits (a literal name reference to the
+//! static or the dynamic table when it can), refers to entries the decoder has acknowledged without
+//! ever blocking, and to entries it has not only while fewer than the peer's blocked-streams limit
+//! of streams would be blocked. Entries still named by a field section the decoder has not
+//! acknowledged (or cancelled) are never evicted. Credentials (`authorization`, `proxy-authorization`,
+//! `cookie`, `set-cookie` and `Encoder.sensitive`) are written as never-indexed literals
+//! (RFC 9204 section 7.1). Not done: the draining index of section 2.1.1.1 (the encoder evicts
+//! the oldest entries when it needs room and they are not in use, and does not otherwise stop referring to
+//! them), choosing what is worth indexing beyond "everything that is not a credential".
+//!
+//! Errors are `Error(code, why)` with the code RFC 9204 section 6 names; each is a connection error
+//! in HTTP/3. A decoder refuses: an index outside the static table or the dynamic one, a reference to
+//! an entry that was evicted or that is at or past the section's Required Insert Count, a Required
+//! Insert Count that does not decode, a string over `max_string` bytes, an integer over 2^62, more
+//! blocked streams than it advertised, an encoder stream instruction that sets a capacity over its
+//! maximum, or inserts an entry larger than the capacity. A field section over `max_list` bytes
+//! (counted as HTTP/3 does: name + value + 32 per field) is decoded to its end, so the table stays
+//! in step, but its fields after the limit are dropped and `Section.too_large` is set.
+
+import std.bytes
+import http
+import http.hpack
+
+/// Error codes (RFC 9204 section 6).
+pub const QPACK_DECOMPRESSION_FAILED: u64 = 512
+pub const QPACK_ENCODER_STREAM_ERROR: u64 = 513
+pub const QPACK_DECODER_STREAM_ERROR: u64 = 514
+
+/// An error: the QPACK error code and a reason.
+pub type Error = { code: u64, why: String }
+
+// the two codes the primitives use: the input ended (wait for more, or a decompression failure), or it is malformed
+const INCOMPLETE: u64 = 0
+const MALFORMED: u64 = 1
+
+fn err(code: u64, why: str) -> Error { Error(code, String.from(why)) }
+
+/// The size of a table entry (RFC 9204 section 3.2.1): name + value + 32.
+pub fn entry_size(f: http.Header) -> usize { f.name.len() + f.value.len() + 32 }
+
+const NEVER: u64 = 4611686018427387904
+
+// ---- the static table (RFC 9204 appendix A) ----
+
+fn h(name: str, value: str) -> http.Header { http.Header(name.bytes(), value.bytes()) }
+
+fn static_table() -> List[http.Header] {
+    let mut t: List[http.Header] = List.new()
+    t.push(h(":authority", ""))
+    t.push(h(":path", "/"))
+    t.push(h("age", "0"))
+    t.push(h("content-disposition", ""))
+    t.push(h("content-length", "0"))
+    t.push(h("cookie", ""))
+    t.push(h("date", ""))
+    t.push(h("etag", ""))
+    t.push(h("if-modified-since", ""))
+    t.push(h("if-none-match", ""))
+    t.push(h("last-modified", ""))
+    t.push(h("link", ""))
+    t.push(h("location", ""))
+    t.push(h("referer", ""))
+    t.push(h("set-cookie", ""))
+    t.push(h(":method", "CONNECT"))
+    t.push(h(":method", "DELETE"))
+    t.push(h(":method", "GET"))
+    t.push(h(":method", "HEAD"))
+    t.push(h(":method", "OPTIONS"))
+    t.push(h(":method", "POST"))
+    t.push(h(":method", "PUT"))
+    t.push(h(":scheme", "http"))
+    t.push(h(":scheme", "https"))
+    t.push(h(":status", "103"))
+    t.push(h(":status", "200"))
+    t.push(h(":status", "304"))
+    t.push(h(":status", "404"))
+    t.push(h(":status", "503"))
+    t.push(h("accept", "*/*"))
+    t.push(h("accept", "application/dns-message"))
+    t.push(h("accept-encoding", "gzip, deflate, br"))
+    t.push(h("accept-ranges", "bytes"))
+    t.push(h("access-control-allow-headers", "cache-control"))
+    t.push(h("access-control-allow-headers", "content-type"))
+    t.push(h("access-control-allow-origin", "*"))
+    t.push(h("cache-control", "max-age=0"))
+    t.push(h("cache-control", "max-age=2592000"))
+    t.push(h("cache-control", "max-age=604800"))
+    t.push(h("cache-control", "no-cache"))
+    t.push(h("cache-control", "no-store"))
+    t.push(h("cache-control", "public, max-age=31536000"))
+    t.push(h("content-encoding", "br"))
+    t.push(h("content-encoding", "gzip"))
+    t.push(h("content-type", "application/dns-message"))
+    t.push(h("content-type", "application/javascript"))
+    t.push(h("content-type", "application/json"))
+    t.push(h("content-type", "application/x-www-form-urlencoded"))
+    t.push(h("content-type", "image/gif"))
+    t.push(h("content-type", "image/jpeg"))
+    t.push(h("content-type", "image/png"))
+    t.push(h("content-type", "text/css"))
+    t.push(h("content-type", "text/html; charset=utf-8"))
+    t.push(h("content-type", "text/plain"))
+    t.push(h("content-type", "text/plain;charset=utf-8"))
+    t.push(h("range", "bytes=0-"))
+    t.push(h("strict-transport-security", "max-age=31536000"))
+    t.push(h("strict-transport-security", "max-age=31536000; includesubdomains"))
+    t.push(h("strict-transport-security", "max-age=31536000; includesubdomains; preload"))
+    t.push(h("vary", "accept-encoding"))
+    t.push(h("vary", "origin"))
+    t.push(h("x-content-type-options", "nosniff"))
+    t.push(h("x-xss-protection", "1; mode=block"))
+    t.push(h(":status", "100"))
+    t.push(h(":status", "204"))
+    t.push(h(":status", "206"))
+    t.push(h(":status", "302"))
+    t.push(h(":status", "400"))
+    t.push(h(":status", "403"))
+    t.push(h(":status", "421"))
+    t.push(h(":status", "425"))
+    t.push(h(":status", "500"))
+    t.push(h("accept-language", ""))
+    t.push(h("access-control-allow-credentials", "FALSE"))
+    t.push(h("access-control-allow-credentials", "TRUE"))
+    t.push(h("access-control-allow-headers", "*"))
+    t.push(h("access-control-allow-methods", "get"))
+    t.push(h("access-control-allow-methods", "get, post, options"))
+    t.push(h("access-control-allow-methods", "options"))
+    t.push(h("access-control-expose-headers", "content-length"))
+    t.push(h("access-control-request-headers", "content-type"))
+    t.push(h("access-control-request-method", "get"))
+    t.push(h("access-control-request-method", "post"))
+    t.push(h("alt-svc", "clear"))
+    t.push(h("authorization", ""))
+    t.push(h("content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"))
+    t.push(h("early-data", "1"))
+    t.push(h("expect-ct", ""))
+    t.push(h("forwarded", ""))
+    t.push(h("if-range", ""))
+    t.push(h("origin", ""))
+    t.push(h("purpose", "prefetch"))
+    t.push(h("server", ""))
+    t.push(h("timing-allow-origin", "*"))
+    t.push(h("upgrade-insecure-requests", "1"))
+    t.push(h("user-agent", ""))
+    t.push(h("x-forwarded-for", ""))
+    t.push(h("x-frame-options", "deny"))
+    t.push(h("x-frame-options", "sameorigin"))
+    t
+}
+
+/// The static table and HPACK's Huffman tables, derived once and shared by an encoder and a decoder.
+pub type Tables = { stat: List[http.Header], huff: hpack.Tables }
+
+/// The tables (the static table is `stat`, index 0 to 98).
+pub fn tables() -> Tables { Tables(static_table(), hpack.tables()) }
+
+// ---- integers and strings ----
+
+/// An integer or a string read at some position, and the position after it.
+type Pi = { value: u64, next: usize }
+type Ps = { data: List[u8], next: usize }
+
+fn put_int(inout out: List[u8], n: u64, flags: u8, v: u64) { out.extend(hpack.encode_int(n, flags, v)) }
+
+/// The integer with an `n`-bit prefix at `pos` (RFC 9204 section 4.1.1 = RFC 7541 section 5.1), at most 2^62.
+fn get_int(b: List[u8], pos: usize, n: u64) -> Result[Pi, Error] {
+    if pos >= b.len() { return Err(err(INCOMPLETE, "qpack: truncated integer")) }
+    let maxp: u64 = ((1 as u64) << n) - 1
+    let mut v: u64 = (b[pos] as u64) & maxp
+    let mut p = pos + 1
+    if v < maxp { return Ok(Pi(v, p)) }
+    let mut shift: u64 = 0
+    while true {
+        if p >= b.len() { return Err(err(INCOMPLETE, "qpack: truncated integer")) }
+        let c = b[p] as u64
+        p += 1
+        if shift > 56 { return Err(err(MALFORMED, "qpack: integer too large")) }
+        v += (c & 127) << shift
+        if v > 4611686018427387904 { return Err(err(MALFORMED, "qpack: integer too large")) }
+        if c < 128 { return Ok(Pi(v, p)) }
+        shift += 7
+    }
+    Err(err(MALFORMED, "qpack: integer"))
+}
+
+/// Writes `s` as a string literal whose length has an `n`-bit prefix (the Huffman flag is the bit above
+/// it), Huffman coded when that is shorter and `huffman` allows it; the bits of `flags` above the flag go
+/// in the first byte.
+fn put_str(t: Tables, inout out: List[u8], n: u64, flags: u8, s: List[u8], huffman: bool) {
+    if huffman {
+        let hs = hpack.huffman_encode(t.huff, s)
+        if hs.len() < s.len() {
+            put_int(inout out, n, flags | (((1 as u8) << (n as u8))), hs.len() as u64)
+            out.extend(hs)
+            return
+        }
+    }
+    put_int(inout out, n, flags, s.len() as u64)
+    out.extend(s)
+}
+
+/// The string literal at `pos` with an `n`-bit length prefix, decoded to at most `max` bytes.
+fn get_str(t: Tables, b: List[u8], pos: usize, n: u64, max: usize) -> Result[Ps, Error] {
+    if pos >= b.len() { return Err(err(INCOMPLETE, "qpack: truncated string")) }
+    let huff = ((b[pos] >> (n as u8)) & 1) != 0
+    let l = get_int(b, pos, n)?
+    // a Huffman code is at most 30 bits per byte, so the coded form is under 4 times the decoded
+    if l.value > (max as u64) * 4 { return Err(err(MALFORMED, "qpack: string too long")) }
+    if l.value > ((b.len() - l.next) as u64) { return Err(err(INCOMPLETE, "qpack: truncated string")) }
+    let end = l.next + (l.value as usize)
+    let raw = b.slice(l.next, end)
+    if huff {
+        return match hpack.huffman_decode(t.huff, raw, max) {
+            Ok(s) => Ok(Ps(s, end))
+            Err(e) => Err(err(MALFORMED, "qpack: bad Huffman string"))
+        }
+    }
+    if raw.len() > max { return Err(err(MALFORMED, "qpack: string too long")) }
+    Ok(Ps(raw, end))
+}
+
+/// An error from the encoder stream: a parse failure other than "not complete yet" is QPACK_ENCODER_STREAM_ERROR.
+fn on_encoder_stream[T](r: Result[T, Error]) -> Result[T, Error] {
+    match r {
+        Ok(v) => Ok(v)
+        Err(e) => {
+            if e.code == INCOMPLETE { return Err(e) }
+            Err(Error(QPACK_ENCODER_STREAM_ERROR, e.why))
+        }
+    }
+}
+
+/// An error from a field section or the decoder stream: both an incomplete and a malformed one are
+/// the given code.
+fn failed_with[T](r: Result[T, Error], code: u64) -> Result[T, Error] {
+    match r {
+        Ok(v) => Ok(v)
+        Err(e) => Err(Error(code, e.why))
+    }
+}
+
+// ---- the decoder ----
+
+/// A decoded field section for a request stream.
+pub type Section = { stream: u64, fields: List[http.Header], too_large: bool }
+
+/// What `decode_section` gives: the fields, or "this stream is blocked on entries that have not arrived".
+pub type Outcome = | Ready(s: Section) | Blocked
+
+// a section waiting for table entries: its stream, the Required Insert Count, the Base, and the bytes
+type Held = { stream: u64, ric: u64, base: u64, at: usize, data: List[u8] }
+
+/// QPACK decoder state for one connection.
+pub type Decoder = {
+    t: Tables,
+    dyn: List[http.Header],
+    /// entries evicted so far: the absolute index of `dyn[0]`
+    dropped: u64,
+    size: usize,
+    cap: usize,
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY, as advertised to the peer
+    max_cap: usize,
+    /// SETTINGS_QPACK_BLOCKED_STREAMS, as advertised
+    max_blocked: usize,
+    /// the largest decoded field section (name + value + 32 per field)
+    max_list: usize,
+    /// the longest string literal accepted after decoding
+    max_string: usize,
+    ebuf: List[u8],
+    epos: usize,
+    blocked: List[Held],
+    /// inserts the encoder has been told about (by a section acknowledgment or an increment)
+    reported: u64,
+    out: List[u8],
+}
+
+/// A decoder whose table the peer may grow to `max_capacity` bytes and that supports `max_blocked`
+/// blocked streams (what we advertised in SETTINGS), and decodes field sections of at most `max_list` bytes.
+pub fn decoder(max_capacity: usize, max_blocked: usize, max_list: usize) -> Decoder {
+    Decoder(tables(), List.new(), 0, 0, 0, max_capacity, max_blocked, max_list, 8192, List.new(), 0, List.new(), 0, List.new())
+}
+
+fn evict_front(inout dyn: List[http.Header], inout dropped: u64, inout size: usize, room: usize) {
+    // evicts the oldest entries until size <= room
+    let mut n: usize = 0
+    while size > room && n < dyn.len() {
+        size -= entry_size(dyn[n])
+        n += 1
+    }
+    if n > 0 {
+        dyn.remove_range(0, n)
+        dropped += n as u64
+    }
+}
+
+impl Decoder {
+    /// Entries inserted so far (the Insert Count).
+    fn insert_count(self) -> u64 { self.dropped + (self.dyn.len() as u64) }
+
+    /// The table's current capacity.
+    fn capacity(self) -> usize { self.cap }
+
+    /// The table's size in the RFC's accounting.
+    fn table_size(self) -> usize { self.size }
+
+    /// Streams waiting for table entries.
+    fn blocked_count(self) -> usize { self.blocked.len() }
+
+    /// The entries of the table, newest first (for tests).
+    fn entries(self) -> List[http.Header] {
+        let mut out: List[http.Header] = List.new()
+        let mut i = self.dyn.len()
+        while i > 0 {
+            i -= 1
+            out.push(self.dyn[i])
+        }
+        out
+    }
+
+    fn insert(inout self, f: http.Header) -> Result[(), Error] {
+        let sz = entry_size(f)
+        if sz > self.cap { return Err(err(QPACK_ENCODER_STREAM_ERROR, "an entry larger than the table capacity")) }
+        evict_front(inout self.dyn, inout self.dropped, inout self.size, self.cap - sz)
+        self.size += sz
+        self.dyn.push(f)
+        Ok(())
+    }
+
+    /// The entry with absolute index `abs`.
+    fn entry(self, abs: u64) -> Option[http.Header] {
+        if abs < self.dropped { return None }
+        let i = abs - self.dropped
+        if i >= (self.dyn.len() as u64) { return None }
+        Some(self.dyn[i as usize])
+    }
+
+    /// One instruction of the encoder stream at `epos`: the bytes it took (an `INCOMPLETE` error when the
+    /// stream has not delivered all of it).
+    fn instruction(inout self) -> Result[usize, Error] {
+        let b = self.ebuf
+        let p = self.epos
+        let c = b[p]
+        if (c & 128) != 0 {
+            // Insert With Name Reference: 1 T index(6), value
+            let i = on_encoder_stream(get_int(b, p, 6))?
+            let v = on_encoder_stream(get_str(self.t, b, i.next, 7, self.max_string))?
+            let mut name: List[u8] = List.new()
+            if (c & 64) != 0 {
+                if i.value >= (self.t.stat.len() as u64) { return Err(err(QPACK_ENCODER_STREAM_ERROR, "a static index out of range")) }
+                name = self.t.stat[i.value as usize].name
+            } else {
+                if i.value >= self.insert_count() { return Err(err(QPACK_ENCODER_STREAM_ERROR, "a relative index out of range")) }
+                match self.entry(self.insert_count() - 1 - i.value) {
+                    Some(e) => { name = e.name }
+                    None => { return Err(err(QPACK_ENCODER_STREAM_ERROR, "an evicted entry")) }
+                }
+            }
+            self.insert(http.Header(name, v.data))?
+            return Ok(v.next - p)
+        }
+        if (c & 64) != 0 {
+            // Insert With Literal Name: 01 H name(5), value
+            let nm = on_encoder_stream(get_str(self.t, b, p, 5, self.max_string))?
+            let v = on_encoder_stream(get_str(self.t, b, nm.next, 7, self.max_string))?
+            self.insert(http.Header(nm.data, v.data))?
+            return Ok(v.next - p)
+        }
+        if (c & 32) != 0 {
+            // Set Dynamic Table Capacity: 001 capacity(5)
+            let i = on_encoder_stream(get_int(b, p, 5))?
+            if i.value > (self.max_cap as u64) { return Err(err(QPACK_ENCODER_STREAM_ERROR, "a capacity over the maximum")) }
+            self.cap = i.value as usize
+            evict_front(inout self.dyn, inout self.dropped, inout self.size, self.cap)
+            return Ok(i.next - p)
+        }
+        // Duplicate: 000 index(5)
+        let i = on_encoder_stream(get_int(b, p, 5))?
+        if i.value >= self.insert_count() { return Err(err(QPACK_ENCODER_STREAM_ERROR, "a relative index out of range")) }
+        match self.entry(self.insert_count() - 1 - i.value) {
+            Some(e) => { self.insert(e)? }
+            None => { return Err(err(QPACK_ENCODER_STREAM_ERROR, "an evicted entry")) }
+        }
+        Ok(i.next - p)
+    }
+
+    /// Bytes read from the peer's encoder stream: the table updates they carry are applied. Returns the
+    /// sections of blocked streams that these updates made decodable. An error is a connection error.
+    fn receive_encoder(inout self, data: List[u8]) -> Result[List[Section], Error] {
+        if self.epos > 0 && self.epos == self.ebuf.len() {
+            self.ebuf.clear()
+            self.epos = 0
+        }
+        bytes.append(inout self.ebuf, data)
+        while self.epos < self.ebuf.len() {
+            match self.instruction() {
+                Ok(n) => { self.epos += n }
+                Err(e) => {
+                    if e.code == INCOMPLETE { break }
+                    return Err(e)
+                }
+            }
+        }
+        let mut ready: List[Section] = List.new()
+        let mut i: usize = 0
+        while i < self.blocked.len() {
+            let hd = self.blocked[i].copy()
+            if hd.ric <= self.insert_count() {
+                self.blocked.remove_range(i, i + 1)
+                ready.push(self.finish(hd.stream, hd.data, hd.ric, hd.base, hd.at)?)
+            } else {
+                i += 1
+            }
+        }
+        Ok(ready)
+    }
+
+    /// The Required Insert Count and Base at the start of a field section: (ric, base, bytes taken).
+    fn prefix(self, b: List[u8]) -> Result[(u64, u64, usize), Error] {
+        let r = failed_with(get_int(b, 0, 8), QPACK_DECOMPRESSION_FAILED)?
+        let max_entries = (self.max_cap / 32) as u64
+        let mut ric: u64 = 0
+        if r.value != 0 {
+            if max_entries == 0 { return Err(err(QPACK_DECOMPRESSION_FAILED, "a Required Insert Count with no table")) }
+            let full = 2 * max_entries
+            if r.value > full { return Err(err(QPACK_DECOMPRESSION_FAILED, "an encoded Required Insert Count out of range")) }
+            let max_value = self.insert_count() + max_entries
+            let max_wrapped = (max_value / full) * full
+            ric = max_wrapped + r.value - 1
+            if ric > max_value {
+                if ric <= full { return Err(err(QPACK_DECOMPRESSION_FAILED, "an invalid Required Insert Count")) }
+                ric -= full
+            }
+            if ric == 0 { return Err(err(QPACK_DECOMPRESSION_FAILED, "an invalid Required Insert Count")) }
+        }
+        if r.next >= b.len() { return Err(err(QPACK_DECOMPRESSION_FAILED, "a field section without its Base")) }
+        let neg = (b[r.next] & 128) != 0
+        let d = failed_with(get_int(b, r.next, 7), QPACK_DECOMPRESSION_FAILED)?
+        let mut base: u64 = 0
+        if neg {
+            if d.value >= ric { return Err(err(QPACK_DECOMPRESSION_FAILED, "a negative Base")) }
+            base = ric - d.value - 1
+        } else {
+            base = ric + d.value
+        }
+        Ok((ric, base, d.next))
+    }
+
+    /// Decodes a field section (the payload of a HEADERS frame, or of a PUSH_PROMISE after its id) of
+    /// request stream `stream`. `Blocked` when it needs table entries that have not arrived: it is kept (so
+    /// the caller does not need to) and comes back from `receive_encoder`. The caller must not hand this
+    /// stream another section before then.
+    fn decode_section(inout self, stream: u64, b: List[u8]) -> Result[Outcome, Error] {
+        let (ric, base, at) = self.prefix(b)?
+        if ric > self.insert_count() {
+            if self.blocked.len() >= self.max_blocked { return Err(err(QPACK_DECOMPRESSION_FAILED, "more blocked streams than advertised")) }
+            self.blocked.push(Held(stream, ric, base, at, b))
+            return Ok(Blocked)
+        }
+        let s = self.finish(stream, b, ric, base, at)?
+        Ok(Ready(s))
+    }
+
+    fn lookup_dyn(self, abs: u64, ric: u64) -> Result[http.Header, Error] {
+        if abs >= ric { return Err(err(QPACK_DECOMPRESSION_FAILED, "a reference past the Required Insert Count")) }
+        match self.entry(abs) {
+            Some(e) => Ok(e)
+            None => Err(err(QPACK_DECOMPRESSION_FAILED, "a reference to an evicted entry"))
+        }
+    }
+
+    fn lookup_static(self, i: u64) -> Result[http.Header, Error] {
+        if i >= (self.t.stat.len() as u64) { return Err(err(QPACK_DECOMPRESSION_FAILED, "a static index out of range")) }
+        Ok(self.t.stat[i as usize])
+    }
+
+    // the lines of a field section whose Required Insert Count is available
+    fn finish(inout self, stream: u64, b: List[u8], ric: u64, base: u64, at: usize) -> Result[Section, Error] {
+        let mut fields: List[http.Header] = List.new()
+        let mut listed: usize = 0
+        let mut too_large = false
+        let mut p = at
+        while p < b.len() {
+            let c = b[p]
+            let mut f: http.Header = http.Header(List.new(), List.new())
+            if (c & 128) != 0 {
+                // indexed field line: 1 T index(6)
+                let i = failed_with(get_int(b, p, 6), QPACK_DECOMPRESSION_FAILED)?
+                p = i.next
+                if (c & 64) != 0 {
+                    f = self.lookup_static(i.value)?
+                } else {
+                    if i.value >= base { return Err(err(QPACK_DECOMPRESSION_FAILED, "a relative index below zero")) }
+                    f = self.lookup_dyn(base - 1 - i.value, ric)?
+                }
+            } else if (c & 240) == 16 {
+                // indexed field line with post-base index: 0001 index(4)
+                let i = failed_with(get_int(b, p, 4), QPACK_DECOMPRESSION_FAILED)?
+                p = i.next
+                f = self.lookup_dyn(base + i.value, ric)?
+            } else if (c & 192) == 64 {
+                // literal field line with name reference: 01 N T index(4), value
+                let i = failed_with(get_int(b, p, 4), QPACK_DECOMPRESSION_FAILED)?
+                let mut name: List[u8] = List.new()
+                if (c & 16) != 0 {
+                    name = self.lookup_static(i.value)?.name
+                } else {
+                    if i.value >= base { return Err(err(QPACK_DECOMPRESSION_FAILED, "a relative index below zero")) }
+                    name = self.lookup_dyn(base - 1 - i.value, ric)?.name
+                }
+                let v = failed_with(get_str(self.t, b, i.next, 7, self.max_string), QPACK_DECOMPRESSION_FAILED)?
+                p = v.next
+                f = http.Header(name, v.data)
+            } else if (c & 240) == 0 {
+                // literal field line with post-base name reference: 0000 N index(3), value
+                let i = failed_with(get_int(b, p, 3), QPACK_DECOMPRESSION_FAILED)?
+                let name = self.lookup_dyn(base + i.value, ric)?.name
+                let v = failed_with(get_str(self.t, b, i.next, 7, self.max_string), QPACK_DECOMPRESSION_FAILED)?
+                p = v.next
+                f = http.Header(name, v.data)
+            } else {
+                // literal field line with literal name: 001 N H name(3), value
+                let nm = failed_with(get_str(self.t, b, p, 3, self.max_string), QPACK_DECOMPRESSION_FAILED)?
+                let v = failed_with(get_str(self.t, b, nm.next, 7, self.max_string), QPACK_DECOMPRESSION_FAILED)?
+                p = v.next
+                f = http.Header(nm.data, v.data)
+            }
+            listed += entry_size(f)
+            if listed > self.max_list {
+                too_large = true
+            } else {
+                fields.push(f)
+            }
+        }
+        if ric > 0 {
+            // Section Acknowledgment: 1 stream(7); it also tells the encoder the inserts up to `ric` arrived
+            put_int(inout self.out, 7, 128, stream)
+            if ric > self.reported { self.reported = ric }
+        }
+        Ok(Section(stream, fields, too_large))
+    }
+
+    /// Stream `stream` was reset or abandoned: forgets its blocked sections and queues a Stream
+    /// Cancellation (RFC 9204 section 4.4.2) for the encoder.
+    fn cancel_stream(inout self, stream: u64) {
+        let mut i: usize = 0
+        while i < self.blocked.len() {
+            if self.blocked[i].stream == stream {
+                self.blocked.remove_range(i, i + 1)
+            } else {
+                i += 1
+            }
+        }
+        put_int(inout self.out, 6, 64, stream)
+    }
+
+    /// The bytes for our decoder stream: acknowledgments and cancellations queued so far, and an Insert
+    /// Count Increment for the entries that arrived since the encoder was last told. Empties the queue.
+    fn take_output(inout self) -> List[u8] {
+        if self.insert_count() > self.reported {
+            put_int(inout self.out, 6, 0, self.insert_count() - self.reported)
+            self.reported = self.insert_count()
+        }
+        let o = self.out.copy()
+        self.out = List.new()
+        o
+    }
+}
+
+// ---- the encoder ----
+
+/// An encoded field section and the instructions for the encoder stream that must reach the peer for it to decode.
+pub type Encoded = { section: List[u8], instructions: List[u8] }
+
+// a section the decoder has not acknowledged: its stream, Required Insert Count and the oldest entry it names
+type Pending = { stream: u64, ric: u64, min_ref: u64 }
+
+// one field line chosen: kind 0 static index, 1 dynamic index, 2 literal with static name, 3 literal with
+// dynamic name, 4 literal with literal name; `idx` is the static index or the absolute index
+type Line = { kind: u8, idx: u64, never: bool, name: List[u8], value: List[u8] }
+
+/// QPACK encoder state for one connection.
+pub type Encoder = {
+    t: Tables,
+    dyn: List[http.Header],
+    dropped: u64,
+    size: usize,
+    cap: usize,
+    /// the peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY
+    max_cap: usize,
+    /// the peer's SETTINGS_QPACK_BLOCKED_STREAMS
+    max_blocked: usize,
+    /// entries the decoder is known to have (the Known Received Count)
+    known: u64,
+    pending: List[Pending],
+    /// field names (lowercase) written as never-indexed literals, besides the built-in credentials
+    sensitive: List[List[u8]],
+    /// Huffman code string literals when that is shorter (default true)
+    huffman: bool,
+    dbuf: List[u8],
+}
+
+/// An encoder for a peer that allows a table of `max_capacity` bytes and `max_blocked` blocked streams
+/// (its SETTINGS; 0 and 0 until they are known: only the static table is used). The table's capacity is 0
+/// until `set_capacity`.
+pub fn encoder(max_capacity: usize, max_blocked: usize) -> Encoder {
+    Encoder(tables(), List.new(), 0, 0, 0, max_capacity, max_blocked, 0, List.new(), List.new(), true, List.new())
+}
+
+fn never_indexed(e: Encoder, name: List[u8]) -> bool {
+    if http.eq_s(name, "authorization") || http.eq_s(name, "proxy-authorization") { return true }
+    if http.eq_s(name, "cookie") || http.eq_s(name, "set-cookie") { return true }
+    for s in e.sensitive {
+        if bytes.eq(s, name) { return true }
+    }
+    false
+}
+
+impl Encoder {
+    /// Entries inserted so far.
+    fn insert_count(self) -> u64 { self.dropped + (self.dyn.len() as u64) }
+
+    /// Entries the decoder is known to have received.
+    fn known_received(self) -> u64 { self.known }
+
+    fn capacity(self) -> usize { self.cap }
+
+    fn table_size(self) -> usize { self.size }
+
+    /// The entries of the table, newest first (for tests).
+    fn entries(self) -> List[http.Header] {
+        let mut out: List[http.Header] = List.new()
+        let mut i = self.dyn.len()
+        while i > 0 {
+            i -= 1
+            out.push(self.dyn[i])
+        }
+        out
+    }
+
+    /// The peer's SETTINGS arrived (or changed): `max_capacity` and `max_blocked`.
+    fn set_peer_limits(inout self, max_capacity: usize, max_blocked: usize) {
+        self.max_cap = max_capacity
+        self.max_blocked = max_blocked
+    }
+
+    /// The oldest entry (absolute index) that a section the decoder has not acknowledged names: entries
+    /// from there on must not be evicted.
+    fn floor(self) -> u64 {
+        let mut f = NEVER
+        for p in self.pending {
+            if p.min_ref < f { f = p.min_ref }
+        }
+        f
+    }
+
+    /// The streams with a section that needs entries the decoder has not acknowledged.
+    fn blocked_streams(self) -> List[u64] {
+        let mut out: List[u64] = List.new()
+        for p in self.pending {
+            if p.ric > self.known && !out.contains(p.stream) { out.push(p.stream) }
+        }
+        out
+    }
+
+    /// Whether a section sent on `stream` has not been acknowledged or cancelled yet.
+    fn outstanding(self, stream: u64) -> bool {
+        for p in self.pending {
+            if p.stream == stream { return true }
+        }
+        false
+    }
+
+    /// How many streams are blocked as far as we know.
+    fn blocked_count(self) -> usize { self.blocked_streams().len() }
+
+    /// Sets the table's capacity (an instruction for the encoder stream is returned). Over the peer's
+    /// maximum, or under what is in use by sections the decoder has not acknowledged, is an error.
+    fn set_capacity(inout self, n: usize) -> Result[List[u8], Error] {
+        if n > self.max_cap { return Err(err(QPACK_ENCODER_STREAM_ERROR, "a capacity over the peer's maximum")) }
+        if n < self.size {
+            let fl = self.floor()
+            let mut freed: usize = 0
+            let mut k: usize = 0
+            while self.size - freed > n {
+                if k >= self.dyn.len() || self.dropped + (k as u64) >= fl {
+                    return Err(err(QPACK_ENCODER_STREAM_ERROR, "entries still in use would have to be evicted"))
+                }
+                freed += entry_size(self.dyn[k])
+                k += 1
+            }
+            self.dyn.remove_range(0, k)
+            self.dropped += k as u64
+            self.size -= freed
+        }
+        self.cap = n
+        let mut out: List[u8] = List.new()
+        put_int(inout out, 5, 32, n as u64)
+        Ok(out)
+    }
+
+    /// Makes room for an entry of `sz` bytes by evicting the oldest entries below `floor`: false (and nothing
+    /// evicted) when that is not possible.
+    fn make_room(inout self, sz: usize, floor: u64) -> bool {
+        if sz > self.cap { return false }
+        let mut freed: usize = 0
+        let mut k: usize = 0
+        while self.size - freed + sz > self.cap {
+            if k >= self.dyn.len() { return false }
+            if self.dropped + (k as u64) >= floor { return false }
+            freed += entry_size(self.dyn[k])
+            k += 1
+        }
+        if k > 0 {
+            self.dyn.remove_range(0, k)
+            self.dropped += k as u64
+            self.size -= freed
+        }
+        true
+    }
+
+    /// The absolute index of the newest entry equal to `f`, and of the newest with its name (-1: none).
+    fn find_dyn(self, f: http.Header) -> (i64, i64) {
+        let mut name_at: i64 = -1
+        let mut k = self.dyn.len()
+        while k > 0 {
+            k -= 1
+            let s = self.dyn[k]
+            if bytes.eq(s.name, f.name) {
+                let abs = (self.dropped as i64) + (k as i64)
+                if bytes.eq(s.value, f.value) { return (abs, abs) }
+                if name_at < 0 { name_at = abs }
+            }
+        }
+        (-1, name_at)
+    }
+
+    /// The static index of the field equal to `f`, and of one with its name (-1: none).
+    fn find_static(self, f: http.Header) -> (i64, i64) {
+        let mut name_at: i64 = -1
+        for i in 0..self.t.stat.len() {
+            let s = self.t.stat[i as usize]
+            if bytes.eq(s.name, f.name) {
+                if bytes.eq(s.value, f.value) { return (i as i64, i as i64) }
+                if name_at < 0 { name_at = i as i64 }
+            }
+        }
+        (-1, name_at)
+    }
+
+    // the Insert instruction for `f`, written to `out`, and the entry added; `name_abs` (-1: none) is a dynamic
+    // entry with its name, `name_static` (-1: none) a static one
+    fn do_insert(inout self, f: http.Header, name_static: i64, name_abs: i64, inout out: List[u8]) {
+        if name_static >= 0 {
+            put_int(inout out, 6, 192, name_static as u64)
+            put_str(self.t, inout out, 7, 0, f.value, self.huffman)
+        } else if name_abs >= 0 {
+            put_int(inout out, 6, 128, self.insert_count() - 1 - (name_abs as u64))
+            put_str(self.t, inout out, 7, 0, f.value, self.huffman)
+        } else {
+            put_str(self.t, inout out, 5, 64, f.name, self.huffman)
+            put_str(self.t, inout out, 7, 0, f.value, self.huffman)
+        }
+        self.size += entry_size(f)
+        self.dyn.push(f)
+    }
+
+    /// Inserts `f` into the table if it fits (evicting what is not in use): the instruction for the encoder
+    /// stream, or empty when nothing was inserted (no capacity, too large, or everything in use).
+    fn insert_field(inout self, f: http.Header) -> List[u8] {
+        let mut out: List[u8] = List.new()
+        let (sx, sn) = self.find_static(f)
+        let (dx, dn) = self.find_dyn(f)
+        let floor0 = self.floor()
+        let mut floor = floor0
+        if sn < 0 && dn >= 0 && (dn as u64) < floor { floor = dn as u64 }
+        if !self.make_room(entry_size(f), floor) { return out }
+        let nd: i64 = if sn < 0 && dn >= 0 && (dn as u64) >= self.dropped { dn } else { -1 }
+        self.do_insert(f, sn, nd, inout out)
+        out
+    }
+
+    /// Duplicates the entry with absolute index `abs` (RFC 9204 section 3.2.4), which keeps a popular but
+    /// old entry from being evicted: the instruction, or empty when it is not in the table or there is no room.
+    fn duplicate(inout self, abs: u64) -> List[u8] {
+        let mut out: List[u8] = List.new()
+        if abs < self.dropped || abs >= self.insert_count() { return out }
+        let e = self.dyn[(abs - self.dropped) as usize].copy()
+        let mut floor = self.floor()
+        if abs < floor { floor = abs }
+        if !self.make_room(entry_size(e), floor) { return out }
+        let rel = self.insert_count() - 1 - abs
+        put_int(inout out, 5, 0, rel)
+        self.size += entry_size(e)
+        self.dyn.push(e)
+        out
+    }
+
+    /// Encodes a field section for request stream `stream`: the section for its HEADERS frame and the
+    /// instructions for the encoder stream (write them before, or at least not after, the section is
+    /// delivered: a decoder that gets the section first blocks that stream until the instructions arrive).
+    fn encode(inout self, stream: u64, fields: List[http.Header]) -> Encoded {
+        let base = self.insert_count()
+        let mut instr: List[u8] = List.new()
+        let bs = self.blocked_streams()
+        let may_block = bs.contains(stream) || bs.len() < self.max_blocked
+        let mut blocking = false
+        let mut max_ref: i64 = -1
+        let mut min_ref: u64 = NEVER
+        let mut lines: List[Line] = List.new()
+        for f in fields {
+            let secret = never_indexed(self, f.name)
+            let (sx, sn) = self.find_static(f)
+            if sx >= 0 && !secret {
+                lines.push(Line(0, sx as u64, false, List.new(), List.new()))
+                continue
+            }
+            let (dx, dn0) = self.find_dyn(f)
+            if !secret && dx >= 0 && ((dx as u64) < self.known || blocking || may_block) {
+                if (dx as u64) >= self.known { blocking = true }
+                if dx > max_ref { max_ref = dx }
+                if (dx as u64) < min_ref { min_ref = dx as u64 }
+                lines.push(Line(1, dx as u64, false, List.new(), List.new()))
+                continue
+            }
+            let mut done = false
+            if !secret && self.cap > 0 {
+                // index it: refer to it at once only when we may block, else as a literal this time
+                let mut floor = self.floor()
+                if min_ref < floor { floor = min_ref }
+                if sn < 0 && dn0 >= 0 && (dn0 as u64) < floor { floor = dn0 as u64 }
+                if self.make_room(entry_size(f), floor) {
+                    let nd: i64 = if sn < 0 && dn0 >= 0 && (dn0 as u64) >= self.dropped { dn0 } else { -1 }
+                    self.do_insert(f, sn, nd, inout instr)
+                    if blocking || may_block {
+                        let abs = self.insert_count() - 1
+                        blocking = true
+                        if (abs as i64) > max_ref { max_ref = abs as i64 }
+                        if abs < min_ref { min_ref = abs }
+                        lines.push(Line(1, abs, false, List.new(), List.new()))
+                        done = true
+                    }
+                }
+            }
+            if done { continue }
+            if sn >= 0 {
+                lines.push(Line(2, sn as u64, secret, List.new(), f.value))
+                continue
+            }
+            let (dx2, dn) = self.find_dyn(f)
+            if !secret && dn >= 0 && ((dn as u64) < self.known || blocking || may_block) {
+                if (dn as u64) >= self.known { blocking = true }
+                if dn > max_ref { max_ref = dn }
+                if (dn as u64) < min_ref { min_ref = dn as u64 }
+                lines.push(Line(3, dn as u64, false, List.new(), f.value))
+                continue
+            }
+            lines.push(Line(4, 0, secret, f.name, f.value))
+        }
+        let ric: u64 = if max_ref < 0 { 0 } else { (max_ref as u64) + 1 }
+        // the field section prefix (RFC 9204 section 4.5.1): the encoded Required Insert Count, the Base
+        let mut sec: List[u8] = List.new()
+        if ric == 0 {
+            put_int(inout sec, 8, 0, 0)
+        } else {
+            let me = (self.max_cap / 32) as u64
+            put_int(inout sec, 8, 0, (ric % (2 * me)) + 1)
+        }
+        if base < ric {
+            put_int(inout sec, 7, 128, ric - base - 1)
+        } else {
+            put_int(inout sec, 7, 0, base - ric)
+        }
+        for l in lines {
+            if l.kind == 0 {
+                put_int(inout sec, 6, 192, l.idx)
+            } else if l.kind == 1 {
+                if l.idx < base {
+                    put_int(inout sec, 6, 128, base - 1 - l.idx)
+                } else {
+                    put_int(inout sec, 4, 16, l.idx - base)
+                }
+            } else if l.kind == 2 {
+                put_int(inout sec, 4, if l.never { 112 } else { 80 }, l.idx)
+                put_str(self.t, inout sec, 7, 0, l.value, self.huffman)
+            } else if l.kind == 3 {
+                if l.idx < base {
+                    put_int(inout sec, 4, 64, base - 1 - l.idx)
+                } else {
+                    put_int(inout sec, 3, 0, l.idx - base)
+                }
+                put_str(self.t, inout sec, 7, 0, l.value, self.huffman)
+            } else {
+                put_str(self.t, inout sec, 3, if l.never { 48 } else { 32 }, l.name, self.huffman)
+                put_str(self.t, inout sec, 7, 0, l.value, self.huffman)
+            }
+        }
+        if ric > 0 { self.pending.push(Pending(stream, ric, min_ref)) }
+        Encoded(sec, instr)
+    }
+
+    /// Bytes read from the peer's decoder stream: section acknowledgments, stream cancellations and insert count
+    /// increments (RFC 9204 section 4.4). An error is a connection error (QPACK_DECODER_STREAM_ERROR).
+    fn receive_decoder(inout self, data: List[u8]) -> Result[(), Error] {
+        if self.dbuf.len() > 0 && data.len() > 0 { bytes.append(inout self.dbuf, data) } else if data.len() > 0 { self.dbuf = data }
+        let mut p: usize = 0
+        while p < self.dbuf.len() {
+            let c = self.dbuf[p]
+            if (c & 128) != 0 {
+                let i = match get_int(self.dbuf, p, 7) {
+                    Ok(x) => x
+                    Err(e) => {
+                        if e.code == INCOMPLETE { break }
+                        return Err(Error(QPACK_DECODER_STREAM_ERROR, e.why))
+                    }
+                }
+                p = i.next
+                // the oldest section of that stream not yet acknowledged
+                let mut at: i64 = -1
+                for k in 0..self.pending.len() {
+                    if at < 0 && self.pending[k as usize].stream == i.value { at = k as i64 }
+                }
+                if at < 0 { return Err(err(QPACK_DECODER_STREAM_ERROR, "an acknowledgment of a section that was not sent")) }
+                let sec = self.pending[at as usize].copy()
+                self.pending.remove_range(at as usize, (at as usize) + 1)
+                if sec.ric > self.known { self.known = sec.ric }
+            } else if (c & 64) != 0 {
+                let i = match get_int(self.dbuf, p, 6) {
+                    Ok(x) => x
+                    Err(e) => {
+                        if e.code == INCOMPLETE { break }
+                        return Err(Error(QPACK_DECODER_STREAM_ERROR, e.why))
+                    }
+                }
+                p = i.next
+                let mut k: usize = 0
+                while k < self.pending.len() {
+                    if self.pending[k].stream == i.value {
+                        self.pending.remove_range(k, k + 1)
+                    } else {
+                        k += 1
+                    }
+                }
+            } else {
+                let i = match get_int(self.dbuf, p, 6) {
+                    Ok(x) => x
+                    Err(e) => {
+                        if e.code == INCOMPLETE { break }
+                        return Err(Error(QPACK_DECODER_STREAM_ERROR, e.why))
+                    }
+                }
+                p = i.next
+                if i.value == 0 { return Err(err(QPACK_DECODER_STREAM_ERROR, "an Insert Count Increment of zero")) }
+                if i.value > self.insert_count() - self.known { return Err(err(QPACK_DECODER_STREAM_ERROR, "an Insert Count Increment past the Insert Count")) }
+                self.known += i.value
+            }
+        }
+        if p > 0 { self.dbuf.remove_range(0, p) }
+        Ok(())
+    }
+}

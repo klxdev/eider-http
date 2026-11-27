@@ -1,0 +1,504 @@
+// http/qpack: the static table (all 99 entries; checked against libnghttp3 by tests/qpack_interop.sh), the RFC 9204
+// appendix B examples in both directions (the decoder reads the RFC's bytes, the encoder writes them), blocked streams,
+// eviction and the rules that keep entries in use, the limits, a corpus of malformed input refused with the code the
+// RFC names, and a deterministic round-trip of many field sections through a small table.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import http
+import http.qpack
+
+fn say(s: String) uses io { io.outln(s.bytes()) }
+fn note(s: str) uses io { say(String.from(s)) }
+
+fn cat(a: String, b: String) -> String {
+    let mut l = a.copy()
+    l.append(b)
+    l
+}
+
+fn msg(a: str, b: String) -> String { cat(String.from(a), b) }
+
+fn hx(b: List[u8]) -> String { encoding.hex(b) }
+
+fn unhex(s: str) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut hi: i32 = -1
+    for c in sys.lit(s) {
+        let v: i32 = if c >= 48 && c <= 57 { (c as i32) - 48 } else if c >= 97 && c <= 102 { (c as i32) - 87 } else { -1 }
+        if v < 0 { continue }
+        if hi < 0 {
+            hi = v
+        } else {
+            out.push((hi * 16 + v) as u8)
+            hi = -1
+        }
+    }
+    out
+}
+
+/// "name=value|name=value": a list of fields (the first = of each splits it)
+fn fl(spec: str) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    let mut name: List[u8] = List.new()
+    let mut value: List[u8] = List.new()
+    let mut in_value = false
+    for c in sys.lit(spec) {
+        if c == 124 {
+            out.push(http.Header(name.copy(), value.copy()))
+            name.clear()
+            value.clear()
+            in_value = false
+        } else if c == 61 && !in_value {
+            in_value = true
+        } else if in_value {
+            value.push(c)
+        } else {
+            name.push(c)
+        }
+    }
+    out.push(http.Header(name.copy(), value.copy()))
+    out
+}
+
+fn fld(n: str, v: str) -> http.Header { http.Header(n.bytes(), v.bytes()) }
+
+fn txt(b: List[u8]) -> String { sys.to_string(b) }
+
+fn fields_text(fs: List[http.Header]) -> String {
+    let mut l = String.from("")
+    for f in fs {
+        l.append(txt(f.name))
+        l.push_str("=")
+        l.append(txt(f.value))
+        l.push_str("; ")
+    }
+    l
+}
+
+fn same(a: List[http.Header], b: List[http.Header]) -> bool {
+    if a.len() != b.len() { return false }
+    for i in 0..a.len() {
+        if !bytes.eq(a[i as usize].name, b[i as usize].name) || !bytes.eq(a[i as usize].value, b[i as usize].value) { return false }
+    }
+    true
+}
+
+fn table_text(es: List[http.Header], newest_abs: u64) -> String {
+    // newest first, with absolute indexes
+    let mut l = String.from("  table:")
+    let mut abs = newest_abs
+    for e in es {
+        l.push_str(" [")
+        l.append(abs.to_string())
+        l.push_str("] ")
+        l.append(txt(e.name))
+        l.push_str("=")
+        l.append(txt(e.value))
+        if abs > 0 { abs -= 1 }
+    }
+    l
+}
+
+fn show_err(r: String, e: qpack.Error) -> String {
+    let mut l = r.copy()
+    l.push_str(" -> error ")
+    l.append(e.code.to_string())
+    l
+}
+
+/// Feeds the encoder stream bytes and prints what became ready.
+fn enc_in(inout d: qpack.Decoder, label: str, b: List[u8]) uses io {
+    match d.receive_encoder(b) {
+        Ok(ready) => {
+            let mut l = String.from(label)
+            l.push_str(": ok, unblocked ")
+            l.append(ready.len().to_string())
+            for s in ready {
+                l.push_str(" [stream ")
+                l.append(s.stream.to_string())
+                l.push_str(": ")
+                l.append(fields_text(s.fields))
+                l.push_str("]")
+            }
+            say(l)
+        }
+        Err(e) => { say(show_err(String.from(label), e)) }
+    }
+}
+
+fn sec_in(inout d: qpack.Decoder, stream: u64, b: List[u8]) uses io {
+    let mut l = String.from("section on stream ")
+    l.append(stream.to_string())
+    l.push_str(": ")
+    match d.decode_section(stream, b) {
+        Ok(o) => {
+            match o {
+                qpack.Ready(s) => {
+                    l.append(fields_text(s.fields))
+                    if s.too_large { l.push_str("(too large)") }
+                }
+                qpack.Blocked => { l.push_str("blocked") }
+            }
+        }
+        Err(e) => { l = show_err(l, e) }
+    }
+    say(l)
+}
+
+fn sec_case(inout d: qpack.Decoder, label: str, h: str) uses io {
+    let mut l = String.from(label)
+    l.push_str(": ")
+    match d.decode_section(0, unhex(h)) {
+        Ok(o) => {
+            match o {
+                qpack.Ready(s) => { l.append(fields_text(s.fields)) }
+                qpack.Blocked => { l.push_str("blocked") }
+            }
+        }
+        Err(e) => { l = show_err(l, e) }
+    }
+    say(l)
+}
+
+fn check(label: str, got: List[u8], want: str) uses io {
+    let mut l = String.from(label)
+    l.push_str(": ")
+    l.append(hx(got))
+    if !bytes.eq(got, unhex(want)) {
+        l.push_str(" MISMATCH, RFC has ")
+        l.append(String.from(want))
+    }
+    say(l)
+}
+
+fn main() uses io {
+    note("-- static table")
+    let t = qpack.tables()
+    say(msg("entries: ", t.stat.len().to_string()))
+    for i in 0..t.stat.len() {
+        let e = t.stat[i as usize]
+        let mut l = i.to_string()
+        l.push_str(" ")
+        l.append(txt(e.name))
+        l.push_str(": ")
+        l.append(txt(e.value))
+        say(l)
+    }
+
+    note("-- RFC 9204 appendix B, the decoder reading the RFC's bytes")
+    let mut d = qpack.decoder(220, 4, 65536)
+    note("B.1")
+    sec_in(inout d, 0, unhex("0000 510b 2f69 6e64 6578 2e68 746d 6c"))
+    note("B.2")
+    enc_in(inout d, "encoder stream", unhex("3fbd01 c00f 7777772e6578616d706c652e636f6d c10c 2f73616d706c652f70617468"))
+    say(table_text(d.entries(), d.insert_count() - 1))
+    sec_in(inout d, 4, unhex("0381 10 11"))
+    say(msg("  decoder stream: ", hx(d.take_output())))
+    note("B.3")
+    enc_in(inout d, "encoder stream", unhex("4a63 7573 746f 6d2d 6b65 79 0c63 7573 746f 6d2d 7661 6c75 65"))
+    say(msg("  decoder stream: ", hx(d.take_output())))
+    note("B.4")
+    enc_in(inout d, "encoder stream", unhex("02"))
+    sec_in(inout d, 8, unhex("0500 80 c1 81"))
+    d.cancel_stream(8)
+    // the acknowledgment of stream 8 was queued before the cancellation; the RFC's example has only the cancellation
+    // because there the section never reached the decoder, so the section is read on a fresh decoder below
+    say(table_text(d.entries(), d.insert_count() - 1))
+    note("B.5")
+    enc_in(inout d, "encoder stream", unhex("810d 6375 7374 6f6d 2d76 616c 7565 32"))
+    say(table_text(d.entries(), d.insert_count() - 1))
+    say(msg("  table size: ", d.table_size().to_string()))
+    // B.4 as the RFC has it: the encoder stream data is delayed, so the section blocks, then the stream is cancelled
+    let mut d2 = qpack.decoder(220, 4, 65536)
+    let a = d2.receive_encoder(unhex("3fbd01 c00f 7777772e6578616d706c652e636f6d c10c 2f73616d706c652f70617468 4a637573746f6d2d6b6579 0c637573746f6d2d76616c7565"))
+    sec_in(inout d2, 8, unhex("0500 80 c1 81"))
+    say(msg("B.4 with the duplicate delayed, blocked streams: ", d2.blocked_count().to_string()))
+    d2.cancel_stream(8)
+    say(msg("  after the cancellation: ", d2.blocked_count().to_string()))
+    say(msg("  decoder stream: ", hx(d2.take_output())))
+    enc_in(inout d2, "the delayed duplicate", unhex("02"))
+
+    note("-- RFC 9204 appendix B, the encoder writing the RFC's bytes (no Huffman coding, as in the RFC)")
+    let mut e = qpack.encoder(220, 4)
+    e.huffman = false
+    let mut ex = e.encode(0, fl(":path=/index.html"))
+    check("B.1 section", ex.section, "0000 510b 2f69 6e64 6578 2e68 746d 6c")
+    say(msg("  instructions: ", hx(ex.instructions)))
+    match e.set_capacity(220) {
+        Ok(i) => { check("B.2 set capacity", i, "3fbd01") }
+        Err(x) => { note("set_capacity failed") }
+    }
+    let mut ins: List[u8] = List.new()
+    let ex2 = e.encode(4, fl(":authority=www.example.com|:path=/sample/path"))
+    check("B.2 encoder stream", ex2.instructions, "c00f 7777772e6578616d706c652e636f6d c10c 2f73616d706c652f70617468")
+    check("B.2 section", ex2.section, "0381 10 11")
+    match e.receive_decoder(unhex("84")) {
+        Ok(x) => { say(msg("  known received after the acknowledgment: ", e.known_received().to_string())) }
+        Err(x) => { say(show_err(String.from("ack"), x)) }
+    }
+    check("B.3 speculative insert", e.insert_field(fld("custom-key", "custom-value")), "4a63 7573 746f 6d2d 6b65 79 0c63 7573 746f 6d2d 7661 6c75 65")
+    match e.receive_decoder(unhex("01")) {
+        Ok(x) => { say(msg("  known received after the increment: ", e.known_received().to_string())) }
+        Err(x) => { say(show_err(String.from("increment"), x)) }
+    }
+    check("B.4 duplicate", e.duplicate(0), "02")
+    let ex4 = e.encode(8, fl(":authority=www.example.com|:path=/|custom-key=custom-value"))
+    check("B.4 section", ex4.section, "0500 80 c1 81")
+    say(msg("  instructions: ", hx(ex4.instructions)))
+    say(msg("  streams blocked (the section names the unacknowledged duplicate): ", e.blocked_count().to_string()))
+    match e.receive_decoder(unhex("48")) {
+        Ok(x) => { say(msg("  after the cancellation, blocked: ", e.blocked_count().to_string())) }
+        Err(x) => { say(show_err(String.from("cancel"), x)) }
+    }
+    check("B.5 insert with a name reference, evicting the oldest", e.insert_field(fld("custom-key", "custom-value2")), "810d 6375 7374 6f6d 2d76 616c 7565 32")
+    say(table_text(e.entries(), e.insert_count() - 1))
+    say(msg("  table size: ", e.table_size().to_string()))
+
+    note("-- a section that arrives before its table entries blocks, and comes out of receive_encoder")
+    let mut b = qpack.decoder(220, 2, 65536)
+    sec_in(inout b, 4, unhex("0381 10 11"))
+    sec_in(inout b, 8, unhex("0381 10 11"))
+    sec_in(inout b, 12, unhex("0381 10 11"))
+    say(msg("blocked streams: ", b.blocked_count().to_string()))
+    enc_in(inout b, "half the instructions", unhex("3fbd01 c00f 7777772e6578616d706c652e636f6d"))
+    say(msg("blocked streams: ", b.blocked_count().to_string()))
+    enc_in(inout b, "the instruction split mid-string", unhex("c10c 2f73616d70"))
+    enc_in(inout b, "its rest", unhex("6c652f70617468"))
+    say(msg("  decoder stream: ", hx(b.take_output())))
+
+    note("-- every proper prefix of the encoder stream is accepted and gives the same table")
+    let full = unhex("3fbd01 c00f 7777772e6578616d706c652e636f6d c10c 2f73616d706c652f70617468 4a637573746f6d2d6b6579 0c637573746f6d2d76616c7565 02")
+    let mut bad = 0
+    for cut in 0..full.len() + 1 {
+        let mut p = qpack.decoder(220, 2, 65536)
+        let r1 = p.receive_encoder(full.slice(0, cut as usize))
+        let r2 = p.receive_encoder(full.slice(cut as usize, full.len()))
+        match r1 {
+            Ok(x) => {}
+            Err(x) => { bad += 1 }
+        }
+        match r2 {
+            Ok(x) => {}
+            Err(x) => { bad += 1 }
+        }
+        if p.insert_count() != 4 || p.table_size() != 217 { bad += 1 }
+    }
+    say(msg("splits that did not give four entries of 217 bytes: ", bad.to_string()))
+
+    note("-- malformed and unusual field sections (table: 0 :authority=www.example.com, 1 :path=/sample/path; one blocked stream allowed)")
+    let mut m = qpack.decoder(220, 1, 65536)
+    let _i = m.receive_encoder(unhex("3fbd01 c00f 7777772e6578616d706c652e636f6d c10c 2f73616d706c652f70617468"))
+    sec_case(inout m, "empty", "")
+    sec_case(inout m, "a Required Insert Count and no Base", "00")
+    sec_case(inout m, "a truncated static index", "0000 ff")
+    sec_case(inout m, "static index 63", "0000 ff00")
+    sec_case(inout m, "static index 0", "0000 c0")
+    sec_case(inout m, "static index 98, the last", "0000 ff23")
+    sec_case(inout m, "static index 99", "0000 ff24")
+    sec_case(inout m, "a truncated name index", "0000 5f")
+    sec_case(inout m, "a truncated string", "0000 510b 2f69")
+    sec_case(inout m, "dynamic index 0 with Base 0", "0000 80")
+    sec_case(inout m, "post-base index 0 with no entries required", "0000 10")
+    sec_case(inout m, "RIC 1, Base 1, dynamic index 0 (entry 0)", "0200 80")
+    sec_case(inout m, "RIC 2, post-base index 2 (past the RIC)", "0381 12")
+    sec_case(inout m, "RIC 2, the same field line three times", "0381 11 11 11")
+    sec_case(inout m, "RIC 3 (entry 2 not inserted yet): blocks", "0481 10")
+    sec_case(inout m, "a second blocked stream (the limit is 1)", "0481 10")
+    sec_case(inout m, "an encoded RIC over twice the maximum entries", "0d00 80")
+    sec_case(inout m, "RIC 2, Base 4, post-base 0 is entry 4", "0382 10")
+    sec_case(inout m, "RIC 1, S=1, delta 1: a negative Base", "0281 11")
+    sec_case(inout m, "an encoded RIC of 1 with no table at all", "0100")
+    sec_case(inout m, "a literal name cut short", "0000 2185")
+    sec_case(inout m, "a Huffman string with the EOS code", "0000 51 84 ffffffff")
+    sec_case(inout m, "a Huffman string with bad padding", "0000 51 81 00")
+    sec_case(inout m, "an integer over 2^62", "0000 5f ffffffffffffffffff7f")
+    sec_case(inout m, "a literal with a post-base name past the RIC", "0381 03 01 61")
+    say(msg("blocked streams: ", m.blocked_count().to_string()))
+    let mut nt = qpack.decoder(0, 0, 65536)
+    sec_case(inout nt, "a decoder with no table, RIC 1", "0200 80")
+
+    note("-- malformed encoder stream")
+    // (an instruction that is cut short is not an error: the decoder waits for the rest)
+    for h in ["3fff03", "3fbd01 c000", "3fbd01 c05b", "3fbd01 8100", "3fbd01 01", "3fbd01 c10c 2f73616d706c652f70617468 05", "3fbd01 c10c 2f73616d706c652f70617468 0200", "20 c00f 7777772e6578616d706c652e636f6d", "3fbd01 4a637573746f6d2d6b6579 ffffffffffffffffffff01", "3fbd01 c1ff", "3fbd01 7f"] {
+        let mut x = qpack.decoder(220, 1, 65536)
+        enc_in(inout x, h, unhex(h))
+    }
+    let mut cap = qpack.decoder(220, 1, 65536)
+    enc_in(inout cap, "capacity 221", unhex("3fbe01"))
+    let mut big = qpack.decoder(220, 1, 65536)
+    let mut bigi = unhex("3fbd01 4a637573746f6d2d6b6579 7f34")
+    bigi.extend(List.filled(97, 179))
+    enc_in(inout big, "an entry of 221 bytes (capacity 220)", bigi)
+    let mut fits = qpack.decoder(220, 1, 65536)
+    let mut fitsi = unhex("3fbd01 4a637573746f6d2d6b6579 7f33")
+    fitsi.extend(List.filled(97, 178))
+    enc_in(inout fits, "an entry of 220 bytes (capacity 220)", fitsi)
+
+    note("-- the decoder's limits")
+    let mut lim = qpack.decoder(220, 1, 100)
+    let _j = lim.receive_encoder(unhex("3fbd01 c00f 7777772e6578616d706c652e636f6d c10c 2f73616d706c652f70617468"))
+    let mut cut = qpack.decoder(220, 1, 120)
+    let _k = cut.receive_encoder(unhex("3fbd01 c00f 7777772e6578616d706c652e636f6d c10c 2f73616d706c652f70617468"))
+    note("two fields of 57 and 49 bytes: limit 120, then limit 100 (decoded to the end, the fields over the limit dropped)")
+    sec_in(inout cut, 0, unhex("0381 10 11"))
+    sec_in(inout lim, 0, unhex("0381 10 11"))
+    let mut sl = qpack.decoder(220, 1, 65536)
+    sl.max_string = 4
+    note("max_string 4: an 11-byte value, then a 3-byte one")
+    sec_in(inout sl, 0, unhex("0000 510b 2f69 6e64 6578 2e68 746d 6c"))
+    sec_in(inout sl, 0, unhex("0000 5103 2f69 6e"))
+
+    note("-- the decoder stream")
+    let mut e2 = qpack.encoder(220, 1)
+    let _s = e2.set_capacity(220)
+    let q1 = e2.encode(4, fl("x-token=abc"))
+    say(msg("  a section that names the new entry: ", hx(q1.section)))
+    say(msg("  blocked streams: ", e2.blocked_count().to_string()))
+    let q2 = e2.encode(8, fl("x-other=def"))
+    say(msg("  a second stream may not block (limit 1): ", hx(q2.section)))
+    say(msg("  instructions: ", hx(q2.instructions)))
+    for h in ["88", "89", "00", "01", "05", "3f", "c0", "ff"] {
+        let mut x = qpack.encoder(220, 1)
+        let _a = x.set_capacity(220)
+        let _b = x.encode(4, fl("x-token=abc"))
+        match x.receive_decoder(unhex(h)) {
+            Ok(r) => { say(msg("decoder stream ", cat(String.from(h), String.from(": accepted")))) }
+            Err(x2) => { say(show_err(msg("decoder stream ", String.from(h)), x2)) }
+        }
+    }
+    let mut y = qpack.encoder(220, 1)
+    let _c = y.set_capacity(220)
+    let _d = y.encode(130, fl("x-token=abc"))
+    let _e = y.receive_decoder(unhex("ff"))
+    say(msg("  an acknowledgment of stream 130 split across reads, pending sections after the first half: ", y.blocked_count().to_string()))
+    match y.receive_decoder(unhex("03")) {
+        Ok(r) => { say(msg("  accepted, known received: ", y.known_received().to_string())) }
+        Err(x2) => { say(show_err(String.from("  split integer"), x2)) }
+    }
+    say(msg("  capacity over the maximum: ", match y.set_capacity(221) { Ok(r) => String.from("accepted"), Err(x3) => String.from("refused") }))
+
+    note("-- credentials are never indexed")
+    let mut c = qpack.encoder(4096, 4)
+    let _z = c.set_capacity(4096)
+    let cx = c.encode(0, fl("cookie=a=b|authorization=Bearer x|x-secret=s|x-plain=p"))
+    say(msg("instructions (only x-secret and x-plain are indexed): ", hx(cx.instructions)))
+    say(msg("section (cookie and authorization are never-indexed literals with a static name): ", hx(cx.section)))
+    c.sensitive.push("x-secret".bytes())
+    let cy = c.encode(4, fl("x-secret=s2|x-secret=s2"))
+    say(msg("instructions with x-secret sensitive: ", hx(cy.instructions)))
+    say(table_text(c.entries(), c.insert_count() - 1))
+
+    note("-- entries named by an unacknowledged section are not evicted")
+    let mut pe = qpack.encoder(200, 4)
+    pe.huffman = false
+    let _p = pe.set_capacity(100)
+    check("insert a", pe.insert_field(fld("x-a", "1")), "4378 2d61 0131")
+    check("insert b", pe.insert_field(fld("x-b", "2")), "4378 2d62 0132")
+    let pe1 = pe.encode(4, fl("x-a=1"))
+    say(msg("a section naming entry 0: ", hx(pe1.section)))
+    check("insert c (needs room: 0 is in use, so nothing may be evicted)", pe.insert_field(fld("x-c", "3")), "")
+    match pe.set_capacity(60) {
+        Ok(r) => { note("shrinking to 60 evicted entries in use") }
+        Err(x) => { say(show_err(String.from("shrinking the table below what is in use"), x)) }
+    }
+    let _q = pe.receive_decoder(unhex("84"))
+    check("after the acknowledgment, insert c evicts entry 0", pe.insert_field(fld("x-c", "3")), "4378 2d63 0133")
+    say(table_text(pe.entries(), pe.insert_count() - 1))
+    say(msg("known received: ", pe.known_received().to_string()))
+
+    note("-- many sections through a small table (eviction, unacknowledged sections, blocked streams)")
+    let mut en = qpack.encoder(300, 3)
+    let mut de = qpack.decoder(300, 3, 65536)
+    match en.set_capacity(300) {
+        Ok(i) => {
+            match de.receive_encoder(i) {
+                Ok(x) => {}
+                Err(x) => { note("SET CAPACITY REFUSED") }
+            }
+        }
+        Err(x) => { note("SET CAPACITY FAILED") }
+    }
+    let mut seed: u64 = 12345
+    let mut sent: List[List[http.Header]] = List.new()
+    let mut mism: i32 = 0
+    let mut sections: i32 = 0
+    let mut blocked_seen: i32 = 0
+    let mut fails: i32 = 0
+    let mut pending_enc: List[u8] = unhex("3fac01").slice(0, 0)
+    let names = ["x-a", "x-b", "x-c", "content-type", "accept", "x-long-header-name-one", "user-agent", ":path"]
+    let vals = ["1", "2", "gzip", "text/html", "v-two", "a-rather-long-value-number-three-abcdefghijklmnop", "/index", "/other"]
+    let mut stream: u64 = 0
+    for round in 0..300 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let n = 1 + (seed >> (16 as u64)) % 4
+        let mut fs: List[http.Header] = List.new()
+        for k in 0..n {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            let a = ((seed >> (12 as u64)) % 8) as usize
+            let bb = ((seed >> (20 as u64)) % 8) as usize
+            fs.push(fld(names[a], vals[bb]))
+        }
+        stream += 4
+        let r = en.encode(stream, fs)
+        sections += 1
+        // deliver the instructions late on every third round, to make streams block
+        let ins = r.instructions.copy()
+        if round % 3 == 0 {
+            pending_enc.extend(ins)
+            let mut got = false
+            match de.decode_section(stream, r.section) {
+                Ok(o) => {
+                    match o {
+                        qpack.Ready(s) => { got = true
+                            if !same(s.fields, fs) { mism += 1 } }
+                        qpack.Blocked => { blocked_seen += 1 }
+                    }
+                }
+                Err(x) => { fails += 1 }
+            }
+            match de.receive_encoder(pending_enc) {
+                Ok(ready) => {
+                    for s in ready {
+                        if s.stream == stream && !same(s.fields, fs) { mism += 1 }
+                        if s.stream == stream { got = true }
+                    }
+                }
+                Err(x) => { fails += 1 }
+            }
+            if !got { mism += 1 }
+            pending_enc = List.new()
+        } else {
+            pending_enc.extend(ins)
+            match de.receive_encoder(pending_enc) {
+                Ok(ready) => {}
+                Err(x) => { fails += 1 }
+            }
+            pending_enc = List.new()
+            match de.decode_section(stream, r.section) {
+                Ok(o) => {
+                    match o {
+                        qpack.Ready(s) => { if !same(s.fields, fs) { mism += 1 } }
+                        qpack.Blocked => { mism += 1 }
+                    }
+                }
+                Err(x) => { fails += 1 }
+            }
+        }
+        // the decoder's stream goes to the encoder
+        match en.receive_decoder(de.take_output()) {
+            Ok(x) => {}
+            Err(x) => { fails += 1 }
+        }
+    }
+    say(msg("sections: ", sections.to_string()))
+    say(msg("mismatches: ", mism.to_string()))
+    say(msg("failures: ", fails.to_string()))
+    say(msg("both tables agree on the insert count: ", String.from(if en.insert_count() == de.insert_count() { "yes" } else { "NO" })))
+    say(msg("both tables agree on the size: ", String.from(if en.table_size() == de.table_size() { "yes" } else { "NO" })))
+    say(msg("blocked at some point: ", String.from(if blocked_seen > 0 { "yes" } else { "no" })))
+    say(msg("table within capacity: ", String.from(if en.table_size() <= 300 { "yes" } else { "NO" })))
+    note("done")
+}
