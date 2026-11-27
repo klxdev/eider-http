@@ -1,0 +1,332 @@
+// http/jwt: RFC 7515 Appendix A.1 and the jwt.io HS256 vectors, tokens signed by OpenSSL (RS256,
+// RS384, PS256, ES256, ES384, EdDSA) and by python's hmac (HS256, HS512) and verified here, signing
+// round trips, JWKS, and the negatives: tampering, `none`, algorithm confusion, expiry, wrong
+// issuer or audience, unknown kid, crit, duplicated members, padding, size.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import crypto
+import http.jwt
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn now() -> i64 { 1800000000 }
+
+fn show(label: str, r: Result[jwt.Claims, jwt.Error]) uses io { show_b(lit(label), r) }
+
+fn c_rsa(n: List[u8], e: List[u8]) -> crypto.RsaPublic { crypto.rsa_public_from_ne(n, e).unwrap() }
+fn c_rsa_priv(der: List[u8]) -> crypto.RsaPrivate { crypto.rsa_private_from_der(der).unwrap() }
+fn c_ec(p256: bool, d: List[u8]) -> crypto.EcSecret { crypto.ec_secret(if p256 { crypto.P256 } else { crypto.P384 }, d).unwrap() }
+fn c_seed(b: List[u8]) -> crypto.Ed25519Seed { crypto.ed25519_seed(b).unwrap() }
+fn c_hmac(key: List[u8], msg: List[u8]) -> List[u8] { crypto.hmac(crypto.hmac_key(crypto.Sha256, key), msg).unwrap().bytes }
+
+fn show_b(label: List[u8], r: Result[jwt.Claims, jwt.Error]) uses io {
+    let mut l = label.copy()
+    bytes.append(inout l, lit(": "))
+    match r {
+        Ok(c) => {
+            bytes.append(inout l, lit("ok alg="))
+            bytes.append(inout l, lit(jwt.alg_name(c.alg)))
+            match c.subject() {
+                Some(s) => {
+                    bytes.append(inout l, lit(" sub="))
+                    bytes.append(inout l, s)
+                }
+                None => {}
+            }
+        }
+        Err(e) => { bytes.append(inout l, jwt.error_text(e).bytes()) }
+    }
+    io.outln(l)
+}
+
+fn secret() -> List[u8] { lit("0123456789abcdef0123456789abcdef-secret") }
+
+fn hs_keys() -> jwt.KeySet { jwt.keyset().add("hs1", jwt.Secret(secret())) }
+
+fn mk(payload: str) -> List[u8] uses io {
+    jwt.sign(jwt.HS256, jwt.SecretKey(secret()), lit("hs1"), lit(payload)).unwrap()
+}
+
+fn hs_only() -> jwt.Validation { jwt.validation(List[jwt.HS256]) }
+
+fn flip(t: str, at: usize) -> List[u8] {
+    let mut b = lit(t)
+    b[at] = if b[at] == 65 { 66 } else { 65 }
+    b
+}
+
+fn jwks() -> List[u8] {
+    let mut s = lit(r#"{"keys":["#)
+    bytes.append(inout s, lit(r#"{"kty":"RSA","kid":"rsa1","use":"sig","n":"rr8oaFKmhr2YbccRwVyPWCAUq2vS75lD-Ch-IaMwQu_Rjy-sBXz2AVdz_9Eg68z3UyNwC6vPD_b0OtLQF4dJUoyzrNvdloIrE3MD-R3YjkzhuFUK_URD4-uMYNt1rruYwHv5-g0ZRGDTcTLn3_IjfGK2U89JvcZT5SUyV7De1rT7_0WR5mW22_Dcd94AqnPEFHC5myqEK7OdCKn1Gf3WcLxpWXr8eWJQoZQQB1dIjmdZOm2KDSHYCDVVvCpbHFzOBCCOB5530xxGwfzjenF7c9jE_dd3kWuGvQIJ4wb5v-AxhqcDFdEpThoNrLVsKA3jxIGqLvPBlma2Vsej012HaQ","e":"AQAB"},"#))
+    bytes.append(inout s, lit(r#"{"kty":"EC","kid":"p256","crv":"P-256","x":"1vdEuIpt9FUUxjLzu2f0N7XvY_3OneTKit2uIEIKcbg","y":"YdEFjiwSUvT1OnATeyiwmnijAaje7H2RExxVGSAb28Q"},"#))
+    bytes.append(inout s, lit(r#"{"kty":"EC","kid":"p384","crv":"P-384","x":"Oobl0IQM0je-7ssFl4uHC9XyWDl7HYsqFyRJ-gWT6L1tvN9sXFDYJQtAOLWddfNv","y":"I3ed4lTcsI2wOoxztMoNB10uZjY8-9RfnI7XVk5QkV1dDNGLBlotGk0MLzyULOYl"},"#))
+    bytes.append(inout s, lit(r#"{"kty":"OKP","kid":"ed1","crv":"Ed25519","x":"9CXLv09olMOQ0Ls7MkfQbaO8lpns2eEzEUZyaqDyS4o"},"#))
+    bytes.append(inout s, lit(r#"{"kty":"EC","kid":"p521","crv":"P-521","x":"AA","y":"AA"},"#))
+    bytes.append(inout s, lit(r#"{"kty":"RSA","kid":"encrypting","use":"enc","n":"AQAB","e":"AQAB"},"#))
+    bytes.append(inout s, lit(r#"{"kty":"oct","kid":"hs1","k":"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYtc2VjcmV0"}"#))
+    bytes.append(inout s, lit(r#"]}"#))
+    s
+}
+
+fn all_algs() -> List[jwt.Alg] {
+    List[jwt.HS256, jwt.HS384, jwt.HS512, jwt.RS256, jwt.RS384, jwt.RS512, jwt.PS256, jwt.PS384, jwt.PS512, jwt.ES256, jwt.ES384, jwt.EdDSA]
+}
+
+fn main() uses io, clock {
+    io.outln(lit("-- RFC 7515 A.1 (HS256)"))
+    let k = lit("AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow")
+    let keys = jwt.keyset().add("", jwt.Secret(encoding.unbase64_url(k).unwrap()))
+    let a1 = lit("eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
+    let mut va = jwt.validation(List[jwt.HS256])
+    show("a1 before exp", jwt.verify_at(va, keys, a1, 1300819379))
+    show("a1 at exp", jwt.verify_at(va, keys, a1, 1300819380))
+    va.leeway = 5
+    show("a1 at exp, leeway 5", jwt.verify_at(va, keys, a1, 1300819384))
+    show("a1 past exp + leeway", jwt.verify_at(va, keys, a1, 1300819385))
+    va.leeway = 0
+    va.issuer = Some(lit("joe"))
+    show("a1 issuer joe", jwt.verify_at(va, keys, a1, 1300819379))
+    va.issuer = Some(lit("jane"))
+    show("a1 issuer jane", jwt.verify_at(va, keys, a1, 1300819379))
+    match jwt.verify_at(jwt.validation(List[jwt.HS256]), keys, a1, 1300819379) {
+        Ok(c) => {
+            match c.issuer() { Some(i) => io.outln(i), None => {} }
+            io.outln(bytes.from_u64(c.raw.len() as u64))
+        }
+        Err(_) => {}
+    }
+
+    io.outln(lit("-- jwt.io HS256"))
+    let jio = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    let jk = jwt.keyset().add("", jwt.Secret(lit("your-256-bit-secret")))
+    let mut vj = jwt.validation(List[jwt.HS256])
+    vj.require_exp = false
+    show("jwt.io", jwt.verify_at(vj, jk, lit(jio), now()))
+    vj.require_exp = true
+    show("jwt.io needs exp", jwt.verify_at(vj, jk, lit(jio), now()))
+    vj.require_exp = false
+    let payload = lit(r#"{"sub":"1234567890","name":"John Doe","iat":1516239022}"#)
+    let again = jwt.sign(jwt.HS256, jwt.SecretKey(lit("your-256-bit-secret")), List.new(), payload).unwrap()
+    io.outln(again)
+    print(bytes.eq(again, lit(jio)))
+
+    io.outln(lit("-- tampering"))
+    show("flipped payload", jwt.verify_at(vj, jk, flip(jio, 60), now()))
+    show("flipped signature", jwt.verify_at(vj, jk, flip(jio, 130), now()))
+    show("flipped header", jwt.verify_at(vj, jk, flip(jio, 10), now()))
+    show("wrong secret", jwt.verify_at(vj, jwt.keyset().add("", jwt.Secret(lit("your-257-bit-secret"))), lit(jio), now()))
+    show("truncated signature", jwt.verify_at(vj, jk, lit("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5"), now()))
+    show("two parts", jwt.verify_at(vj, jk, lit("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0"), now()))
+    show("four parts", jwt.verify_at(vj, jk, lit("a.b.c.d"), now()))
+    show("empty", jwt.verify_at(vj, jk, List.new(), now()))
+    show("empty signature", jwt.verify_at(vj, jk, lit("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."), now()))
+    show("padded base64", jwt.verify_at(vj, jk, lit("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9==.eyJzdWIiOiIxMjM0NTY3ODkwIn0.x"), now()))
+    show("garbage", jwt.verify_at(vj, jk, lit("not.a.jwt"), now()))
+    let mut tiny = jwt.validation(List[jwt.HS256])
+    tiny.max_size = 100
+    show("too large", jwt.verify_at(tiny, jk, lit(jio), now()))
+
+    io.outln(lit("-- alg none and friends"))
+    let nh = encoding.base64_url(lit(r#"{"alg":"none"}"#))
+    let np = encoding.base64_url(lit(r#"{"sub":"root","exp":4102444800}"#))
+    let mut none_tok = nh.bytes()
+    none_tok.push(46)
+    bytes.append(inout none_tok, np.bytes())
+    let mut none_sig = none_tok.copy()
+    none_tok.push(46)
+    show("none, no signature", jwt.verify_at(jwt.validation(List[jwt.HS256]), jk, none_tok, now()))
+    bytes.append(inout none_sig, lit(".c2ln"))
+    show("none, with a signature", jwt.verify_at(jwt.validation(List[jwt.HS256]), jk, none_sig, now()))
+    let mut vnone = jwt.validation(List[jwt.HS256])
+    vnone.require_exp = false
+    for name in ["None", "NONE", "nOnE", "hs256", "ES512", "HS256 ", ""] {
+        let mut hh = lit(r#"{"alg":""#)
+        bytes.append(inout hh, lit(name))
+        bytes.append(inout hh, lit(r#""}"#))
+        let mut t = encoding.base64_url(hh).bytes()
+        t.push(46)
+        bytes.append(inout t, np.bytes())
+        bytes.append(inout t, lit(".c2ln"))
+        let mut l = lit("alg ")
+        bytes.append(inout l, lit(name))
+        show_b(l, jwt.verify_at(vnone, jk, t, now()))
+    }
+    print(jwt.alg_of(lit("none")).is_none())
+    print(jwt.alg_of(lit("ES512")).is_none())
+    print(jwt.alg_of(lit("ES256")).is_some())
+
+    io.outln(lit("-- algorithm confusion"))
+    let rsa_n = encoding.unbase64_url(lit("rr8oaFKmhr2YbccRwVyPWCAUq2vS75lD-Ch-IaMwQu_Rjy-sBXz2AVdz_9Eg68z3UyNwC6vPD_b0OtLQF4dJUoyzrNvdloIrE3MD-R3YjkzhuFUK_URD4-uMYNt1rruYwHv5-g0ZRGDTcTLn3_IjfGK2U89JvcZT5SUyV7De1rT7_0WR5mW22_Dcd94AqnPEFHC5myqEK7OdCKn1Gf3WcLxpWXr8eWJQoZQQB1dIjmdZOm2KDSHYCDVVvCpbHFzOBCCOB5530xxGwfzjenF7c9jE_dd3kWuGvQIJ4wb5v-AxhqcDFdEpThoNrLVsKA3jxIGqLvPBlma2Vsej012HaQ")).unwrap()
+    let rsa_e = encoding.unbase64_url(lit("AQAB")).unwrap()
+    let rsa_pub = jwt.Rsa(c_rsa(rsa_n, rsa_e))
+    let rkeys = jwt.keyset().add("rsa1", rsa_pub)
+    let both = jwt.validation(List[jwt.RS256, jwt.HS256])
+    // the classic attack: an HS256 token MACed with the RSA key's public bytes as the secret
+    let forged = jwt.sign(jwt.HS256, jwt.SecretKey(rsa_n), lit("rsa1"), lit(r#"{"sub":"admin","exp":4102444800}"#)).unwrap()
+    show("HS256 with the RSA modulus as the secret, HS256 allowed", jwt.verify_at(both, rkeys, forged, now()))
+    show("the same, only RS256 allowed", jwt.verify_at(jwt.validation(List[jwt.RS256]), rkeys, forged, now()))
+    show("RS256 token, kid rsa1 names a secret", jwt.verify_at(jwt.validation(List[jwt.RS256]), jwt.keyset().add("rsa1", jwt.Secret(rsa_n)), lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    show("RS256 token, only HS256 allowed", jwt.verify_at(hs_only(), rkeys, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    show("RS256 token as PS256 (not allowed)", jwt.verify_at(jwt.validation(List[jwt.PS256]), rkeys, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    let pinned = jwt.keyset().add_for("rsa1", jwt.PS256, rsa_pub)
+    show("key pinned to PS256, RS256 token", jwt.verify_at(jwt.validation(List[jwt.RS256, jwt.PS256]), pinned, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    show("key pinned to PS256, PS256 token", jwt.verify_at(jwt.validation(List[jwt.RS256, jwt.PS256]), pinned, lit("eyJhbGciOiJQUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.njSt_lbqHB2JVoBaAcNtW2bkOyoz8bKNVkj_q-krdxcBnm7HW7wiLinlIHT_voo12ta_QIqj1TFH_404d0yfAf0Ud1eLY_uiYWJJnz2XSedbJyD79Z9qt-PuxgzHCgTFEh6WRXkHrS1ZnjKY1GrW3um1vdQ7K-W9-gMKbRFMZnVwF2VoFw2nj1Hq0il7w0Ks3nYeACv66tH3-Ajt6bLXdptYPqmHoQ8JlXnMjjUtQ-yTzhp9s6ZcnY8OLzQhPcooe4WFg45KB9AmM4oqFirtGk3vmtChl1H_lpVZFAPj7CZDmtkUjN_QC5iuml86Sisp_30b_8aTVjRYUBVOofHTgA"), now()))
+
+    io.outln(lit("-- tokens from OpenSSL and python, keys from a JWKS"))
+    let set = jwt.parse_jwks(jwks(), false).unwrap()
+    io.outln(bytes.from_u64(set.len() as u64))
+    let strict = jwt.validation(all_algs())
+    show("RS256", jwt.verify_at(strict, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    show("RS384", jwt.verify_at(strict, set, lit("eyJhbGciOiJSUzM4NCIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.TTczG8X0V2-DyRxc-jWw5XUmnhi3wMNluVSBzTh7RUvUP1JWrqy90LAZT5nLtJGGTTFd3yJHhkXEoBOQ11NOJjHpZfLjk9IkouunkGPxQy6no1RKB2TFKApbF3ZV97Am156kVOnMz8jtDiEeyjNcyA0E9vNRfAfagG9pz63rDgS0q9hEU0IrpeZcpKOCkHQqtJ8D7zWjFlyqZw_4_Vw9DLjfY9LbflzxgMd4e8vnyK3q02KKRQ0TEfYkxVFq0f_A1eFW5W7nE6V3wPce3wIaec342BP4csudQKQo8yrpp9D2UgDO6tlVAMj3UcrvGTNrOzpwzrs3neSA6hTY8j_q_A"), now()))
+    show("PS256", jwt.verify_at(strict, set, lit("eyJhbGciOiJQUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.njSt_lbqHB2JVoBaAcNtW2bkOyoz8bKNVkj_q-krdxcBnm7HW7wiLinlIHT_voo12ta_QIqj1TFH_404d0yfAf0Ud1eLY_uiYWJJnz2XSedbJyD79Z9qt-PuxgzHCgTFEh6WRXkHrS1ZnjKY1GrW3um1vdQ7K-W9-gMKbRFMZnVwF2VoFw2nj1Hq0il7w0Ks3nYeACv66tH3-Ajt6bLXdptYPqmHoQ8JlXnMjjUtQ-yTzhp9s6ZcnY8OLzQhPcooe4WFg45KB9AmM4oqFirtGk3vmtChl1H_lpVZFAPj7CZDmtkUjN_QC5iuml86Sisp_30b_8aTVjRYUBVOofHTgA"), now()))
+    show("ES256", jwt.verify_at(strict, set, lit("eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InAyNTYifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.aPnxVTq9uqpQQ8nqqR45H6rm1mGKWvTMGwoe4Kh1f-ZWHihgsas6vmqRqlHKfjYDvJyKJY_Wufht3HiYsAq0wQ"), now()))
+    show("ES384", jwt.verify_at(strict, set, lit("eyJhbGciOiJFUzM4NCIsInR5cCI6IkpXVCIsImtpZCI6InAzODQifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.ggGaIMzsg7NUoAF49cJbmMzLgg9yGfMczXq0hhTCFnf7Po8qhyPfum6DDzbtivDYiAi0ctObaooK1WFlr_Roenhjy0KdINSG1KioR10ZPrheb-7twsYy8UvrF14K_D6o"), now()))
+    show("EdDSA", jwt.verify_at(strict, set, lit("eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImVkMSJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.OfTkYAVOg2tHXQn39iG-djsxEi-YB9la6UIVn7YbQCH0WqbjBdpUW7fg-Xq-UaocvwVuJpXLUS0bQsNiR96JCQ"), now()))
+    let withoct = jwt.parse_jwks(jwks(), true).unwrap()
+    io.outln(bytes.from_u64(withoct.len() as u64))
+    show("HS256 (python hmac)", jwt.verify_at(strict, withoct, lit("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImhzMSJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.-kK-BN4pmdYDdDB9nP5ZNcGXX1EJGOC621kca-K3f0A"), now()))
+    show("HS512 (python hmac)", jwt.verify_at(strict, withoct, lit("eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCIsImtpZCI6ImhzMSJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.WHtexDwmh1cR0rEZYOtRNrb5IP9SnstAq8_1u64mSsM4pAri6wBM4RDODwYkM5h41a19zloo2cJqdDILV0Js-w"), now()))
+    show("HS256 but the set has no oct key", jwt.verify_at(strict, set, lit("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImhzMSJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.-kK-BN4pmdYDdDB9nP5ZNcGXX1EJGOC621kca-K3f0A"), now()))
+    show("ES256 token, tampered", jwt.verify_at(strict, set, flip("eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InAyNTYifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.aPnxVTq9uqpQQ8nqqR45H6rm1mGKWvTMGwoe4Kh1f-ZWHihgsas6vmqRqlHKfjYDvJyKJY_Wufht3HiYsAq0wQ", 100), now()))
+    show("EdDSA token, tampered", jwt.verify_at(strict, set, flip("eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImVkMSJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.OfTkYAVOg2tHXQn39iG-djsxEi-YB9la6UIVn7YbQCH0WqbjBdpUW7fg-Xq-UaocvwVuJpXLUS0bQsNiR96JCQ", 100), now()))
+    show("RS256 token, tampered", jwt.verify_at(strict, set, flip("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA", 100), now()))
+
+    io.outln(lit("-- claims"))
+    match jwt.verify_at(strict, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()) {
+        Ok(c) => {
+            io.outln(c.str("iss").unwrap())
+            print(c.int("exp").unwrap())
+            print(c.int("sub").is_none())
+            print(c.has_scope("read"))
+            print(c.has_scope("write"))
+            print(c.has_scope("rea"))
+            io.outln(bytes.join(c.scopes(), lit("|")))
+            io.outln(c.kid)
+        }
+        Err(_) => {}
+    }
+    let mut vc = jwt.validation(all_algs())
+    vc.issuer = Some(lit("https://issuer.example"))
+    vc.audience = Some(lit("other"))
+    show("iss and aud (array) match", jwt.verify_at(vc, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    vc.audience = Some(lit("oth"))
+    show("aud is a prefix only", jwt.verify_at(vc, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    vc.audience = Some(lit("api"))
+    vc.issuer = Some(lit("https://issuer.example/"))
+    show("iss differs by a slash", jwt.verify_at(vc, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    vc.issuer = None
+    vc.max_age = 1000
+    show("max_age exceeded", jwt.verify_at(vc, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    vc.max_age = 100000000
+    show("max_age fine", jwt.verify_at(vc, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), now()))
+    show("iat in the future", jwt.verify_at(vc, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), 1600000000))
+    vc.leeway = 100000000
+    show("iat in the future, big leeway", jwt.verify_at(vc, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), 1600000000))
+    show("expired", jwt.verify_at(strict, set, lit("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiYWRhIiwiYXVkIjpbImFwaSIsIm90aGVyIl0sInNjb3BlIjoicmVhZCB3cml0ZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwfQ.RecsaKBcKh4bjaNH8TLj1fjLAHLBmOLxdj3FBNS628LhWUads6OZSkgv1geOoZPRHJ1b2AVZ5p5cZAJw85XMwQQY7E9gX0cRaQGMtIKTyjdGbHjMJB8Z131MtCX_RPaeboNWGeWrNGWTozmU98D_fDecvDdSaxLzkOgUqObgiFrKObDNKuUVAOiAwYNLpBDuxwZb_DzLwUQ-RH0GPPB4FTt5Lz24e5R0ZouH_1sgtvPSp6WyXjKpFHPCHQljDZltgfkxx870ewKPT_gSusb5kFSS53yEuA4PLR9aCJnzZvHsxP9i5b4oXwje6t-jJAB409bmXcfzmH0jGHfipMpmSA"), 4102444800))
+
+    io.outln(lit("-- exp, nbf, iat, aud, iss with HS256"))
+    let hv = hs_only()
+    show("fractional exp", jwt.verify_at(hv, hs_keys(), mk(r#"{"exp":1800000000.5}"#), 1799999999))
+    show("fractional exp, then", jwt.verify_at(hv, hs_keys(), mk(r#"{"exp":1800000000.5}"#), 1800000000))
+    show("exp as a string", jwt.verify_at(hv, hs_keys(), mk(r#"{"exp":"1900000000"}"#), now()))
+    show("exp as a negative", jwt.verify_at(hv, hs_keys(), mk(r#"{"exp":-5}"#), now()))
+    show("exp in exponent form", jwt.verify_at(hv, hs_keys(), mk(r#"{"exp":1.9e9}"#), now()))
+    show("no exp", jwt.verify_at(hv, hs_keys(), mk(r#"{"sub":"x"}"#), now()))
+    let mut noexp = hs_only()
+    noexp.require_exp = false
+    show("no exp, not required", jwt.verify_at(noexp, hs_keys(), mk(r#"{"sub":"x"}"#), now()))
+    show("nbf in the future", jwt.verify_at(hv, hs_keys(), mk(r#"{"exp":1900000000,"nbf":1800000100}"#), now()))
+    let mut lee = hs_only()
+    lee.leeway = 100
+    show("nbf in the future, leeway", jwt.verify_at(lee, hs_keys(), mk(r#"{"exp":1900000000,"nbf":1800000100}"#), now()))
+    show("nbf reached", jwt.verify_at(hv, hs_keys(), mk(r#"{"exp":1900000000,"nbf":1800000000}"#), now()))
+    let mut ia = hs_only()
+    ia.audience = Some(lit("api"))
+    ia.issuer = Some(lit("me"))
+    show("aud string", jwt.verify_at(ia, hs_keys(), mk(r#"{"exp":1900000000,"aud":"api","iss":"me"}"#), now()))
+    show("aud missing", jwt.verify_at(ia, hs_keys(), mk(r#"{"exp":1900000000,"iss":"me"}"#), now()))
+    show("aud wrong", jwt.verify_at(ia, hs_keys(), mk(r#"{"exp":1900000000,"aud":"apis","iss":"me"}"#), now()))
+    show("aud numbers", jwt.verify_at(ia, hs_keys(), mk(r#"{"exp":1900000000,"aud":[1,2],"iss":"me"}"#), now()))
+    show("aud among many", jwt.verify_at(ia, hs_keys(), mk(r#"{"exp":1900000000,"aud":["x","api"],"iss":"me"}"#), now()))
+    show("iss missing", jwt.verify_at(ia, hs_keys(), mk(r#"{"exp":1900000000,"aud":"api"}"#), now()))
+    show("payload not an object", jwt.verify_at(hv, hs_keys(), mk("[1,2]"), now()))
+    show("payload not JSON", jwt.verify_at(hv, hs_keys(), mk("nope"), now()))
+    show("duplicate claim", jwt.verify_at(hv, hs_keys(), mk(r#"{"exp":1900000000,"exp":1}"#), now()))
+
+    io.outln(lit("-- headers and keys"))
+    let none_set = jwt.keyset()
+    let ok = mk(r#"{"exp":1900000000,"sub":"u"}"#)
+    show("kid hs1", jwt.verify_at(hv, hs_keys(), ok, now()))
+    show("unknown kid", jwt.verify_at(hv, jwt.keyset().add("other", jwt.Secret(secret())), ok, now()))
+    show("no keys", jwt.verify_at(hv, none_set, ok, now()))
+    let two = jwt.keyset().add("a", jwt.Secret(lit("aaaa"))).add("hs1", jwt.Secret(secret()))
+    show("two keys, kid picks", jwt.verify_at(hv, two, ok, now()))
+    let nokid = jwt.sign(jwt.HS256, jwt.SecretKey(secret()), List.new(), lit(r#"{"exp":1900000000}"#)).unwrap()
+    show("no kid, two keys", jwt.verify_at(hv, two, nokid, now()))
+    show("no kid, one key", jwt.verify_at(hv, jwt.keyset().add("whatever", jwt.Secret(secret())), nokid, now()))
+    // headers built by hand and signed with the secret
+    for h in [r#"{"alg":"HS256","crit":["exp"],"exp":1}"#, r#"{"alg":"HS256","alg":"HS256"}"#, r#"{"alg":"HS256","kid":5}"#, r#"{"typ":"JWT"}"#, r#"{"alg":5}"#, r#"[]"#, r#"{"alg":"HS256","b64":false}"#, r#"{"alg":"HS256","typ":"JWT"}"#] {
+        let mut t = encoding.base64_url(lit(h)).bytes()
+        t.push(46)
+        bytes.append(inout t, encoding.base64_url(lit(r#"{"exp":1900000000}"#)).bytes())
+        let tag = c_hmac(secret(), t)
+        t.push(46)
+        bytes.append(inout t, encoding.base64_url(tag).bytes())
+        show(h, jwt.verify_at(hv, jwt.keyset().add("", jwt.Secret(secret())), t, now()))
+    }
+    print(jwt.secret_strong(lit("short")).is_err())
+    print(jwt.secret_strong(secret()).is_ok())
+    print(jwt.key_allows(jwt.Secret(lit("")), jwt.HS256))
+    print(jwt.key_allows(jwt.Secret(lit("k")), jwt.RS256))
+
+    io.outln(lit("-- signing round trips"))
+    let claims = jwt.claims().str("iss", lit("me")).str("sub", lit("a \"quoted\" name")).int("exp", 1900000000).strs("aud", List[lit("x"), lit("y")]).json()
+    io.outln(claims)
+    let rsa_sk = jwt.RsaPrivate(c_rsa_priv(encoding.unbase64(lit("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCuvyhoUqaGvZhtxxHBXI9YIBSra9LvmUP4KH4hozBC79GPL6wFfPYBV3P/0SDrzPdTI3ALq88P9vQ60tAXh0lSjLOs292WgisTcwP5HdiOTOG4VQr9REPj64xg23Wuu5jAe/n6DRlEYNNxMuff8iN8YrZTz0m9xlPlJTJXsN7WtPv/RZHmZbbb8Nx33gCqc8QUcLmbKoQrs50IqfUZ/dZwvGlZevx5YlChlBAHV0iOZ1k6bYoNIdgINVW8KlscXM4EII4HnnfTHEbB/ON6cXtz2MT913eRa4a9AgnjBvm/4DGGpwMV0SlOGg2stWwoDePEgaou88GWZrZWx6PTXYdpAgMBAAECggEAANS95MkdK5+JMwnIUYAW2mzEobq7NRJ92pdECkrpYYLHH1mIWuT+PSwPoX7QG5miRM3yrCDetOJlb5uDC9RD4ABKoR7ROJ8D2hgo7lgFqJ+VpI0a+/CwK0xPzZdy7CgjkNQbcI9RYxwxb+S1v5Xk307k3mnU8vHCLQvL59OFK8Y3NDDs8oXMqfIVI7REm1lUtHCSzfnr+gLJaiWkBYCWhMIhQM4nSuqJy4QnO9yHouBtEpO0A0oLraHDc6hDRlFFsUAUTaJHRc+otVYgsrkQXQc0P2FVbe8ExUlvL8ozUHS2wOuN+Gg5XHTzijweFXSkqBqIaal4Q6PbDEymmiL3AQKBgQDvxT9uVaN3p1qs7i9NnnWhikaBZMMNNnqgOaliIWikBz5XYXcOTI9IHo+x/pxRKfSSu+RAd/OpQb7b+3CgKwc0/dp/HgceNXbEL2cL+gkmvvdl8EgbeS4i0yhsEloPfqa/hp7iSHpVr30kTqM6Quu776INakl7P/0mMUWC9LB6YQKBgQC6kyzngnSb9UYqyN5bvxtjEgNp3aUbkKjlCusUXASddLuqQMj7zsbzHGLCO02WImmCCueJYjTH0Zlz7mkEHg/Ff3q4Wr018tp5RGoBg+N382Myw/qSFjqfE5KWgyWS7AzrC41IiLrz6njF5Q94EFgAVsVzieUzoQ93YJ87VDd6CQKBgEbKEJkttY59HXtS8ypSb15bKcfIDQJYpEmr3IN5Y6CR9ujrgK/7EI51X21ow5P+9BNiX9hc0daV75iZGr5fFciibiD7p5RWqpLvf9f8YTlMRlSVZWSfGWz0tMl7fZV3ihmf0Eb0qRGlNyhCA1UPLvQUot6dE8bMtJvTDjfEsFnhAoGBAIveh7xrHVZJ0zeB7MilBTgJKgv0gLGgii1jOQbDUSZle8bP2JyF0Loynor0AF88HxLBcACbYewm4r55jbrrenFZ9zs7szs9e7GLq1jFcgLbsJM/PprEFWBqQOubF9EEK08OEvW8o0L2lWHuLeGZhw+B/XZ3ex9wb/LTuau1n/1ZAoGAYIvzBNP0889Ekq927GHhrPqLsj50RhgdJPq50I22KhhlQthcx/VeXT8Nr881Fy2MGvdyDwdqoM9+HDzufn6zrpGtznOzx1KD24e+Fkmxv1qKE3L6VpaqBqZRP5+7bfMbibGRxH/1Qgkci3MZ2JAjjp2QF7OcQ4tJ0tt3+2g8bls=")).unwrap()))
+    let p256_sk = jwt.EcPrivate(c_ec(true, encoding.unhex(lit("ba4c57252f1112df3ae662fc5e3b1d566490655e225bf7e2ccb8d083d34066be")).unwrap()))
+    let p384_sk = jwt.EcPrivate(c_ec(false, encoding.unhex(lit("a7239ecdd1155ca27cbebf364ddcea5b9ed56a4a580e7ddf9533f6972ed46230319605bc87ead7fe6bbf6393d634e9b1")).unwrap()))
+    let ed_sk = jwt.Ed25519Seed(c_seed(encoding.unhex(lit("38db505a249ae7bd27531c9e9d23d7da354e001d676c666d10fea7e590f752a5")).unwrap()))
+    let hsk = jwt.SecretKey(secret())
+    let mut pairs: List[(jwt.Alg, jwt.SigningKey, str)] = List.new()
+    pairs.push((jwt.HS256, hsk, "hs1"))
+    pairs.push((jwt.HS384, hsk, "hs1"))
+    pairs.push((jwt.HS512, hsk, "hs1"))
+    pairs.push((jwt.RS256, rsa_sk, "rsa1"))
+    pairs.push((jwt.RS384, rsa_sk, "rsa1"))
+    pairs.push((jwt.RS512, rsa_sk, "rsa1"))
+    pairs.push((jwt.PS256, rsa_sk, "rsa1"))
+    pairs.push((jwt.PS384, rsa_sk, "rsa1"))
+    pairs.push((jwt.PS512, rsa_sk, "rsa1"))
+    pairs.push((jwt.ES256, p256_sk, "p256"))
+    pairs.push((jwt.ES384, p384_sk, "p384"))
+    pairs.push((jwt.EdDSA, ed_sk, "ed1"))
+    for pr in pairs {
+        let (a, sk, kid) = pr
+        match jwt.sign(a, sk, lit(kid), claims) {
+            Ok(t) => {
+                let mut vv = jwt.validation(List[a])
+                vv.audience = Some(lit("y"))
+                show(jwt.alg_name(a), jwt.verify_at(vv, withoct, t, now()))
+            }
+            Err(e) => io.outln(e.bytes())
+        }
+    }
+    match jwt.sign(jwt.RS256, hsk, List.new(), claims) { Ok(_) => print("signed?!"), Err(e) => io.outln(e.bytes()) }
+    match jwt.sign(jwt.HS256, rsa_sk, List.new(), claims) { Ok(_) => print("signed?!"), Err(e) => io.outln(e.bytes()) }
+    match jwt.sign(jwt.ES384, p256_sk, List.new(), claims) { Ok(_) => print("signed?!"), Err(e) => io.outln(e.bytes()) }
+
+    io.outln(lit("-- JWKS errors"))
+    for d in [r#"{"keys":5}"#, r#"{"nokeys":[]}"#, r#"nope"#, r#"{"keys":[5]}"#, r#"{"keys":[{"kid":"x"}]}"#, r#"{"keys":[{"kty":"RSA","n":"AQAB"}]}"#, r#"{"keys":[{"kty":"RSA","n":"AQAB","e":"AQAB"}]}"#, r#"{"keys":[{"kty":"EC","crv":"P-256","x":"AQ","y":"AQ"}]}"#, r#"{"keys":[{"kty":"oct","k":"!!"}]}"#, r#"{"keys":[{"kty":"unknown"}]}"#, r#"{"keys":[]}"#] {
+        match jwt.parse_jwks(lit(d), true) {
+            Ok(s) => {
+                let mut l = lit("ok ")
+                bytes.append(inout l, bytes.from_u64(s.len() as u64))
+                io.outln(l)
+            }
+            Err(e) => io.outln(e.bytes())
+        }
+    }
+}
