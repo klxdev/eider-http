@@ -1,0 +1,273 @@
+//! http/cookiejar: the cookie store of an HTTP client (RFC 6265 section 5, as http/pool uses it): it
+//! keeps the cookies of `Set-Cookie` headers and says which of them a request to a URL carries.
+//!
+//!     let jar = cookiejar.new()
+//!     jar.store(host, path, secure, response.headers, now)     // after a response
+//!     match jar.header_for(host, path, secure, now) { ... }    // before a request: the Cookie header value
+//!
+//! All times are Unix seconds (`time.unix_seconds()`), passed in so that tests need no clock. A jar is
+//! shared by its copies and safe to use from many tasks (one Lock).
+//!
+//! The rules, from 6265 and 6265bis:
+//! - a cookie with no `Domain` is host-only (it goes to exactly the host that set it); with `Domain` it
+//!   goes to that domain and its subdomains, and only when the host that set it is in the domain. A
+//!   `Domain` that is a single label other than the host itself (`com`) is refused: there is no public
+//!   suffix list here, so a host in `co.uk` can still set a cookie for `co.uk`. An IP address host only
+//!   sets host-only cookies;
+//! - `Path` defaults to the directory of the request path; a cookie goes to a path that it matches (6265
+//!   section 5.1.4);
+//! - `Secure` cookies are only set over https and only sent over https, and an http response cannot
+//!   replace or delete one that an https response set (6265bis "leave Secure cookies alone");
+//! - `Max-Age` outranks `Expires`; a time in the past (or `Max-Age` of 0 or less) deletes the cookie, and
+//!   a lifetime is at most 400 days; a cookie with neither lives as long as the jar;
+//! - `__Secure-` and `__Host-` cookies are checked as http/cookie parses them (a `__Host-` cookie has to
+//!   be host-only, which `parse_set_cookie` already requires through "no Domain");
+//! - at most 50 cookies per domain and 3000 in all: the oldest go first;
+//! - `SameSite` is a browser's business (it depends on the page that made the request); a client that
+//!   is not a browser sends every cookie that matches, and `HttpOnly` is likewise not about this client.
+
+import core.sys
+import std.bytes
+import std.sync
+import http
+import http.cookie
+
+/// One cookie of the jar. `expires` is Unix seconds (`NEVER` for a session cookie); `host_only`
+/// cookies match `domain` exactly.
+pub type Entry = {
+    name: List[u8],
+    value: List[u8],
+    domain: List[u8],
+    host_only: bool,
+    path: List[u8],
+    expires: i64,
+    secure: bool,
+    http_only: bool,
+    created: i64,
+    seq: i64
+}
+
+/// `Entry.expires` of a cookie that has no lifetime.
+pub const NEVER: i64 = 9223372036854775807
+
+type Store = { items: List[Entry], seq: i64 }
+
+/// A cookie store shared by its copies.
+pub type Jar = { st: sync.Lock[Store] }
+
+/// An empty jar.
+pub fn new() -> Jar { Jar(sync.lock(Store(List.new(), 0))) }
+
+const MAX_TOTAL: usize = 3000
+const MAX_PER_DOMAIN: usize = 50
+const MAX_LIFETIME: i64 = 34560000
+
+/// Whether `h` is an IPv4 or IPv6 literal (letters, digits, dots and colons that make an address): such a host has no domain.
+fn is_ip(h: List[u8]) -> bool {
+    if bytes.find_byte(h, 58, 0).is_some() { return true }
+    let mut dots = 0
+    for c in h {
+        if c == 46 { dots += 1 } else if !bytes.is_digit(c) { return false }
+    }
+    dots == 3
+}
+
+/// 6265 section 5.1.3: the host is the domain, or ends with `.` and the domain (and is not an IP address).
+pub fn domain_match(host: List[u8], domain: List[u8]) -> bool {
+    if bytes.eq(host, domain) { return true }
+    if is_ip(host) { return false }
+    if host.len() <= domain.len() { return false }
+    bytes.ends_with(host, domain) && host[host.len() - domain.len() - 1] == 46
+}
+
+/// 6265 section 5.1.4: the request path is the cookie path, or starts with it and the cookie path ends with `/` or the next byte of the
+/// request path is `/`.
+pub fn path_match(request_path: List[u8], cookie_path: List[u8]) -> bool {
+    if bytes.eq(request_path, cookie_path) { return true }
+    if !bytes.starts_with(request_path, cookie_path) { return false }
+    if cookie_path.len() > 0 && cookie_path[cookie_path.len() - 1] == 47 { return true }
+    request_path.len() > cookie_path.len() && request_path[cookie_path.len()] == 47
+}
+
+/// 6265 section 5.1.4's default path: the request path up to (not including) its last `/`, or `/`.
+pub fn default_path(request_path: List[u8]) -> List[u8] {
+    if request_path.len() == 0 || request_path[0] != 47 { return sys.lit("/") }
+    match bytes.rfind_byte(request_path, 47) {
+        Some(i) => {
+            if i == 0 { sys.lit("/") } else { bytes.slice(request_path, 0, i) }
+        }
+        None => sys.lit("/")
+    }
+}
+
+fn same_key(e: Entry, name: List[u8], domain: List[u8], host_only: bool, path: List[u8]) -> bool {
+    e.host_only == host_only && bytes.eq(e.name, name) && bytes.eq(e.domain, domain) && bytes.eq(e.path, path)
+}
+
+fn oldest(items: List[Entry], domain: Option[List[u8]]) -> usize {
+    let mut best: usize = 0
+    let mut best_seq: i64 = NEVER
+    let mut i: usize = 0
+    for e in items {
+        let eligible = match domain {
+            Some(d) => bytes.eq(e.domain, d)
+            None => true
+        }
+        if eligible && e.created * 1000000 + e.seq < best_seq { best = i; best_seq = e.created * 1000000 + e.seq }
+        i += 1
+    }
+    best
+}
+
+impl Jar {
+    /// Handles the `Set-Cookie` headers `hs` of a response from `host` (lowercase, as in the URL) for a request to `path`
+    /// (the path only, no query) over https when `secure`; `now` is Unix seconds. Cookies that break the rules in the
+    /// module comment are dropped. Returns how many were kept (set, replaced or deleted).
+    fn store(self, host: List[u8], path: List[u8], secure: bool, hs: List[http.Header], now: i64) -> usize {
+        let h = http.lower(host)
+        let cs = cookie.parse_set_cookies(hs)
+        self.st.modify(|inout s: Store| -> usize {
+            let mut kept: usize = 0
+            for c in cs {
+                let mut domain = h.copy()
+                let mut host_only = true
+                match c.domain {
+                    Some(d) => {
+                        if !domain_match(h, d) { continue }
+                        if bytes.find_byte(d, 46, 0).is_none() && !bytes.eq(d, h) { continue }
+                        if is_ip(h) && !bytes.eq(d, h) { continue }
+                        domain = d
+                        host_only = false
+                    }
+                    None => {}
+                }
+                if c.secure && !secure { continue }
+                let cpath = match c.path {
+                    Some(p) => p
+                    None => default_path(path)
+                }
+                let mut expires = NEVER
+                match c.max_age {
+                    Some(m) => {
+                        if m <= 0 { expires = 0 - 1 } else if m > MAX_LIFETIME { expires = now + MAX_LIFETIME } else { expires = now + m }
+                    }
+                    None => {
+                        match c.expires {
+                            Some(t) => {
+                                if t <= now { expires = 0 - 1 } else if t > now + MAX_LIFETIME { expires = now + MAX_LIFETIME } else { expires = t }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                // find the cookie this one replaces
+                let mut at: Option[usize] = None
+                let mut i: usize = 0
+                for e in s.items {
+                    if same_key(e, c.name, domain, host_only, cpath) && at.is_none() { at = Some(i) }
+                    i += 1
+                }
+                match at {
+                    Some(k) => {
+                        // an insecure origin leaves a Secure cookie alone
+                        if s.items[k].secure && !secure { continue }
+                    }
+                    None => {}
+                }
+                if expires < 0 {
+                    match at {
+                        Some(k) => {
+                            s.items.remove(k)
+                            kept += 1
+                        }
+                        None => {}
+                    }
+                    continue
+                }
+                s.seq += 1
+                let created = match at {
+                    Some(k) => s.items[k].created
+                    None => now
+                }
+                let e = Entry(c.name, c.value, domain, host_only, cpath, expires, c.secure, c.http_only, created, s.seq)
+                match at {
+                    Some(k) => { s.items[k] = e }
+                    None => {
+                        let mut same: usize = 0
+                        for x in s.items { if bytes.eq(x.domain, e.domain) { same += 1 } }
+                        if same >= MAX_PER_DOMAIN { s.items.remove(oldest(s.items, Some(e.domain.copy()))) }
+                        if s.items.len() >= MAX_TOTAL { s.items.remove(oldest(s.items, None)) }
+                        s.items.push(e)
+                    }
+                }
+                kept += 1
+            }
+            kept
+        })
+    }
+
+    /// The `Cookie` header value for a request to `host` and `path` (no query), over https when `secure`: the cookies that match,
+    /// longest path first, then oldest first (6265 section 5.4), as `a=1; b=2`; None when there is none. Expired cookies
+    /// are dropped on the way.
+    fn header_for(self, host: List[u8], path: List[u8], secure: bool, now: i64) -> Option[List[u8]] {
+        let h = http.lower(host)
+        let p = if path.len() == 0 { sys.lit("/") } else { path }
+        self.st.modify(|inout s: Store| -> Option[List[u8]] {
+            let mut live: List[Entry] = List.new()
+            for e in s.items { if e.expires > now { live.push(e) } }
+            s.items = live
+            let mut hits: List[Entry] = List.new()
+            for e in s.items {
+                let dm = if e.host_only { bytes.eq(h, e.domain) } else { domain_match(h, e.domain) }
+                if dm && path_match(p, e.path) && (!e.secure || secure) { hits.push(e) }
+            }
+            if hits.len() == 0 { return None }
+            // insertion sort: longer paths first, then earlier creation
+            let mut i: usize = 1
+            while i < hits.len() {
+                let mut j = i
+                while j > 0 && before(hits[j], hits[j - 1]) {
+                    let t = hits[j].copy()
+                    hits[j] = hits[j - 1].copy()
+                    hits[j - 1] = t
+                    j -= 1
+                }
+                i += 1
+            }
+            let mut out: List[u8] = List.new()
+            for e in hits {
+                if out.len() > 0 { bytes.append(inout out, sys.lit("; ")) }
+                bytes.append(inout out, e.name)
+                out.push(61)
+                bytes.append(inout out, e.value)
+            }
+            Some(out)
+        })
+    }
+
+    /// The cookies in the jar (expired ones included until they are next looked at), oldest first.
+    fn entries(self) -> List[Entry] { self.st.modify(|inout s: Store| -> List[Entry] { s.items.copy() }) }
+
+    /// How many cookies the jar holds.
+    fn len(self) -> usize { self.st.modify(|inout s: Store| -> usize { s.items.len() }) }
+
+    /// Removes every cookie.
+    fn clear(self) { self.st.modify(|inout s: Store| -> () { s.items = List.new() }) }
+
+    /// Adds a cookie the program made (`name=value` for `host`, host-only, path `/`, no expiry, `secure` as given).
+    fn set(self, host: List[u8], name: List[u8], value: List[u8], secure: bool, now: i64) {
+        let mut hs: List[http.Header] = List.new()
+        let mut line = name.copy()
+        line.push(61)
+        bytes.append(inout line, value)
+        bytes.append(inout line, sys.lit("; Path=/"))
+        if secure { bytes.append(inout line, sys.lit("; Secure")) }
+        hs.push(http.Header(sys.lit("Set-Cookie"), line))
+        let k = self.store(host, sys.lit("/"), secure, hs, now)
+    }
+}
+
+fn before(a: Entry, b: Entry) -> bool {
+    if a.path.len() != b.path.len() { return a.path.len() > b.path.len() }
+    a.created * 1000000 + a.seq < b.created * 1000000 + b.seq
+}
