@@ -1,0 +1,600 @@
+// http/limit: the concurrency limiter (queue, shed, FIFO hand-off, per key, deadlines, traps), the
+// adaptive cap on a fixed clock, the 504 timeout, the client retry helper, and the metrics
+// text, plus two load tests with an atomic high-water mark. Order between threads comes from
+// channels and from the limiter's own counters (a helper polls `counts()` until a waiter has
+// queued: the poll decides when to go on, never what is printed). Nothing prints a duration.
+
+import core.sys
+import std.atomic
+import std.bytes
+import std.io
+import std.net
+import std.sync
+import std.task
+import std.time
+import http
+import http.client
+import http.limit
+import http.metrics
+import http.router
+import http.server
+import http.testing
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn say(label: str, n: i64) uses io {
+    let mut l = lit(label)
+    bytes.append(inout l, lit(": "))
+    bytes.append(inout l, bytes.from_i64(n))
+    io.outln(l)
+}
+
+fn get(target: str) -> http.Request { http.request("GET", lit(target)) }
+
+fn show(r: http.Response) uses io {
+    let mut l = bytes.from_i64(r.status as i64)
+    l.push(32)
+    for h in r.headers {
+        bytes.append(inout l, h.name)
+        l.push(61)
+        bytes.append(inout l, h.value)
+        l.push(32)
+    }
+    bytes.append(inout l, lit("| "))
+    bytes.append(inout l, r.body)
+    io.outln(l)
+}
+
+fn waiting(lim: limit.Limiter, n: i64) uses io, clock {
+    let dl = time.after_ms(20000)
+    while lim.counts().waiting < n {
+        if dl.expired() { panic("timed out waiting for waiters") }
+        time.sleep_ms(1)
+    }
+}
+
+fn counts_line(lim: limit.Limiter) uses io {
+    let c = lim.counts()
+    let mut l = lit("admitted=")
+    bytes.append(inout l, bytes.from_i64(c.admitted))
+    bytes.append(inout l, lit(" queued="))
+    bytes.append(inout l, bytes.from_i64(c.queued))
+    bytes.append(inout l, lit(" shed="))
+    bytes.append(inout l, bytes.from_i64(c.shed))
+    bytes.append(inout l, lit(" expired="))
+    bytes.append(inout l, bytes.from_i64(c.expired))
+    bytes.append(inout l, lit(" running="))
+    bytes.append(inout l, bytes.from_i64(c.running))
+    bytes.append(inout l, lit(" waiting="))
+    bytes.append(inout l, bytes.from_i64(c.waiting))
+    bytes.append(inout l, lit(" limit="))
+    bytes.append(inout l, bytes.from_i64(c.limit))
+    io.outln(l)
+}
+
+fn k(s: str) -> List[u8] { lit(s) }
+
+fn main() uses io, clock, threads, net {
+    print("-- shed: no queue")
+    let a = limit.limiter(2, limit.shed())
+    say("first", a.acquire(k(""), time.never()))
+    say("second", a.acquire(k(""), time.never()))
+    say("third (refused)", a.acquire(k(""), time.never()))
+    counts_line(a)
+    a.release(k(""))
+    say("after a release", a.acquire(k(""), time.never()))
+    a.release(k(""))
+    a.release(k(""))
+    counts_line(a)
+
+    print("-- queue: FIFO hand-off")
+    let q = limit.limiter(1, limit.queue(8, time.seconds(60)))
+    say("holder", q.acquire(k(""), time.never()))
+    let order: Chan[i64] = Chan.new()
+    let mut ts: List[Task[i64]] = List.new()
+    for i in 1..5 {
+        let id = i as i64
+        let lq = q
+        let o = order
+        ts.push(spawn(|| -> i64 {
+            let r = lq.acquire(k(""), time.never())
+            o.send(id)
+            lq.release(k(""))
+            r
+        }))
+        waiting(q, id)
+    }
+    counts_line(q)
+    // a newcomer does not overtake the queue: it queues too (and is last)
+    let lq5 = q
+    let o5 = order
+    ts.push(spawn(|| -> i64 {
+        let r = lq5.acquire(k(""), time.never())
+        o5.send(5)
+        lq5.release(k(""))
+        r
+    }))
+    waiting(q, 5)
+    q.release(k(""))
+    let mut got = lit("served in order:")
+    for i in 0..5 {
+        got.push(32)
+        bytes.append(inout got, bytes.from_i64(order.recv().unwrap()))
+    }
+    io.outln(got)
+    for t in ts { say("waiter result", t.join()) }
+    counts_line(q)
+    say("high water", q.counts().high_water)
+
+    print("-- queue full")
+    let f = limit.limiter(1, limit.queue(1, time.seconds(60)))
+    say("holder", f.acquire(k(""), time.never()))
+    let lf = f
+    let w1 = spawn(|| -> i64 {
+        let r = lf.acquire(k(""), time.never())
+        lf.release(k(""))
+        r
+    })
+    waiting(f, 1)
+    say("third (queue full)", f.acquire(k(""), time.never()))
+    f.release(k(""))
+    say("the waiter got in", w1.join())
+    counts_line(f)
+
+    print("-- a wait that runs out")
+    let e = limit.limiter(1, limit.queue(1, time.millis(20)))
+    say("holder", e.acquire(k(""), time.never()))
+    say("waiter (max_wait over)", e.acquire(k(""), time.never()))
+    counts_line(e)
+    e.release(k(""))
+    say("slot free again", e.acquire(k(""), time.never()))
+    e.release(k(""))
+    // the request's own deadline is shorter than max_wait
+    let d = limit.limiter(1, limit.queue(1, time.seconds(60)))
+    say("holder", d.acquire(k(""), time.never()))
+    say("waiter (request deadline over)", d.acquire(k(""), time.after_ms(20)))
+    counts_line(d)
+    d.release(k(""))
+
+    print("-- one cap per key")
+    let by = limit.limiter(1, limit.shed()).by(|r: http.Request| -> List[u8] { r.header("x-tenant").unwrap_or(lit("")) })
+    say("tenant a", by.acquire(k("a"), time.never()))
+    say("tenant b", by.acquire(k("b"), time.never()))
+    say("tenant a again (refused)", by.acquire(k("a"), time.never()))
+    by.release(k("a"))
+    say("tenant a after release", by.acquire(k("a"), time.never()))
+    by.release(k("a"))
+    by.release(k("b"))
+    counts_line(by)
+
+    print("-- the layer: 503 problem+json with Retry-After, skip, traps")
+    let gate: Chan[i32] = Chan.new()
+    let g = gate
+    let entered: Chan[i32] = Chan.new()
+    let en = entered
+    let slow = |r: http.Request| -> http.Response {
+        en.send(1)
+        let z = g.recv()
+        http.text(200, "done")
+    }
+    let boom = |r: http.Request| -> http.Response {
+        panic("secret internal state")
+        http.text(200, "unreachable")
+    }
+    let lim = limit.limiter(1, limit.shed().retry_after_secs(7)).except(|r: http.Request| -> bool { bytes.eq(r.path, lit("/health")) })
+    let app = limit.middleware(lim, |r: http.Request| -> http.Response {
+        if bytes.eq(r.path, lit("/boom")) { return boom(r) }
+        if bytes.eq(r.path, lit("/health")) { return http.text(200, "ok") }
+        slow(r)
+    })
+    let held = spawn(|| -> http.Response { app(get("/slow")) })
+    let z1 = entered.recv()
+    show(app(get("/slow")))
+    show(app(get("/health")))
+    gate.send(1)
+    show(held.join())
+    say("running after", lim.counts().running)
+    let tb = app(get("/boom"))
+    show(tb)
+    print(tb.keep_alive)
+    say("running after a trap", lim.counts().running)
+    counts_line(lim)
+
+    print("-- load: queueing, 16 threads x 150 requests, cap 4")
+    let lq2 = limit.limiter(4, limit.queue(1000, time.seconds(60)))
+    let cur = atomic.new(0)
+    let hw = atomic.new(0)
+    let done = atomic.new(0)
+    let mut ws: List[Task[i64]] = List.new()
+    for t in 0..16 {
+        let l = lq2
+        ws.push(spawn(|| -> i64 {
+            let mut ok: i64 = 0
+            for j in 0..150 {
+                if l.acquire(k(""), time.never()) == 0 {
+                    let now = cur.add(1, atomic.SeqCst) + 1
+                    let z = hw.update(atomic.SeqCst, |m: i64| -> i64 { if now > m { now } else { m } })
+                    let y = done.add(1, atomic.SeqCst)
+                    let x = cur.sub(1, atomic.SeqCst)
+                    l.release(k(""))
+                    ok += 1
+                }
+            }
+            ok
+        }))
+    }
+    let mut total: i64 = 0
+    for t in ws { total += t.join() }
+    say("served", total)
+    say("max in flight within cap 4", if hw.load(atomic.SeqCst) <= 4 && hw.load(atomic.SeqCst) >= 1 { 1 as i64 } else { 0 as i64 })
+    say("limiter high water within cap", if lq2.counts().high_water <= 4 { 1 as i64 } else { 0 as i64 })
+    let cq = lq2.counts()
+    say("admitted", cq.admitted)
+    say("shed", cq.shed)
+    say("running at the end", cq.running)
+    say("waiting at the end", cq.waiting)
+
+    print("-- load: shedding, 16 threads x 150 requests, cap 4")
+    let ls = limit.limiter(4, limit.shed())
+    let cur2 = atomic.new(0)
+    let hw2 = atomic.new(0)
+    let ran = atomic.new(0)
+    let mut ws2: List[Task[i64]] = List.new()
+    for t in 0..16 {
+        let l = ls
+        ws2.push(spawn(|| -> i64 {
+            let mut shed: i64 = 0
+            for j in 0..150 {
+                if l.acquire(k(""), time.never()) == 0 {
+                    let now = cur2.add(1, atomic.SeqCst) + 1
+                    let z = hw2.update(atomic.SeqCst, |m: i64| -> i64 { if now > m { now } else { m } })
+                    // hold the slot a moment so others really collide
+                    time.sleep_ms(0)
+                    let y = ran.add(1, atomic.SeqCst)
+                    let x = cur2.sub(1, atomic.SeqCst)
+                    l.release(k(""))
+                } else {
+                    shed += 1
+                }
+            }
+            shed
+        }))
+    }
+    let mut shed_total: i64 = 0
+    for t in ws2 { shed_total += t.join() }
+    let c2 = ls.counts()
+    say("admitted + shed", c2.admitted + c2.shed)
+    say("callers saw the same shed count", if shed_total == c2.shed { 1 as i64 } else { 0 as i64 })
+    say("handler ran as often as admitted", if ran.load(atomic.SeqCst) == c2.admitted { 1 as i64 } else { 0 as i64 })
+    say("max in flight within cap 4", if hw2.load(atomic.SeqCst) <= 4 { 1 as i64 } else { 0 as i64 })
+    say("running at the end", c2.running)
+
+    print("-- load with a barrier: 16 callers at once, cap 4")
+    let lb = limit.limiter(4, limit.shed())
+    let res: Chan[i64] = Chan.new()
+    let hold: Chan[i32] = Chan.new()
+    let mut bt: List[Task[i64]] = List.new()
+    for t in 0..16 {
+        let l = lb
+        let rc = res
+        let hc = hold
+        bt.push(spawn(|| -> i64 {
+            let r = l.acquire(k(""), time.never())
+            rc.send(r)
+            if r == 0 {
+                let z = hc.recv()
+                l.release(k(""))
+            }
+            r
+        }))
+    }
+    let mut admitted_n: i64 = 0
+    let mut shed_n: i64 = 0
+    for i in 0..16 {
+        if res.recv().unwrap() == 0 { admitted_n += 1 } else { shed_n += 1 }
+    }
+    say("admitted", admitted_n)
+    say("shed", shed_n)
+    say("running while they hold", lb.counts().running)
+    for i in 0..4 { hold.send(1) }
+    for t in bt { let z = t.join() }
+    counts_line(lb)
+
+    print("-- load with a barrier: 16 callers at once, cap 4, queue of 16")
+    let lw = limit.limiter(4, limit.queue(16, time.seconds(60)))
+    let res2: Chan[i64] = Chan.new()
+    let hold2: Chan[i32] = Chan.new()
+    let order2: Chan[i64] = Chan.new()
+    let mut bt2: List[Task[i64]] = List.new()
+    for t in 0..16 {
+        let l = lw
+        let rc = res2
+        let hc = hold2
+        bt2.push(spawn(|| -> i64 {
+            let r = l.acquire(k(""), time.never())
+            rc.send(r)
+            let z = hc.recv()
+            l.release(k(""))
+            r
+        }))
+    }
+    // 4 are in, 12 wait: nobody is shed, nobody exceeds the cap
+    waiting(lw, 12)
+    let cw = lw.counts()
+    say("running", cw.running)
+    say("waiting", cw.waiting)
+    say("shed", cw.shed)
+    for i in 0..16 { hold2.send(1) }
+    let mut zeros: i64 = 0
+    for t in bt2 { zeros += t.join() }
+    say("all served (sum of results is 0)", zeros)
+    let cw2 = lw.counts()
+    say("admitted", cw2.admitted)
+    say("high water", cw2.high_water)
+
+    print("-- adaptive cap on a fixed clock")
+    let ms = |n: i64| -> i64 { n * 1000000 }
+    let sh = limit.shedder(limit.adaptive(2, 10, time.millis(100)), limit.shed())
+    say("starts at", sh.counts().limit)
+    for i in 0..3 { say("admit", sh.acquire(k(""), time.never())) }
+    sh.release_at(k(""), ms(500), true, ms(1000))
+    say("one slow: cut by a tenth", sh.counts().limit)
+    sh.release_at(k(""), ms(500), true, ms(1050))
+    say("another slow within the target window: not again", sh.counts().limit)
+    sh.release_at(k(""), ms(500), true, ms(1300))
+    say("slow after the window: cut again", sh.counts().limit)
+    for i in 0..3 { let z = sh.acquire(k(""), time.never()) }
+    // a 5xx counts as slow even when quick
+    sh.release_at(k(""), ms(1), false, ms(2000))
+    say("a failure cuts too", sh.counts().limit)
+    sh.release_at(k(""), ms(1), true, ms(2001))
+    sh.release_at(k(""), ms(1), true, ms(2002))
+    say("fast ones, below a window's worth", sh.counts().limit)
+    let lim_now = sh.counts().limit
+    for i in 0..lim_now { let z = sh.acquire(k(""), time.never()) }
+    let mut n_before = sh.counts().limit
+    for i in 0..n_before { sh.release_at(k(""), ms(1), true, ms(3000)) }
+    say("a full window of fast ones: up by one", sh.counts().limit)
+    // never below the floor
+    let fl = limit.shedder(limit.adaptive(2, 3, time.millis(10)), limit.shed())
+    for i in 0..10 {
+        let z = fl.acquire(k(""), time.never())
+        fl.release_at(k(""), ms(500), false, ms(1000 + (i as i64) * 100))
+    }
+    say("floor", fl.counts().limit)
+
+    print("-- adaptive: a queue that is backed up sheds newcomers")
+    let aq = limit.shedder(limit.adaptive(1, 1, time.millis(1)), limit.queue(5, time.seconds(60)))
+    say("holder", aq.acquire_at(k(""), time.never(), 0))
+    let la = aq
+    let aw = spawn(|| -> i64 {
+        let r = la.acquire_at(k(""), time.never(), 0)
+        la.release(k(""))
+        r
+    })
+    waiting(aq, 1)
+    say("newcomer 20 ms after the head queued (head older than 10 ms): 3", aq.acquire_at(k(""), time.never(), ms(20)))
+    show(aq.refuse(3))
+    aq.release(k(""))
+    say("the queued one got in", aw.join())
+    counts_line(aq)
+
+    print("-- timeout: 504, counters, the late handler's result is dropped")
+    let pool = task.pool(2, 4)
+    let tm = limit.timeouts()
+    let tgate: Chan[i32] = Chan.new()
+    let tg = tgate
+    let finished = atomic.new(0)
+    let slowh = |r: http.Request| -> http.Response {
+        let z = tg.recv()
+        let y = finished.add(1, atomic.SeqCst)
+        http.text(200, "late")
+    }
+    let fast = |r: http.Request| -> http.Response {
+        http.text(200, if r.deadline.is_never() { "no deadline" } else { "deadline set" })
+    }
+    let t_fast = tm.wrap(time.seconds(30), pool, fast)
+    show(t_fast(get("/")))
+    let t_slow = tm.wrap(time.millis(30), pool, slowh)
+    let rs = t_slow(get("/"))
+    show(rs)
+    print(rs.keep_alive)
+    tgate.send(1)
+    // the pool is still usable and the late handler ran to its end
+    show(t_fast(get("/")))
+    let t_boom = tm.wrap(time.seconds(30), pool, |r: http.Request| -> http.Response {
+        panic("secret internal state")
+        http.text(200, "unreachable")
+    })
+    show(t_boom(get("/")))
+    let (st, to, rj, tr) = tm.counts()
+    say("started", st)
+    say("timed out", to)
+    say("rejected", rj)
+    say("trapped", tr)
+    pool.shutdown()
+    say("late handler finished before shutdown returned", finished.load(atomic.SeqCst))
+
+    print("-- timeout: no worker free is a 503, not a 504")
+    let p1 = task.pool(1, 1)
+    let rg: Chan[i32] = Chan.new()
+    let rgc = rg
+    let blocker = |r: http.Request| -> http.Response {
+        let z = rgc.recv()
+        http.text(200, "x")
+    }
+    let tm2 = limit.timeouts()
+    let t_b = tm2.wrap(time.millis(40), p1, blocker)
+    // one runs, one waits in the queue, the third finds the queue full until its deadline
+    let r1 = t_b(get("/"))
+    let r2 = t_b(get("/"))
+    let r3 = t_b(get("/"))
+    show(r1)
+    show(r2)
+    show(r3)
+    let (st2, to2, rj2, tr2) = tm2.counts()
+    say("started", st2)
+    say("timed out", to2)
+    say("rejected", rj2)
+    rg.send(1)
+    rg.send(1)
+    p1.shutdown()
+
+    print("-- retry: scripted outcomes")
+    let sleeps: Chan[i64] = Chan.new()
+    let sl = sleeps
+    let full = |b: i64| -> i64 { b }
+    let mk = |st: sync.Lock[List[i32]], seen: sync.Lock[i64], ra: str| -> fn(http.Request, time.Deadline) -> Result[http.Response, String] {
+        |q: http.Request, dl: time.Deadline| -> Result[http.Response, String] {
+            seen.modify(|inout n: i64| -> () { n += 1 })
+            let c = st.modify(|inout l: List[i32]| -> i32 {
+                if l.len() == 0 { return 200 }
+                let h = l[0]
+                let mut rest: List[i32] = List.new()
+                for i in 1..l.len() { rest.push(l[i]) }
+                l = rest
+                h
+            })
+            if c == 0 { return Err(String.from("connection refused")) }
+            let mut r = http.text(c, "body")
+            if c == 503 && ra.len() > 0 { r.set_header("Retry-After", lit(ra)) }
+            Ok(r)
+        }
+    }
+    let drain = |ch: Chan[i64], n: i64| -> List[i64] {
+        let mut o: List[i64] = List.new()
+        for i in 0..n { o.push(ch.recv().unwrap()) }
+        o
+    }
+    let list_text = |l: List[i64]| -> List[u8] {
+        let mut t: List[u8] = List.new()
+        for v in l {
+            if t.len() > 0 { t.push(44) }
+            bytes.append(inout t, bytes.from_i64(v / 1000000))
+        }
+        t
+    }
+    let outcome = |label: str, res: Result[http.Response, String], seen: sync.Lock[i64]| -> () {
+        let mut l = lit(label)
+        bytes.append(inout l, lit(": "))
+        match res {
+            Ok(r) => { bytes.append(inout l, bytes.from_i64(r.status as i64)) }
+            Err(e) => {
+                bytes.append(inout l, lit("error "))
+                bytes.append(inout l, e.bytes())
+            }
+        }
+        bytes.append(inout l, lit(", attempts "))
+        bytes.append(inout l, bytes.from_i64(seen.get()))
+        io.outln(l)
+    }
+    let base = limit.retry().with_clock(|ns: i64| -> () { sl.send(ns) }, full)
+
+    let s1: sync.Lock[i64] = sync.lock(0)
+    let r_a = base.send(mk(sync.lock(List[503, 503, 200]), s1, ""), get("/x"), time.never())
+    outcome("503 503 200", r_a, s1)
+    io.outln(list_text(drain(sleeps, 2)))
+
+    let s2: sync.Lock[i64] = sync.lock(0)
+    outcome("POST is not repeated", base.send(mk(sync.lock(List[503, 200]), s2, ""), http.request("POST", lit("/x")), time.never()), s2)
+    let s3: sync.Lock[i64] = sync.lock(0)
+    let mut keyed = http.request("POST", lit("/x"))
+    keyed.headers.push(http.Header(lit("idempotency-key"), lit("abc")))
+    outcome("POST with Idempotency-Key is repeated", base.send(mk(sync.lock(List[503, 200]), s3, ""), keyed, time.never()), s3)
+    let _w1 = drain(sleeps, 1)
+    let s4: sync.Lock[i64] = sync.lock(0)
+    outcome("POST with any_method", base.any_method().send(mk(sync.lock(List[503, 200]), s4, ""), http.request("POST", lit("/x")), time.never()), s4)
+    let _w2 = drain(sleeps, 1)
+    let s5: sync.Lock[i64] = sync.lock(0)
+    outcome("404 is final", base.send(mk(sync.lock(List[404, 200]), s5, ""), get("/x"), time.never()), s5)
+    let s6: sync.Lock[i64] = sync.lock(0)
+    outcome("errors are retried", base.send(mk(sync.lock(List[0, 0, 200]), s6, ""), get("/x"), time.never()), s6)
+    let _w3 = drain(sleeps, 2)
+    let s7: sync.Lock[i64] = sync.lock(0)
+    outcome("attempts used up: the last 503", base.send(mk(sync.lock(List[503, 503, 503, 200]), s7, ""), get("/x"), time.never()), s7)
+    let _w4 = drain(sleeps, 2)
+    let s8: sync.Lock[i64] = sync.lock(0)
+    outcome("6 attempts allowed, backoff capped", base.attempts(6).backoff(time.millis(100), time.millis(300)).with_budget(10, 0, 10).send(mk(sync.lock(List[503, 503, 503, 503, 503, 200]), s8, ""), get("/x"), time.never()), s8)
+    io.outln(list_text(drain(sleeps, 5)))
+
+    print("-- retry: Retry-After")
+    let s9: sync.Lock[i64] = sync.lock(0)
+    outcome("Retry-After 2 beats the 100 ms backoff", base.send(mk(sync.lock(List[503, 200]), s9, "2"), get("/x"), time.never()), s9)
+    io.outln(list_text(drain(sleeps, 1)))
+    let s10: sync.Lock[i64] = sync.lock(0)
+    outcome("Retry-After 120 is over the 30 s accepted: not retried", base.send(mk(sync.lock(List[503, 200]), s10, "120"), get("/x"), time.never()), s10)
+    let s11: sync.Lock[i64] = sync.lock(0)
+    outcome("Retry-After ignored when not honoured", base.retry_after(false, time.seconds(30)).send(mk(sync.lock(List[503, 200]), s11, "2"), get("/x"), time.never()), s11)
+    io.outln(list_text(drain(sleeps, 1)))
+    let s12: sync.Lock[i64] = sync.lock(0)
+    outcome("an HTTP-date Retry-After falls back to the backoff", base.send(mk(sync.lock(List[503, 200]), s12, "Wed, 21 Oct 2026 07:28:00 GMT"), get("/x"), time.never()), s12)
+    io.outln(list_text(drain(sleeps, 1)))
+    let s13: sync.Lock[i64] = sync.lock(0)
+    outcome("the wait would pass the deadline: not retried", base.send(mk(sync.lock(List[503, 200]), s13, "5"), get("/x"), time.after_ms(1000)), s13)
+
+    print("-- retry: the budget")
+    let bud = base.with_budget(1, 0, 1)
+    let s14: sync.Lock[i64] = sync.lock(0)
+    outcome("first request spends the only retry", bud.send(mk(sync.lock(List[503, 200]), s14, ""), get("/x"), time.never()), s14)
+    let _w5 = drain(sleeps, 1)
+    let s15: sync.Lock[i64] = sync.lock(0)
+    outcome("second finds the budget empty", bud.send(mk(sync.lock(List[503, 200]), s15, ""), get("/x"), time.never()), s15)
+    let (rq, rt, ex, gu) = bud.counts()
+    say("requests", rq)
+    say("retries", rt)
+    say("budget exhausted", ex)
+    // 50 percent: two requests earn one retry
+    let half = base.with_budget(0, 50, 5)
+    let s16: sync.Lock[i64] = sync.lock(0)
+    outcome("request 1 earns half a retry", half.send(mk(sync.lock(List[503, 200]), s16, ""), get("/x"), time.never()), s16)
+    let s17: sync.Lock[i64] = sync.lock(0)
+    outcome("request 2 has earned the whole", half.send(mk(sync.lock(List[503, 200]), s17, ""), get("/x"), time.never()), s17)
+    let _w6 = drain(sleeps, 1)
+
+    print("-- retry over the real client")
+    let flaky: sync.Lock[i64] = sync.lock(0)
+    let mut rt2 = router.new()
+    rt2.get("/flaky", |q: http.Request| -> http.Response {
+        let n = flaky.modify(|inout c: i64| -> i64 {
+            c += 1
+            c
+        })
+        if n < 3 {
+            let mut r = http.error_response(503)
+            r.set_header("Retry-After", lit("1"))
+            return r
+        }
+        http.text(200, "finally")
+    })
+    let mut cfg = server.config()
+    cfg.log = None
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let h = router.handler(rt2)
+    let tok = task.root()
+    let tk = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, tk).unwrap() })
+    let port = srv.port()
+    let real = limit.retry().with_clock(|ns: i64| -> () { sl.send(ns) }, full)
+    let rr = real.fetch_host("127.0.0.1", port, get("/flaky"), time.after_ms(20000)).unwrap()
+    let mut rl = bytes.from_i64(rr.status as i64)
+    rl.push(32)
+    bytes.append(inout rl, rr.body)
+    io.outln(rl)
+    io.outln(list_text(drain(sleeps, 2)))
+    let (rq3, rt3, ex3, gu3) = real.counts()
+    say("requests", rq3)
+    say("retries", rt3)
+    tok.cancel()
+    let stats = th.join()
+
+    print("-- metrics")
+    let m = metrics.new()
+    let mq = limit.limiter(1, limit.shed()).named("Render-API")
+    mq.expose(m, "unused")
+    let mt = limit.timeouts()
+    mt.expose(m, "render")
+    real.expose(m)
+    say("a", mq.acquire(k(""), time.never()))
+    say("b", mq.acquire(k(""), time.never()) )
+    io.out(m.render())
+}
