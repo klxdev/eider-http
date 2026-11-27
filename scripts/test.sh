@@ -57,6 +57,14 @@ else
   echo "FAIL h2 interop: build"; cat "$B/log"; fail=1
 fi
 rm -rf "$B"
+# http/multipart against curl -F and Python's email/http stdlib (tests/multipart_interop.sh; `skip` for what is not installed)
+B=$(mktemp -d)
+if ei build tests/multipart_interop_server.ei -o "$B/mpsrv" > "$B/log" 2>&1; then
+  sh tests/multipart_interop.sh "$B" || fail=1
+else
+  echo "FAIL multipart interop: build"; cat "$B/log"; fail=1
+fi
+rm -rf "$B"
 if [ -n "$TSAN" ]; then
   T=$(mktemp -d)
   trap 'rm -rf "$T"' EXIT

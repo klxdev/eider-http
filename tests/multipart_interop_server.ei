@@ -1,0 +1,99 @@
+// The Eider server for tests/multipart_interop.sh, against curl -F and Python's stdlib:
+//
+//   multipart_interop_server
+//
+// POST /upload streams a multipart/form-data body and answers one line per part:
+//   name|filename|content-type|size|sum   (sum: the bytes added up, modulo 1000003)
+// or the problem+json of the error. GET /sample answers a body made by http/multipart's builder (a
+// field, a text file, a binary file, a name that needs filename*) with its Content-Type, for Python's
+// parser. GET /quit stops the server. Prints `listening <port>` once it is up.
+
+import core.sys
+import std.bytes
+import std.io
+import std.net
+import std.task
+import http
+import http.multipart
+import http.router
+import http.server
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn upload(q: http.Request) -> http.Response uses io {
+    let mut lim = multipart.limits()
+    lim.max_part_bytes = 8388608
+    let mut f = match multipart.from_request(q, lim) {
+        Ok(f) => f
+        Err(e) => { return e.response() }
+    }
+    let mut body = q.stream.unwrap()
+    let mut out: List[u8] = List.new()
+    while true {
+        match f.next_part(inout body) {
+            Ok(Some(p)) => {
+                let mut n: usize = 0
+                let mut sum: u64 = 0
+                while true {
+                    match f.read(inout body, 65536) {
+                        Ok(b) => {
+                            if b.len() == 0 { break }
+                            n += b.len()
+                            for c in b { sum = (sum + (c as u64)) % 1000003 }
+                        }
+                        Err(e) => { return e.response() }
+                    }
+                }
+                bytes.append(inout out, p.name)
+                out.push(124)
+                bytes.append(inout out, p.filename.unwrap_or(lit("-")))
+                out.push(124)
+                bytes.append(inout out, p.content_type)
+                out.push(124)
+                bytes.append(inout out, bytes.from_u64(n as u64))
+                out.push(124)
+                bytes.append(inout out, bytes.from_u64(sum))
+                out.push(10)
+            }
+            Ok(None) => { break }
+            Err(e) => { return e.response() }
+        }
+    }
+    http.respond(200, "text/plain", out)
+}
+
+fn sample(q: http.Request) -> http.Response uses io {
+    let mut b = multipart.builder()
+    b.field(lit("title"), lit("h\u{e9}llo\r\nworld")).unwrap()
+    b.file(lit("notes"), lit("notes.txt"), lit("text/plain"), lit("one\r\n--not-a-boundary\r\ntwo")).unwrap()
+    let mut bin: List[u8] = List.new()
+    for i in 0..3000 { bin.push((i % 256) as u8) }
+    b.file(lit("blob"), lit("caf\u{e9} \"q\".bin"), lit(""), bin).unwrap()
+    b.field(lit("empty"), lit("")).unwrap()
+    let body = b.finish()
+    let mut r = http.response(200)
+    r.set_header("Content-Type", b.content_type())
+    r.body = body
+    r
+}
+
+fn main() uses io, net, clock, threads {
+    let tok = task.root()
+    let mut r = router.new()
+    r.route_with("POST", "/upload", http.Plan(0, true), upload)
+    r.get("/sample", sample)
+    let t2 = tok
+    r.get("/quit", |q: http.Request| -> http.Response {
+        t2.cancel()
+        http.text(200, "bye")
+    })
+    let mut cfg = server.config()
+    cfg.plan = r.planner()
+    cfg.limits.max_body = 67108864
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let mut up = String.from("listening ")
+    up.append(String.from_int(srv.addr().port as i64))
+    io.outln(up.bytes())
+    let h = router.handler(r)
+    let s = srv.serve(h, tok)
+}
