@@ -1,0 +1,83 @@
+// The Eider server for tests/unixsock_interop.sh, against curl (`--unix-socket`, with and without HTTP/2) and python3:
+//
+//   unixsock_interop_server <unix socket path> [mode]
+//
+// Serves GET /hello, POST /echo (the body back), GET /peer (the client address and `Host` the handler saw, and the
+// PROXY header's fields), GET /quit (stops the server). On the unix socket it speaks HTTP/1.1 and h2c. With a mode
+// (octal, e.g. 600) the socket file gets it. A second listener on TCP 127.0.0.1 requires a PROXY header (v1 or v2)
+// from 127.0.0.0/8. Prints `listening <tcp port>` once both are up.
+
+import core.sys
+import std.bytes
+import std.env
+import std.io
+import std.net
+import std.task
+import std.time
+import http
+import http.h2
+import http.proxy
+import http.proxyproto
+import http.server
+import http.unixsock
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn octal(s: List[u8]) -> u32 {
+    let mut v: u32 = 0
+    for c in s { v = v * 8 + ((c - 48) as u32) }
+    v
+}
+
+fn main() uses io, net, clock, threads, fs {
+    let a = env.args()
+    if a.len() < 2 {
+        io.errln(lit("usage: unixsock_interop_server <socket path> [mode]"))
+        return
+    }
+    let path = a[1].copy()
+    let tok = task.root()
+    let t = tok
+    let h = |q: http.Request| -> http.Response {
+        if bytes.eq(q.path, lit("/hello")) { return http.text(200, "hello over a unix socket") }
+        if bytes.eq(q.path, lit("/echo")) { return http.respond(200, "application/octet-stream", q.body) }
+        if bytes.eq(q.path, lit("/quit")) {
+            t.cancel()
+            return http.text(200, "bye")
+        }
+        let mut b = lit("peer=")
+        bytes.append(inout b, q.peer)
+        bytes.append(inout b, lit(" host="))
+        bytes.append(inout b, q.header("host").unwrap_or(lit("-")))
+        bytes.append(inout b, lit(" proxy_peer="))
+        bytes.append(inout b, q.get_ctx("proxy_peer").unwrap_or(lit("-")))
+        bytes.append(inout b, lit(" alpn="))
+        bytes.append(inout b, q.get_ctx("proxy_alpn").unwrap_or(lit("-")))
+        bytes.append(inout b, lit(" authority="))
+        bytes.append(inout b, q.get_ctx("proxy_authority").unwrap_or(lit("-")))
+        http.respond(200, "text/plain", b)
+    }
+    let mut cfg = server.config()
+    cfg.log = None
+    cfg.h2 = Some(h2.options())
+    let mut o = unixsock.options()
+    if a.len() > 2 { o = o.with_mode(octal(a[2].copy())) }
+    let usrv = unixsock.listen(path, cfg, o).unwrap()
+    let mut pcfg = server.config()
+    pcfg.log = None
+    pcfg.proxy_protocol = Some(proxyproto.options(proxy.trust_none().allow("127.0.0.0/8").unwrap()))
+    let tsrv = server.listen(net.ipv4(127, 0, 0, 1, 0), pcfg).unwrap()
+    let port = tsrv.port()
+    let ut = spawn(|| -> i32 {
+        let r = usrv.serve(h, t)
+        0
+    })
+    let tt = spawn(|| -> i32 {
+        let r = tsrv.serve(h, t)
+        0
+    })
+    io.outln(bytes.concat(lit("listening "), bytes.from_i64(port as i64)))
+    let z = ut.join()
+    let z2 = tt.join()
+    let r = unixsock.remove(path)
+}

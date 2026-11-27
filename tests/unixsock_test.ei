@@ -1,0 +1,303 @@
+// http/unixsock: the server on a unix socket (filesystem and abstract), the client dialling one (Docker-API
+// style `Host: localhost`), stale socket files (removed only when it is a socket nobody listens on), the socket's
+// permissions, h2c over a unix socket, and the PROXY protocol on a unix listener. The socket lives in a
+// directory made under /tmp for the run and removed at the end; nothing is printed that depends on its name.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.fs
+import std.io
+import std.net
+import std.random
+import std.task
+import std.time
+import http
+import http.client
+import http.h2
+import http.proxy
+import http.proxyproto
+import http.server
+import http.unixsock
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn cat(a: str, b: String) -> String {
+    let mut t = String.from(a)
+    t.append(b)
+    t
+}
+
+fn at(d: List[u8], name: str) -> List[u8] { bytes.concat(d, lit(name)) }
+
+fn cat2(a: String, b: String) -> String {
+    let mut t = a.copy()
+    t.append(b)
+    t
+}
+
+fn n(v: i64) -> String { sys.to_string(bytes.from_i64(v)) }
+
+fn handler() -> http.Handler {
+    |q: http.Request| -> http.Response {
+        if bytes.eq(q.path, lit("/_ping")) { return http.text(200, "OK") }
+        if bytes.eq(q.path, lit("/v1.43/containers/json")) {
+            return http.json_response(200, lit(r#"[{"Id":"abc","Names":["/web"]}]"#))
+        }
+        if bytes.eq(q.path, lit("/echo")) { return http.respond(200, "application/octet-stream", q.body) }
+        let mut b = lit("peer=")
+        bytes.append(inout b, q.peer)
+        bytes.append(inout b, lit(" host="))
+        bytes.append(inout b, q.header("host").unwrap_or(lit("-")))
+        bytes.append(inout b, lit(" proxy_peer="))
+        bytes.append(inout b, q.get_ctx("proxy_peer").unwrap_or(lit("-")))
+        http.respond(200, "text/plain", b)
+    }
+}
+
+fn config() -> server.Config {
+    let mut c = server.config()
+    c.log = None
+    c
+}
+
+fn start(srv: server.Server, tok: task.Token) -> Task[server.Stats] uses net, io, clock, threads {
+    let h = handler()
+    let t = tok
+    spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+}
+
+fn body_of(r: Result[http.Response, String]) -> String {
+    match r {
+        Ok(x) => cat("", sys.to_string(bytes.concat(bytes.from_i64(x.status as i64), bytes.concat(lit(" "), x.body))))
+        Err(e) => cat("error: ", e)
+    }
+}
+
+fn contains(e: String, what: str) -> bool { bytes.find(e.bytes(), lit(what), 0).is_some() }
+
+fn kind_name(path: List[u8]) -> str uses fs {
+    match fs.lstat(path) {
+        Ok(s) => {
+            if s.kind == fd.SOCKET { return "socket" }
+            if s.kind == fd.FILE { return "file" }
+            "other"
+        }
+        Err(e) => "missing"
+    }
+}
+
+fn main() uses net, io, clock, threads, fs {
+    let tag = random.bytes(5).unwrap()
+    let d = bytes.concat(lit("/tmp/eider-unixsock-"), bytes.hex(tag))
+    fs.mkdir_all(d).unwrap()
+    let path = at(d, "/api.sock")
+    let dl = time.after(time.seconds(20))
+
+    print("-- serve and fetch")
+    let srv = unixsock.listen(path, config(), unixsock.options()).unwrap()
+    print(cat("addr is the path: ", String.from(if bytes.eq(srv.addr().path, path) { "yes" } else { "no" })))
+    print(cat("the file is a ", String.from(kind_name(path))))
+    let tok = task.root()
+    let th = start(srv, tok)
+    print(body_of(unixsock.get(path, "/_ping", dl)))
+    print(body_of(unixsock.get(path, "/v1.43/containers/json", dl)))
+    print(body_of(unixsock.get(path, "/whoami", dl)))
+    let mut post = http.request("POST", lit("/echo"))
+    post.body = lit("hello over a unix socket")
+    print(body_of(unixsock.fetch(path, post, dl)))
+    let mut big: List[u8] = List.new()
+    for i in 0..300000 { big.push((i % 251) as u8) }
+    let mut bigreq = http.request("POST", lit("/echo"))
+    bigreq.body = big.copy()
+    match unixsock.fetch(path, bigreq, dl) {
+        Ok(r) => { print(cat("300000 bytes back intact: ", String.from(if bytes.eq(r.body, big) { "yes" } else { "no" }))) }
+        Err(e) => { print(cat("error: ", e)) }
+    }
+
+    print("-- keep-alive on one connection")
+    let mut c = unixsock.connect(path, dl).unwrap()
+    for i in 0..3 {
+        let r = c.request(http.request("GET", lit("/_ping")), dl).unwrap()
+        print(cat("request ", cat2(n(i as i64 + 1), cat(": ", sys.to_string(r.body)))))
+    }
+    print(cat("still open: ", String.from(if c.open { "yes" } else { "no" })))
+    print(body_of(Ok(c.request(http.request("GET", lit("/whoami")), dl).unwrap())))
+    c.close()
+    let mut c2 = unixsock.connect_host(path, lit("docker.example"), dl).unwrap()
+    print(body_of(Ok(c2.request(http.request("GET", lit("/whoami")), dl).unwrap())))
+    c2.close()
+
+    print("-- a dead path")
+    match unixsock.get(d, "/", dl) {
+        Ok(r) => { print("unexpected") }
+        Err(e) => { print("a directory is not a socket: error") }
+    }
+    let gone = at(d, "/nobody.sock")
+    match unixsock.get(gone, "/", dl) {
+        Ok(r) => { print("unexpected") }
+        Err(e) => { print(cat("no socket there: ", String.from(if contains(e, "cannot connect") { "cannot connect" } else { "other" }))) }
+    }
+
+    tok.cancel()
+    let st = th.join()
+    print(cat("requests handled: ", n(st.requests)))
+    print(cat("removed: ", String.from(if unixsock.remove(path) { "yes" } else { "no" })))
+    print(cat("the file is ", String.from(kind_name(path))))
+    print(cat("removing again: ", String.from(if unixsock.remove(path) { "yes" } else { "no" })))
+
+    print("-- a stale socket file")
+    // a server that died: its file stays when its listener is closed
+    let ls = net.listener(net.unix(path), true).unwrap()
+    fd.close(ls).unwrap()
+    print(cat("left behind: ", String.from(kind_name(path))))
+    match unixsock.listen(path, config(), unixsock.options().keep_stale()) {
+        Ok(s) => { print("unexpected") }
+        Err(e) => { print(cat("keep_stale refuses: ", String.from(if contains(e, "exists") { "the socket file exists" } else { "other" }))) }
+    }
+    let srv2 = unixsock.listen(path, config(), unixsock.options()).unwrap()
+    print("stale file replaced")
+    let tok2 = task.root()
+    let th2 = start(srv2, tok2)
+    print(body_of(unixsock.get(path, "/_ping", dl)))
+
+    print("-- a live server is not displaced")
+    match unixsock.listen(path, config(), unixsock.options()) {
+        Ok(s) => { print("unexpected") }
+        Err(e) => { print(cat("refused: ", String.from(if contains(e, "in use") { "address in use" } else { "other" }))) }
+    }
+    print(body_of(unixsock.get(path, "/_ping", dl)))
+    tok2.cancel()
+    let st2 = th2.join()
+    print(cat("requests handled: ", n(st2.requests)))
+    print(cat("removed: ", String.from(if unixsock.remove(path) { "yes" } else { "no" })))
+
+    print("-- what is not a socket is never removed")
+    fs.write(path, lit("precious")).unwrap()
+    match unixsock.listen(path, config(), unixsock.options()) {
+        Ok(s) => { print("unexpected") }
+        Err(e) => { print(cat("a regular file: ", String.from(if contains(e, "not a socket") { "refused, not a socket" } else { "other" }))) }
+    }
+    print(cat("remove() leaves it: ", String.from(if unixsock.remove(path) { "removed!" } else { "left" })))
+    print(cat("content kept: ", sys.to_string(fs.read(path).unwrap())))
+    fs.remove_all(path).unwrap()
+    let sub = at(d, "/subdir")
+    fs.mkdir_all(sub).unwrap()
+    match unixsock.listen(sub, config(), unixsock.options()) {
+        Ok(s) => { print("unexpected") }
+        Err(e) => { print(cat("a directory: ", String.from(if contains(e, "not a socket") { "refused, not a socket" } else { "other" }))) }
+    }
+    match unixsock.listen(List.new(), config(), unixsock.options()) {
+        Ok(s) => { print("unexpected") }
+        Err(e) => { print(cat("empty path: ", e)) }
+    }
+    let mut longp = at(d, "/")
+    for i in 0..120 { longp.push(120) }
+    match unixsock.listen(longp, config(), unixsock.options()) {
+        Ok(s) => { print("unexpected") }
+        Err(e) => { print(cat("too long: ", e)) }
+    }
+
+    print("-- permissions")
+    let mp = at(d, "/private.sock")
+    let msrv = unixsock.listen(mp, config(), unixsock.options().with_mode(384)).unwrap()
+    print(cat("mode 0600: ", n(mode_of(mp))))
+    print(cat("addr is the final path: ", String.from(if bytes.eq(msrv.addr().path, mp) { "yes" } else { "no" })))
+    print(cat("entries left in the directory (subdir and the socket, no temporary directory): ", n(fs.list(d).unwrap().len() as i64)))
+    let tok3 = task.root()
+    let th3 = start(msrv, tok3)
+    print(body_of(unixsock.get(mp, "/_ping", dl)))
+    tok3.cancel()
+    let st3 = th3.join()
+    let z = unixsock.remove(mp)
+    let msrv2 = unixsock.listen(mp, config(), unixsock.options().with_mode(438)).unwrap()
+    print(cat("mode 0666: ", n(mode_of(mp))))
+    fd.close(msrv2.ls).unwrap()
+    let z2 = unixsock.remove(mp)
+
+    print("-- an abstract socket")
+    let aname = bytes.concat(lit("eider-http-test-"), bytes.hex(tag))
+    let asrv = unixsock.listen_abstract(aname, config()).unwrap()
+    let tok4 = task.root()
+    let th4 = start(asrv, tok4)
+    let mut ac = unixsock.connect_to(unixsock.abstract_addr(aname), lit("localhost"), dl).unwrap()
+    print(body_of(Ok(ac.request(http.request("GET", lit("/whoami")), dl).unwrap())))
+    ac.close()
+    match unixsock.listen_abstract(aname, config()) {
+        Ok(s) => { print("unexpected") }
+        Err(e) => { print("a second listener on the name: refused") }
+    }
+    tok4.cancel()
+    let st4 = th4.join()
+
+    print("-- h2c over a unix socket")
+    let hp = at(d, "/h2.sock")
+    let mut hc = config()
+    hc.h2 = Some(h2.options())
+    let hsrv = unixsock.listen(hp, hc, unixsock.options()).unwrap()
+    let tok5 = task.root()
+    let th5 = start(hsrv, tok5)
+    let cl = unixsock.connect_h2(hp, h2.options(), dl).unwrap()
+    let r = cl.fetch(http.request("GET", lit("/whoami")), dl).unwrap()
+    print(cat("status ", cat2(n(r.status as i64), cat(": ", sys.to_string(r.body)))))
+    let mut hpost = http.request("POST", lit("/echo"))
+    hpost.body = lit("h2 body")
+    let r2 = cl.fetch(hpost, dl).unwrap()
+    print(cat("echo: ", sys.to_string(r2.body)))
+    cl.close()
+    // and HTTP/1.1 on the same socket
+    print(body_of(unixsock.get(hp, "/_ping", dl)))
+    tok5.cancel()
+    let st5 = th5.join()
+    let z3 = unixsock.remove(hp)
+
+    print("-- the PROXY protocol on a unix listener")
+    let pp = at(d, "/proxied.sock")
+    let mut pc = config()
+    pc.proxy_protocol = Some(proxyproto.options(proxy.trust_none().allow_unix()))
+    let psrv = unixsock.listen(pp, pc, unixsock.options()).unwrap()
+    let tok6 = task.root()
+    let th6 = start(psrv, tok6)
+    let hdr = proxyproto.encode_v2(proxyproto.header(net.ipv4(198, 51, 100, 9, 4444), net.ipv4(192, 0, 2, 1, 80)), false).unwrap()
+    let mut px = proxyproto.connect(net.unix(pp), hdr, dl).unwrap()
+    px.host = lit("localhost")
+    print(body_of(Ok(px.request(http.request("GET", lit("/whoami")), dl).unwrap())))
+    px.close()
+    match unixsock.get(pp, "/whoami", dl) {
+        Ok(r) => { print("unexpected: a request without a header was served") }
+        Err(e) => { print("without a header: dropped") }
+    }
+    tok6.cancel()
+    let st6 = th6.join()
+    print(cat("requests handled: ", n(st6.requests)))
+    let pq = at(d, "/untrusting.sock")
+    let mut pc2 = config()
+    pc2.proxy_protocol = Some(proxyproto.options(proxy.trust_none().allow("10.0.0.0/8").unwrap()))
+    let psrv2 = unixsock.listen(pq, pc2, unixsock.options()).unwrap()
+    let tok7 = task.root()
+    let th7 = start(psrv2, tok7)
+    match proxyproto.connect(net.unix(pq), hdr, dl) {
+        Ok(cc) => {
+            let mut c3 = cc.copy()
+            c3.host = lit("localhost")
+            match c3.request(http.request("GET", lit("/whoami")), dl) {
+                Ok(r) => { print("unexpected: a unix peer was trusted without allow_unix") }
+                Err(e) => { print("a unix peer is not trusted unless allow_unix: dropped") }
+            }
+            c3.close()
+        }
+        Err(e) => { print("a unix peer is not trusted unless allow_unix: dropped") }
+    }
+    tok7.cancel()
+    let st7 = th7.join()
+
+    fs.remove_all(d).unwrap()
+    print(cat("cleaned up: ", String.from(if fs.exists(d) { "no" } else { "yes" })))
+}
+
+fn mode_of(path: List[u8]) -> i64 uses fs {
+    match fs.lstat(path) {
+        Ok(s) => (s.mode as i64) % 512
+        Err(e) => -1
+    }
+}

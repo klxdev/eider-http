@@ -1,0 +1,237 @@
+//! http/unixsock: HTTP over Unix-domain sockets, serving and dialling: the Docker Engine API's way of
+//! living on `/var/run/docker.sock`, a sidecar behind a proxy on the same host, a socket a service manager hands over.
+//!
+//!     let srv = unixsock.listen(sys.lit("/run/app/api.sock"), server.config(), unixsock.options().with_mode(0o660)).unwrap()
+//!     let stats = srv.serve(handler, tok)            // the same server: workers, deadlines, HTTP/2, PROXY protocol
+//!     unixsock.remove(sys.lit("/run/app/api.sock"))           // a listening socket is not removed by closing it
+//!
+//!     let c = unixsock.connect(sys.lit("/run/app/api.sock"), dl).unwrap()      // Host: localhost
+//!     let r = unixsock.get(sys.lit("/var/run/docker.sock"), "/v1.43/containers/json", dl)
+//!
+//! std/net has AF_UNIX (`net.unix(path)`, `net.listener`, `net.connect`, `net.pair`), and `server.listen` and
+//! `client.connect` take any `net.Addr`, so this module is the plumbing around them that a pathname
+//! socket needs and TCP does not:
+//!
+//! - Stale socket files. A server that was killed leaves its socket file behind and `bind` then fails
+//!   with "address in use". `listen` removes the path only when it is a socket (a regular file, a directory or a symlink is never
+//!   touched: an error instead) **and nothing listens on it** (a probe `connect` is refused). A socket that accepts the probe
+//!   (or whose queue is full) belongs to a running server, and `listen` fails with that; the same for any other error
+//!   of the probe (permission denied: not ours to remove). `options().keep_stale()` turns the removal off.
+//! - Permissions. A socket file is created with the mode `0777` minus the process's umask, which this
+//!   library cannot change, and the mode decides who may connect (write permission on the file). With
+//!   `with_mode(m)` the socket is created inside a fresh directory only the process can enter (`0700`),
+//!   `chmod`ed to `m` there, and renamed to the path: it is never reachable with another mode, not even for an instant. (The rename
+//!   replaces what is at the path at that moment, so two servers starting on one path at the same instant is a race that this
+//!   does not close: serialise it with a lock file.) The path of the directory is a little longer than the
+//!   socket's, so the limit on the path (107 bytes on Linux) is a little tighter then.
+//! - Abstract sockets (Linux): `abstract_addr("name")` is the address with a leading NUL byte, no file, no stale state and
+//!   no permissions (any process of the network namespace may connect); `listen_abstract` serves on it.
+//! - The client: `connect` and `fetch` dial a path and send `Host: localhost` (the Docker Engine API and most
+//!   daemons accept that; `connect_host` sets another), because the address text of a unix socket is not a host. `Conn`'s
+//!   keep-alive and reconnect work as over TCP. `connect_h2` starts prior-knowledge HTTP/2 (h2c) on a unix socket (the server
+//!   serves it when `Config.h2` is set).
+//! - What a handler sees: `Request.peer` of a unix client is "unix:" (the peer of an unbound client socket has no
+//!   name), so `proxy.Trust.allow_unix()` and PROXY protocol `allow_unix()` match it, and rate limiting keys it as one client.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.fs
+import std.net
+import std.random
+import std.time
+import http
+import http.client
+import http.h2
+import http.server
+
+/// How `listen` prepares and creates the socket. `mode`: the permission bits of the socket file (`None`: what the
+/// umask leaves of 0777); `remove_stale`: remove a socket file nobody listens on.
+pub type Options = { mode: Option[u32], remove_stale: bool }
+
+/// The umask's default mode, stale socket files removed.
+pub fn options() -> Options { Options(None, true) }
+
+impl Options {
+    /// The socket file gets the permission bits `mode` (e.g. 0o660) from the moment it exists.
+    fn with_mode(self, mode: u32) -> Options { Options(Some(mode), self.remove_stale) }
+
+    /// A file at the path is never removed: `bind` fails if there is one.
+    fn keep_stale(self) -> Options { Options(self.mode, false) }
+}
+
+/// The abstract-namespace address `name` (Linux): a leading NUL byte and the name.
+pub fn abstract_addr(name: List[u8]) -> net.Addr {
+    let mut p: List[u8] = List.new()
+    p.push(0)
+    bytes.append(inout p, name)
+    net.unix(p)
+}
+
+fn has(e: String, what: str) -> bool { bytes.find(e.bytes(), sys.lit(what), 0).is_some() }
+
+/// Whether a server listens at the socket file `path`: a probe connection that is accepted or waits in a full
+/// queue says yes; "connection refused" says no; any other failure is an Err (not ours to judge).
+fn listening(path: List[u8]) -> Result[bool, String] uses net, io {
+    let s = net.socket(net.UNIX, net.STREAM, true)?
+    let r = net.connect(s, net.unix(path))
+    let z = fd.close(s)
+    match r {
+        Ok(b) => Ok(true)
+        Err(e) => {
+            if has(e, "refused") { return Ok(false) }
+            Err(e)
+        }
+    }
+}
+
+/// Makes the path free for `bind`: nothing there, or a stale socket file removed. Err for a live server, for a file that is
+/// not a socket, or for anything it cannot judge.
+fn clear_path(path: List[u8], o: Options) -> Result[(), String] uses net, io, fs {
+    let st = match fs.lstat(path) {
+        Ok(s) => s
+        Err(e) => { return Ok(()) }
+    }
+    let mut m = String.from("unix socket ")
+    m.append(sys.to_string(path))
+    if st.kind != fd.SOCKET {
+        m.push_str(": the path exists and is not a socket")
+        return Err(m)
+    }
+    if !o.remove_stale {
+        m.push_str(": the socket file exists")
+        return Err(m)
+    }
+    if listening(path)? {
+        m.push_str(": address in use (a server is listening)")
+        return Err(m)
+    }
+    fs.remove_all(path)?
+    Ok(())
+}
+
+/// Removes the socket file at `path` if it is a socket (what a server does when it has stopped); true if it removed one.
+/// Another kind of file is left alone.
+pub fn remove(path: List[u8]) -> bool uses fs {
+    let p = path.copy()
+    match fs.lstat(p) {
+        Ok(st) => {
+            if st.kind != fd.SOCKET { return false }
+            match fs.remove_all(p) {
+                Ok(b) => true
+                Err(e) => false
+            }
+        }
+        Err(e) => false
+    }
+}
+
+fn path_ok(path: List[u8]) -> Result[List[u8], String] {
+    let p = path.copy()
+    if p.len() == 0 { return Err(String.from("unix socket: an empty path (use abstract_addr for an abstract socket)")) }
+    if bytes.find_byte(p, 0, 0).is_some() { return Err(String.from("unix socket: a NUL byte in the path")) }
+    if p.len() > 107 { return Err(String.from("unix socket: the path is longer than 107 bytes")) }
+    Ok(p)
+}
+
+/// Binds and listens on the unix socket `path` (see the module comment for stale files and permissions); serve it with
+/// `Server.serve`. `Server.addr()` is the path.
+pub fn listen(path: List[u8], cfg: server.Config, o: Options) -> Result[server.Server, String] uses net, io, clock, fs {
+    let p = path_ok(path)?
+    clear_path(p, o)?
+    match o.mode {
+        None => { server.listen(net.unix(p), cfg) }
+        Some(mode) => {
+            let dir = fs.dirname(p)
+            let tag = random.bytes(6)?
+            let mut name = sys.lit(".s")
+            bytes.append(inout name, bytes.hex(tag))
+            let tmp = fs.join(dir, name)
+            fs.mkdir_all(tmp)?
+            // only this process may enter the directory until the socket has its mode
+            match fs.chmod(tmp, 448) {
+                Ok(b) => {}
+                Err(e) => {
+                    let z = fs.remove_all(tmp)
+                    return Err(e)
+                }
+            }
+            let inner = fs.join(tmp, sys.lit("s"))
+            if inner.len() > 107 {
+                let z = fs.remove_all(tmp)
+                return Err(String.from("unix socket: the path is too long for a socket with a mode (107 bytes minus the temporary directory)"))
+            }
+            let mut srv = match server.listen(net.unix(inner), cfg) {
+                Ok(s) => s
+                Err(e) => {
+                    let z = fs.remove_all(tmp)
+                    return Err(e)
+                }
+            }
+            let moved = fs.chmod(inner, mode)
+            let placed = match moved {
+                Ok(b) => fs.rename(inner, p)
+                Err(e) => Err(e)
+            }
+            let z = fs.remove_all(tmp)
+            match placed {
+                Ok(b) => {
+                    srv.addr = net.unix(p)
+                    Ok(srv)
+                }
+                Err(e) => {
+                    fd.close(srv.ls)
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// Listens on the abstract socket `name` (Linux).
+pub fn listen_abstract(name: List[u8], cfg: server.Config) -> Result[server.Server, String] uses net, io {
+    server.listen(abstract_addr(name), cfg)
+}
+
+/// Connects to the unix socket `path` before `dl`; requests carry `Host: localhost`.
+pub fn connect(path: List[u8], dl: time.Deadline) -> Result[client.Conn, String] uses net, io, clock {
+    connect_to(net.unix(path), sys.lit("localhost"), dl)
+}
+
+/// `connect`, with another `Host` header.
+pub fn connect_host(path: List[u8], host: List[u8], dl: time.Deadline) -> Result[client.Conn, String] uses net, io, clock {
+    connect_to(net.unix(path), host, dl)
+}
+
+/// Connects to any unix address (`abstract_addr(name)` too).
+pub fn connect_to(a: net.Addr, host: List[u8], dl: time.Deadline) -> Result[client.Conn, String] uses net, io, clock {
+    if a.family != net.UNIX { return Err(String.from("unix socket: not a unix address")) }
+    let mut c = client.connect(a, dl)?
+    c.host = host
+    Ok(c)
+}
+
+/// One request to the socket `path` on a new connection, closed afterwards (the Docker CLI's way).
+pub fn fetch(path: List[u8], req: http.Request, dl: time.Deadline) -> Result[http.Response, String] uses net, io, clock {
+    let mut c = connect(path, dl)?
+    let mut r = req.copy()
+    r.keep_alive = false
+    let resp = c.request(r, dl)
+    c.close()
+    resp
+}
+
+/// GET `target` from the socket `path` (one-shot).
+pub fn get(path: List[u8], target: str, dl: time.Deadline) -> Result[http.Response, String] uses net, io, clock {
+    fetch(path, http.request("GET", sys.lit(target)), dl)
+}
+
+/// Starts prior-knowledge HTTP/2 (h2c) on a new connection to the unix socket `path`: the `h2.Client`'s `fetch` sends
+/// `localhost` as the authority. The server must have `Config.h2` set.
+pub fn connect_h2(path: List[u8], opt: h2.Options, dl: time.Deadline) -> Result[h2.Client, String] uses net, io, clock, threads {
+    let conn = connect(path, dl)?
+    match h2.connect(h2.wire_of_transport(conn.transport()), opt) {
+        Ok(c) => Ok(c.with_target("http".bytes(), conn.host.copy()))
+        Err(e) => Err(e.why)
+    }
+}
