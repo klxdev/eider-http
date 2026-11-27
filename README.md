@@ -39,7 +39,7 @@ fn main() uses io, net, clock, threads {
 | `http/ratelimit` | rate limiting per client address (GCRA), 429 with `Retry-After`, bounded memory |
 | `http/metrics` | counters, an in-flight gauge and a latency histogram (Prometheus text), optionally per route |
 | `http/sse` | server-sent events |
-| `http/ws` | WebSockets (RFC 6455) with limits, a codec and a test client |
+| `http/ws` | WebSockets (RFC 6455) with limits, a codec and a client; permessage-deflate and WebSocket over HTTP/2 (RFC 8441) (docs/ws-extensions.md) |
 | `http/h2`, `http/hpack`, `http/h2frame` | HTTP/2 (RFC 9113) and HPACK (RFC 7541): server and client over any connected duplex, streaming both ways, trailers, flow control, h2c and ALPN `h2`; for gRPC |
 | `http/trace` | W3C traceparent propagation and a span per request |
 | `http/problem` | `ApiError`, written as RFC 9457 problem+json |
@@ -47,6 +47,21 @@ fn main() uses io, net, clock, threads {
 | `http/transport` | the bytes under a connection, plain or TLS (the server, the client and `ws` use only it; it imports no TLS) |
 | `http/secure` | https: `server_from_files(...)`, `service.options().with_tls(tls.acceptor())`, `client_system()`, `connect_url("https://...")`, `dial_ws("wss://...")`, client certificates, certificate reload (eider-tls, TLS 1.3) |
 | `http/sock` | sending before a deadline, lingering close |
+| `http/extract` | Typed extractors: `json`, `query`, `form`, `path` into `@[derive(Deserialize)]` types, `Rejection` to problem+json (400/413/415/422), `respond_json` (docs/extract.md) |
+| `http/cookie` | `Cookie`/`Set-Cookie` parsing and building (RFC 6265bis rules, prefixes, no header injection), signed (HMAC) and private (AES-GCM) jars with key rotation |
+| `http/cookiejar` | a client cookie store: domain/path matching, expiry, Secure |
+| `http/pool` | a high-level client: per-authority connection pool, h2 multiplexing, redirects, cookie jar, base URL, default headers, deadlines, gzip |
+| `http/multipart` | `multipart/form-data` parser: streaming parts with limits, 400/413/415 problem+json, filename sanitising, and a body builder (docs/multipart.md) |
+| `http/auth` | `Authorization` parsing (Basic, Bearer), verifiers, Basic/Bearer/JWT middleware with RFC 6750 challenges and scopes (docs/auth.md) |
+| `http/jwt` | JWS/JWT verification and signing, key sets, JWKS, claim checks (docs/auth.md) |
+| `http/csrf` | signed double-submit CSRF tokens, Origin/Sec-Fetch-Site checks, SameSite cookie helper (docs/auth.md) |
+| `http/wsext` | permessage-deflate (RFC 7692): the `Sec-WebSocket-Extensions` negotiation and the per-message codec (docs/ws-extensions.md) |
+| `http/proxyproto` | HAProxy PROXY protocol v1/v2: parser, writer, trusted-proxy allow-list, `server.Config.proxy_protocol` |
+| `http/unixsock` | HTTP over Unix-domain sockets: listen (stale files, mode, abstract), connect/fetch with `Host: localhost`, h2c |
+| `http/h3frame` | HTTP/3 frames and varints (RFC 9114, RFC 9000 section 16): an incremental decoder that streams DATA, skips reserved frames and refuses with the RFC's error codes; encoders; SETTINGS (docs/h3.md) |
+| `http/qpack` | QPACK (RFC 9204): static and dynamic tables, encoder and decoder streams, blocked streams, limits; checked against libnghttp3 (docs/h3.md) |
+| `http/h3` | HTTP/3 over any streams, sans-IO: control stream, SETTINGS, requests, responses, trailers, GOAWAY, errors; no QUIC transport yet (docs/h3.md) |
+| `http/limit` | concurrency limits (queue or shed, per route or key, adaptive), handler timeout (504), client retry with budget (docs/limit.md) |
 
 [docs/services.md](docs/services.md) is the design: the concurrency model, every limit and
 default, the security posture, TLS (in the process or behind a proxy), the tests and the

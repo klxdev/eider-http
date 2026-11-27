@@ -3,6 +3,64 @@
 eider-http's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## 0.8.1
+
+Features for the axum/hyper gaps (milestone v0.8.1; issues #13 to #21). All are additive: nothing changes for a program that does not use them,
+except where noted under "Breaking". Docs: docs/extract.md, cookie.md, pool.md, multipart.md, auth.md, limit.md, ws-extensions.md, ops.md, h3.md.
+
+- `http/extract`: typed extractors `json[T]`, `query[T]`, `form[T]`, `path[T]` (and `json_with`, `form_with`, `read_body`, `json_bytes`) that read a request into a `@[derive(Deserialize)]` type through std/serial and eider-json, with a typed `Rejection` that becomes problem+json: 400 malformed, 415 wrong Content-Type, 413 over the limit (streamed bodies are cut off at the limit), 422 invalid with every `@[check]` violation and its field place (JSON pointer for bodies, name for query and path). Queries and forms handle repeated keys (`List` fields), `Option`, percent-decoding and numbers and bools from text. `respond_json[T]` writes a value as a JSON response. docs/extract.md.
+- **`http/cookie`** (#15): the `Cookie` header, `Set-Cookie` built and parsed (Path, Domain, Max-Age, Expires, Secure, HttpOnly,
+  SameSite, Partitioned) with the RFC 6265bis rules (name and value validity, no header injection, size limits, `__Host-` and
+  `__Secure-` prefixes, lenient RFC 6265 date parsing), a signed jar (HMAC-SHA-256 over name and value, constant-time verify, a list
+  of keys for rotation) and a private jar (AES-256-GCM, the name as associated data, rotation). Docs: docs/cookie.md. Tests:
+  `tests/cookie_test.ei`.
+- **`http/cookiejar`**: a client cookie store (domain and path matching, expiry, Secure, "leave Secure cookies alone", limits).
+  Test: `tests/cookiejar_test.ei`.
+- **`http/pool`** (#14): a high-level client: a pool of keep-alive HTTP/1.1 connections per authority (max idle per host, idle timeout,
+  stale-connection detection, one retry of an idempotent call), HTTP/2 multiplexing over one connection when ALPN selects `h2`,
+  redirects (301/302/303/307/308 method and body rules, a limit, credentials dropped across origins, https to http refused by default),
+  a cookie jar, a base URL, default headers, one deadline per call, gzip/deflate/zstd decoding. Thread-safe (state behind `sync.Lock`s).
+  Docs: docs/pool.md. Tests: `tests/pool_test.ei`, `tests/pool_tls_test.ei`.
+- **`http/h2`**: a client stream of a HEAD request no longer fails with PROTOCOL_ERROR when the response's `content-length` is not
+  followed by a body (also 204 and 304); found by the pool's HEAD test. (5 lines in h2.ei: a `head_req` field of `Strm`.)
+- `http/multipart` (multipart.ei): `multipart/form-data` request bodies (RFC 7578/2046) as a stream. A pure
+  incremental `Parser` (same result for any chunking), a `Form` over a `stream.Reader` (a streamed
+  `Request.stream`: `next_part`, `read` in chunks, nothing buffered), and `collect`/`parse_request` (text in
+  memory, files in memory up to `max_memory`, then a 0600 temp file under `spill_dir`). Boundary handling
+  (quoted, 70 chars, split across reads, boundary-like content, preamble/epilogue), `filename*` (RFC 5987/2231),
+  limits (parts, header bytes, part bytes, total bytes, fields) with typed errors mapped to 400/413/415
+  problem+json, `safe_filename`/`header_safe`, and a `Builder` writer with a random boundary. Interop tests
+  against `curl -F` and Python's email/http stdlib. docs/multipart.md.
+- **http/auth, http/jwt, http/csrf** (docs/auth.md): the `Authorization` header (Basic per RFC 7617 with UTF-8 and colons in passwords, Bearer per RFC 6750) with verifiers, constant-time tables and `basic`, `bearer`, `jwt_bearer`, `require_scope` middleware (401 `invalid_token`, 403 `insufficient_scope`, 400 `invalid_request`, the principal, scopes and claims in the request context); JWT/JWS verification and signing (HS256/384/512, RS256/384/512, PS256/384/512, ES256, ES384, EdDSA) with a strict allow-list bound to the key type (no `none`, no algorithm confusion), `kid` key sets and JWKS parsing, `exp`/`nbf`/`iat` with leeway, `iss`/`aud`, size limits; CSRF protection with signed double-submit tokens bound to the session, `Origin`/`Sec-Fetch-Site` checks and a small SameSite cookie helper. Tests include RFC 7515 A.1, jwt.io's HS256 vector, OpenSSL- and python-made tokens.
+- `http/limit`: tower-style layers. `limiter`/`concurrency`: a shared in-flight cap (global, per
+  route, or per key with `by`) that queues (bounded length and wait, FIFO hand-off) or sheds with
+  `503` + `Retry-After` problem+json; `shedder`/`load_shed`: an adaptive (AIMD on latency, queue
+  age) cap; `timeout`/`timeouts`: handler timeout answering `504` with counters; `retry`: a client
+  helper over `client.fetch`/`fetch_host` with a retry budget, exponential backoff with jitter,
+  idempotent-methods-only default and `Retry-After`. Counters via `expose(metrics)`.
+- WebSocket: permessage-deflate (RFC 7692) in `http/ws` (new module `http/wsext`): `Options.with_deflate()` /
+  `deflate_with(level, min, takeover)` on the server, `ws.dial_with`/`DialOptions` on the client, `Client.recv_message`;
+  negotiates `Sec-WebSocket-Extensions` (`*_no_context_takeover`, `client_max_window_bits`), RSV1 on a compressed
+  message's first frame, the `00 00 ff ff` tail, context takeover, and caps what a message inflates to at `max_message`
+  (a bomb closes with 1009); off by default. WebSocket over HTTP/2 (RFC 8441): `h2.Options.connect_protocol`
+  advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` and `h2.handler` hands an extended CONNECT to the handler, where
+  `ws.accept` answers 200 and runs the same `Conn` over the stream's DATA; `ws.dial_h2(h2.Client, ...)` is the client.
+  `h2.Conn.open` refuses `:protocol` until the peer advertised the setting. Docs: docs/ws-extensions.md.
+- `http/proxyproto`: HAProxy PROXY protocol v1 and v2 at the start of an accepted connection (all address families, TCP/UDP, LOCAL and PROXY, TLVs: ALPN, authority, SSL, unique id, CRC32c checked; strict limits: 107-byte v1 line, 536-byte v2 header by default), a trusted-proxies allow-list (`proxy.Trust`), modes `Required` and `Optional` and refuse-or-ignore for an untrusted sender (a header that is recognised but invalid always drops the connection), a writer (`encode_v1`, `encode_v2`, `connect`), and `server.Config.proxy_protocol` (default `None`) so `Request.peer` and the rate-limit key are the real client. `http/unixsock`: serving and dialling Unix-domain sockets: `listen` (stale socket files removed only when nothing listens, an optional permission mode applied before the socket is reachable, abstract sockets), `connect`/`fetch`/`get` with `Host: localhost` (the Docker Engine API), h2c over a unix socket. docs/ops.md.
+- **HTTP/3 building blocks (issue #20): `http/h3frame`, `http/qpack`, `http/h3`.** RFC 9000 varints and RFC 9114 frames
+  with an incremental decoder that streams DATA and skips grease frames; QPACK (RFC 9204) with static and dynamic tables,
+  encoder and decoder streams and blocked streams (RFC 9204 appendix B reproduced byte for byte, checked against libnghttp3 in
+  both directions); and a sans-IO HTTP/3 connection (control stream, SETTINGS, requests, responses, trailers, interim
+  responses, GOAWAY, every error code of RFC 9114) that runs over any set of streams, tested Eider to Eider over in-memory
+  ones. The QUIC transport itself is not included: it is blocked on header protection primitives in `crypto`, a message-level
+  handshake API with `quic_transport_parameters` in eider-tls, and (for quality) UDP ancillary data in `std.net`;
+  `docs/h3.md` lists the exact asks.
+
+- **Breaking for code that builds these records by position or calls them as listed:** `server.Config` has one new last field
+  (`proxy_protocol`); `ws.Options`, `ws.Client`, `ws.Frame`, `ws.Decoder` and `h2.Options` gained fields (use `ws.options()` and `h2.options()`);
+  `ws.Client.send_text` / `send_binary` take `inout self`; `http.ws` now imports `http.h2`.
+- **Not included:** the QUIC transport (HTTP/3 above it is), ES512 for JWT, a public suffix list for cookies. See each docs page and issue #20.
+
 ## 0.8.0
 
 For Eider 0.8: the version and the `eider` series move to 0.8 with the toolchain; no source changes.
