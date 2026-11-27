@@ -1,0 +1,280 @@
+// http/auth: Authorization parsing (Basic with colons, UTF-8 and bad base64; Bearer token68), the
+// constant-time tables, and the middleware: 401/403/400 challenges, optional mode, principals
+// (and a spoofed one scrubbed), scopes, and JWTs plugged in.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import std.time
+import http
+import http.auth
+import http.jwt
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn get(target: str) -> http.Request { http.request("GET", lit(target)) }
+
+fn with_header(r: http.Request, name: str, v: List[u8]) -> http.Request {
+    let mut q = r.copy()
+    q.headers.push(http.Header(http.lower(lit(name)), v))
+    q
+}
+
+fn authz(v: List[u8]) -> http.Request { with_header(get("/"), "Authorization", v) }
+
+fn show(r: http.Response) uses io {
+    let mut l = bytes.from_u64(r.status as u64)
+    for h in r.headers {
+        if http.eq_ci_s(h.name, "www-authenticate") {
+            l.push(32)
+            bytes.append(inout l, h.value)
+        }
+    }
+    match r.get_ctx("principal") {
+        Some(p) => {
+            bytes.append(inout l, lit(" [principal="))
+            bytes.append(inout l, p)
+            l.push(93)
+        }
+        None => {}
+    }
+    bytes.append(inout l, lit(" | "))
+    bytes.append(inout l, r.body)
+    io.outln(l)
+}
+
+fn who() -> http.Handler {
+    |req: http.Request| -> http.Response {
+        let mut b = lit("hello ")
+        match auth.principal(req) {
+            Some(p) => bytes.append(inout b, p)
+            None => bytes.append(inout b, lit("(nobody)"))
+        }
+        match auth.scheme_of(req) {
+            Some(s) => {
+                b.push(32)
+                bytes.append(inout b, s)
+            }
+            None => {}
+        }
+        match req.get_ctx("scope") {
+            Some(s) => {
+                bytes.append(inout b, lit(" scope="))
+                bytes.append(inout b, s)
+            }
+            None => {}
+        }
+        http.respond(200, "text/plain", b)
+    }
+}
+
+fn pb(label: str, v: List[u8]) uses io {
+    let mut l = lit(label)
+    bytes.append(inout l, lit(": "))
+    match auth.parse_basic(v) {
+        Ok(Some(b)) => {
+            bytes.append(inout l, lit("user=["))
+            bytes.append(inout l, b.user)
+            bytes.append(inout l, lit("] password=["))
+            bytes.append(inout l, b.password)
+            l.push(93)
+        }
+        Ok(None) => bytes.append(inout l, lit("another scheme"))
+        Err(e) => {
+            bytes.append(inout l, lit("error: "))
+            bytes.append(inout l, e.bytes())
+        }
+    }
+    io.outln(l)
+}
+
+fn pr(label: str, v: List[u8]) uses io {
+    let mut l = lit(label)
+    bytes.append(inout l, lit(": "))
+    match auth.parse_bearer(v) {
+        Ok(Some(t)) => {
+            bytes.append(inout l, lit("token=["))
+            bytes.append(inout l, t)
+            l.push(93)
+        }
+        Ok(None) => bytes.append(inout l, lit("another scheme"))
+        Err(e) => {
+            bytes.append(inout l, lit("error: "))
+            bytes.append(inout l, e.bytes())
+        }
+    }
+    io.outln(l)
+}
+
+fn b64(s: List[u8]) -> List[u8] { encoding.base64(s).bytes() }
+
+fn basic_raw(prefix: str, raw: List[u8]) -> List[u8] {
+    let mut v = lit(prefix)
+    bytes.append(inout v, b64(raw))
+    v
+}
+
+fn main() uses io, clock {
+    io.outln(lit("-- Basic parsing"))
+    // RFC 7617's example
+    pb("RFC 7617", lit("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="))
+    pb("lowercase scheme", lit("basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="))
+    pb("two spaces", lit("Basic  QWxhZGRpbjpvcGVuIHNlc2FtZQ=="))
+    pb("colon in the password", auth.basic_header(lit("ada"), lit("pa:ss:word")))
+    pb("empty password", auth.basic_header(lit("ada"), List.new()))
+    pb("empty user", auth.basic_header(List.new(), lit("pw")))
+    pb("UTF-8", auth.basic_header(lit("Jos\u{e9}"), lit("p\u{e4}ssw\u{f6}rd \u{1f511}")))
+    pb("RFC 7617 test:123", lit("Basic dGVzdDoxMjPCow=="))
+    pb("no colon", basic_raw("Basic ", lit("nocolon")))
+    pb("not base64", lit("Basic !!!!"))
+    pb("missing padding", lit("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ"))
+    pb("padding in the middle", lit("Basic QWxh=ZGRpbjpvcGVuIHNlc2FtZQ=="))
+    pb("space inside", lit("Basic QWxhZGRp bjpvcGVuIHNlc2FtZQ=="))
+    pb("url-safe alphabet", lit("Basic -_-_"))
+    let mut bad = lit("ada:")
+    bad.push(255)
+    bad.push(254)
+    pb("invalid UTF-8", basic_raw("Basic ", bad))
+    let mut ctl = lit("a")
+    ctl.push(10)
+    bytes.append(inout ctl, lit("b:pw"))
+    pb("newline in the user", basic_raw("Basic ", ctl))
+    pb("scheme only", lit("Basic"))
+    pb("scheme and a space", lit("Basic "))
+    pb("Basicx", lit("Basicx QWxhZGRpbjpvcGVuIHNlc2FtZQ=="))
+    pb("Bearer", lit("Bearer abc"))
+    pb("empty", List.new())
+    let mut huge = lit("Basic ")
+    for i in 0..9000 { huge.push(65) }
+    pb("too long", huge)
+    let back = auth.parse_basic(auth.basic_header(lit("x"), lit("y:z"))).unwrap().unwrap()
+    print(bytes.eq(back.password, lit("y:z")))
+
+    io.outln(lit("-- Bearer parsing"))
+    pr("plain", lit("Bearer abc.def-ghi_jkl~+/="))
+    pr("lowercase", lit("bearer T"))
+    pr("padding then more", lit("Bearer ab=c"))
+    pr("space inside", lit("Bearer a b"))
+    pr("quote", lit("Bearer \"abc\""))
+    pr("no token", lit("Bearer"))
+    pr("no token, space", lit("Bearer "))
+    pr("Basic", lit("Basic abc"))
+    pr("Bearerx", lit("Bearerx abc"))
+
+    io.outln(lit("-- Authorization headers"))
+    print(auth.authorization(get("/")).unwrap().is_none())
+    print(auth.authorization(authz(lit("x"))).unwrap().is_some())
+    print(auth.authorization(with_header(authz(lit("x")), "authorization", lit("y"))).is_err())
+    print(auth.secret_eq(lit("a"), lit("a")))
+    print(auth.secret_eq(lit("a"), lit("b")))
+    print(auth.secret_eq(lit("a"), lit("ab")))
+    print(auth.secret_eq(List.new(), List.new()))
+
+    io.outln(lit("-- basic middleware"))
+    let mut users: List[(List[u8], List[u8])] = List.new()
+    users.push((lit("root"), lit("pa:ss")))
+    users.push((lit("ada"), lit("lovelace")))
+    let h = auth.basic(auth.config("admin \"area\""), auth.basic_table(users), who())
+    show(h(get("/")))
+    show(h(authz(auth.basic_header(lit("root"), lit("pa:ss")))))
+    show(h(authz(auth.basic_header(lit("ada"), lit("lovelace")))))
+    show(h(authz(auth.basic_header(lit("root"), lit("pa:s")))))
+    show(h(authz(auth.basic_header(lit("root"), lit("pa:ssx")))))
+    show(h(authz(auth.basic_header(lit("roo"), lit("pa:ss")))))
+    show(h(authz(auth.basic_header(lit("ada"), lit("pa:ss")))))
+    show(h(authz(auth.basic_header(lit("nobody"), List.new()))))
+    show(h(authz(lit("Basic !!!"))))
+    show(h(authz(lit("Bearer abc"))))
+    show(h(with_header(authz(auth.basic_header(lit("root"), lit("pa:ss"))), "authorization", auth.basic_header(lit("ada"), lit("lovelace")))))
+    // a client cannot name its own principal: the context is not a header, and whatever was there is dropped
+    let mut spoof = authz(lit("Basic !!!"))
+    spoof.set_ctx("principal", lit("root"))
+    show(h(spoof))
+    let mut spoof2 = get("/")
+    spoof2.set_ctx("principal", lit("root"))
+    spoof2.set_ctx("scope", lit("admin"))
+    let ob = auth.basic(auth.optional("o"), auth.basic_table(users), who())
+    show(ob(spoof2))
+    let opt = auth.basic(auth.optional("open"), auth.basic_table(users), who())
+    show(opt(get("/")))
+    show(opt(authz(lit("Bearer other"))))
+    show(opt(authz(auth.basic_header(lit("root"), lit("wrong")))))
+    show(opt(authz(auth.basic_header(lit("root"), lit("pa:ss")))))
+
+    io.outln(lit("-- bearer middleware"))
+    let mut toks: List[(List[u8], List[u8])] = List.new()
+    toks.push((lit("tok-ada"), lit("ada")))
+    toks.push((lit("tok-bob"), lit("bob")))
+    let b = auth.bearer(auth.config("api"), auth.token_table(toks), who())
+    show(b(get("/")))
+    show(b(authz(auth.bearer_header(lit("tok-ada")))))
+    show(b(authz(lit("bearer tok-bob"))))
+    show(b(authz(auth.bearer_header(lit("tok-adx")))))
+    show(b(authz(auth.bearer_header(lit("tok-ada-and-more")))))
+    show(b(authz(lit("Bearer a b"))))
+    show(b(authz(lit("Bearer"))))
+    show(b(authz(auth.basic_header(lit("ada"), lit("x")))))
+    show(b(with_header(authz(auth.bearer_header(lit("tok-ada"))), "authorization", auth.bearer_header(lit("tok-bob")))))
+    let verdicts = auth.bearer(auth.config("api"), |t: List[u8]| -> auth.Verdict {
+        if bytes.eq(t, lit("ro")) { return auth.Granted(lit("reader"), lit("read"), lit("")) }
+        if bytes.eq(t, lit("rw")) { return auth.Granted(lit("writer"), lit("read write"), lit("")) }
+        if bytes.eq(t, lit("low")) { return auth.Forbidden(lit("read")) }
+        if bytes.eq(t, lit("lower")) { return auth.Forbidden(List.new()) }
+        auth.Denied
+    }, who())
+    show(verdicts(authz(lit("Bearer ro"))))
+    show(verdicts(authz(lit("Bearer low"))))
+    show(verdicts(authz(lit("Bearer lower"))))
+    show(verdicts(authz(lit("Bearer nope"))))
+    let scoped = auth.bearer(auth.config("api"), |t: List[u8]| -> auth.Verdict {
+        if bytes.eq(t, lit("ro")) { return auth.Granted(lit("reader"), lit("read"), lit("")) }
+        if bytes.eq(t, lit("rw")) { return auth.Granted(lit("writer"), lit("read write"), lit("")) }
+        auth.Denied
+    }, auth.require_scope(auth.config("api"), "write", who()))
+    show(scoped(authz(lit("Bearer ro"))))
+    show(scoped(authz(lit("Bearer rw"))))
+    show(scoped(get("/")))
+    let rs = auth.require_scope(auth.config("api"), "write", who())
+    show(rs(get("/")))
+    let optb = auth.bearer(auth.optional("api"), auth.token_table(toks), who())
+    show(optb(get("/")))
+    show(optb(authz(auth.bearer_header(lit("tok-bob")))))
+    show(optb(authz(auth.bearer_header(lit("junk")))))
+    show(optb(authz(auth.basic_header(lit("a"), lit("b")))))
+
+    io.outln(lit("-- JWT bearer"))
+    let secret = lit("0123456789abcdef0123456789abcdef")
+    let keys = jwt.keyset().add("k1", jwt.Secret(secret))
+    let mut v = jwt.validation(List[jwt.HS256])
+    v.audience = Some(lit("api"))
+    v.issuer = Some(lit("https://issuer.example"))
+    let now = time_now()
+    let good = jwt.claims().str("iss", lit("https://issuer.example")).str("sub", lit("ada")).str("aud", lit("api")).str("scope", lit("read write")).int("exp", now + 600).json()
+    let tok = jwt.sign(jwt.HS256, jwt.SecretKey(secret), lit("k1"), good).unwrap()
+    let jb = auth.jwt_bearer(auth.config("api"), v, keys, who())
+    show(jb(authz(auth.bearer_header(tok))))
+    let expired = jwt.sign(jwt.HS256, jwt.SecretKey(secret), lit("k1"), jwt.claims().str("iss", lit("https://issuer.example")).str("sub", lit("ada")).str("aud", lit("api")).int("exp", now - 600).json()).unwrap()
+    show(jb(authz(auth.bearer_header(expired))))
+    let wrongaud = jwt.sign(jwt.HS256, jwt.SecretKey(secret), lit("k1"), jwt.claims().str("iss", lit("https://issuer.example")).str("sub", lit("ada")).str("aud", lit("web")).int("exp", now + 600).json()).unwrap()
+    show(jb(authz(auth.bearer_header(wrongaud))))
+    let nosub = jwt.sign(jwt.HS256, jwt.SecretKey(secret), lit("k1"), jwt.claims().str("iss", lit("https://issuer.example")).str("aud", lit("api")).int("exp", now + 600).json()).unwrap()
+    show(jb(authz(auth.bearer_header(nosub))))
+    let other = jwt.sign(jwt.HS256, jwt.SecretKey(lit("ffffffffffffffffffffffffffffffff")), lit("k1"), good).unwrap()
+    show(jb(authz(auth.bearer_header(other))))
+    show(jb(authz(lit("Bearer not.a.jwt"))))
+    let admin = auth.jwt_bearer(auth.config("api"), v, keys, auth.require_scope(auth.config("api"), "admin", who()))
+    show(admin(authz(auth.bearer_header(tok))))
+    let writer = auth.jwt_bearer(auth.config("api"), v, keys, auth.require_scope(auth.config("api"), "write", who()))
+    show(writer(authz(auth.bearer_header(tok))))
+    let cc = jwt.sign(jwt.HS256, jwt.SecretKey(secret), lit("k1"), jwt.claims().str("iss", lit("https://issuer.example")).str("client_id", lit("svc-1")).str("aud", lit("api")).int("exp", now + 600).json()).unwrap()
+    show(jb(authz(auth.bearer_header(cc))))
+    // the claims reach the handler
+    let claims_h = auth.jwt_bearer(auth.config("api"), v, keys, |req: http.Request| -> http.Response {
+        http.respond(200, "application/json", req.get_ctx("claims").unwrap())
+    })
+    let r = claims_h(authz(auth.bearer_header(tok)))
+    print(r.body.len() > 20)
+}
+
+fn time_now() -> i64 uses clock { time.unix_seconds() }
