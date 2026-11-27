@@ -1,0 +1,95 @@
+-- negotiation
+plain: permessage-deflate
+client bits without a value: permessage-deflate
+client bits with a value: permessage-deflate; server_no_context_takeover; client_max_window_bits=10
+second offer wins: permessage-deflate
+server bits 15: permessage-deflate
+unknown parameter: no extension
+value on a flag: no extension
+bits out of range: no extension
+repeated parameter: no extension
+other extension first: permessage-deflate; client_no_context_takeover
+only another extension: no extension
+quoted value: permessage-deflate; client_max_window_bits=11
+upper case: permessage-deflate; client_no_context_takeover
+forced: permessage-deflate; server_no_context_takeover; client_no_context_takeover
+permessage-deflate
+permessage-deflate; client_no_context_takeover; server_no_context_takeover
+a|b|c
+response ok: server_nct=false client_nct=false
+response ok: server_nct=true client_nct=true
+response error: the server chose an extension that was not offered
+response error: the server sent client_max_window_bits, which was not offered
+response error: the server's permessage-deflate parameters are invalid
+-- RFC 7692 7.2.3: decoding
+one block: Hello
+with a back reference (context takeover): Hello
+no takeover, first: Hello
+no takeover, second: Hello
+a stored block: Hello
+a BFINAL block: Hello
+after a BFINAL block the window goes on: Hello
+-- encoding
+f248cdc9c90700
+02130000
+f248cdc9c90700
+f248cdc9c90700
+short message compressed: false
+empty message compressed: false
+-- a round trip with takeover, 50 messages
+round trips: 50
+compressed: 50
+-- the cap on what a message inflates to (a bomb)
+bomb is smaller than 5000 bytes: true
+refused: deflate: output over the limit
+at the cap: 65536
+over the cap, refused: deflate: output over the limit
+messages under the cap in a row: 10
+garbage error: deflate: invalid block type 3
+-- RSV1 in the frame decoder
+not negotiated: 1002 reserved bits are set (no extensions are negotiated)
+negotiated, rsv1: true
+rsv1 on a ping: 1002 RSV1 on a control or continuation frame
+rsv1 on a continuation: 1002 RSV1 on a control or continuation frame
+rsv2: 1002 reserved bits are set (no extensions are negotiated)
+-- a negotiated connection
+permessage-deflate
+first echo: rsv1=true smaller=true
+second echo (the window is kept): smaller than the first=true
+a short message is not compressed: rsv1=false
+echoed 451 0
+echoed 451 1
+echoed 451 2
+echoed 451 3
+echoed 451 4
+binary 4000
+text 30
+utf-8 intact: true
+-- no context takeover (forced by the server)
+permessage-deflate; server_no_context_takeover; client_no_context_takeover
+same size both times: true
+echo 1805
+echo 1805
+echo 1805
+-- no context takeover (asked by the client)
+permessage-deflate; server_no_context_takeover; client_no_context_takeover
+same size both times: true
+-- the extension is off unless both sides want it
+server without it: extensions=none
+plain frame: rsv1=false len=1800
+client without it: extensions=none
+plain frame: rsv1=false len=1800
+RSV1 without the extension: close 1002
+-- limits and violations on a negotiated connection
+a message of max_message bytes: binary 8192
+one byte over, compressed: closed 1009
+the bomb on the wire is under 4000 bytes: true
+a bomb: close 1009
+invalid DEFLATE data: close 1007
+a compressed ping: close 1002
+RSV1 on a continuation: close 1002
+a compressed text frame from raw bytes: text Hello
+and the next one that refers back to it: text Hello
+-- a compressed invalid UTF-8 text message
+close 1007
+true

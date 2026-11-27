@@ -1,0 +1,50 @@
+-- the server advertises SETTINGS_ENABLE_CONNECT_PROTOCOL
+true
+-- an ordinary request on the same connection
+status 200
+hello over h2
+-- an echo conversation over one stream
+chat.v1
+opcode 1 héllo
+opcode 2 bin
+opcode 1 fragmented
+opcode 10 p
+binary 8000
+closed 1000 
+-- three WebSockets at once on one h2 connection
+failures: 0
+-- permessage-deflate over h2
+permessage-deflate
+rsv1=true smaller=true
+second smaller (window kept)=true
+a message over max_message when inflated: close 1009
+-- the server sends first and closes
+text welcome
+closed 1000 bye
+-- refusals: an unknown path, another :protocol
+dial_h2: the server answered 404
+:status 501
+-- the 200 has no Sec-WebSocket-Accept or Upgrade
+:status: 200
+sec-websocket-protocol: chat.v1
+:status: 426
+sec-websocket-version: 13
+-- a server that has not enabled it
+false
+dial_h2: the server does not allow extended CONNECT (RFC 8441)
+-- raw: :protocol when the server did not advertise the setting
+RST_STREAM PROTOCOL_ERROR
+setting advertised: false
+-- raw: extended CONNECT when it did
+HEADERS (the request was accepted)
+setting advertised: true
+-- raw: extended CONNECT without :path
+RST_STREAM PROTOCOL_ERROR
+setting advertised: true
+-- raw: :protocol on a GET
+RST_STREAM PROTOCOL_ERROR
+setting advertised: true
+-- raw: a plain CONNECT (no :protocol) is still the tunnel form: no :path, no :scheme
+RST_STREAM PROTOCOL_ERROR
+setting advertised: true
+done
