@@ -1,0 +1,60 @@
+== required, from a trusted address
+v1 tcp4: peer=203.0.113.7:51234 key=203.0.113.7 proxy_version=1 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v1 tcp4, request after the header: peer=203.0.113.7:51234 key=203.0.113.7 proxy_version=1 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v1 tcp6: peer=[2001:db8:0:0:0:0:0:7]:51234 key=[2001:db8:0:0:0:0:0:0] proxy_version=1 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=[2001:db8:0:0:0:0:0:1]:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v1 mapped: peer=203.0.113.8:1 key=203.0.113.8 proxy_version=1 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=[2001:db8:0:0:0:0:0:1]:2 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v1 unknown: peer=127.0.0.1:<ephemeral> key=127.0.0.1 proxy_version=1 proxy_peer=- proxy_dst=- proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v2 tcp4: peer=198.51.100.4:40000 key=198.51.100.4 proxy_version=2 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v2 with tlvs and crc: peer=198.51.100.5:40001 key=198.51.100.5 proxy_version=2 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=h2 proxy_authority=shop.example proxy_unique_id=req-42 proxy_ssl_cn=client.example
+v2 ipv6: peer=[0:0:0:0:0:0:0:1]:9 key=[0:0:0:0:0:0:0:0] proxy_version=2 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=[0:0:0:0:0:0:0:1]:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v2 unix source: peer=unix:/run/lb.sock key=unix:/run/lb.sock proxy_version=2 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=unix:/run/app.sock proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v2 local: peer=127.0.0.1:<ephemeral> key=127.0.0.1 proxy_version=2 proxy_peer=- proxy_dst=- proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v2 local with tlvs: peer=127.0.0.1:<ephemeral> key=127.0.0.1 proxy_version=2 proxy_peer=- proxy_dst=- proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+-- a header sent a byte at a time
+byte at a time: peer=203.0.113.9:777 key=203.0.113.9 proxy_version=1 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v2 byte at a time: peer=198.51.100.5:40001 key=198.51.100.5 proxy_version=2 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=h2 proxy_authority=shop.example proxy_unique_id=req-42 proxy_ssl_cn=client.example
+-- no header, or a bad one: dropped
+plain request: dropped
+h2 preface: dropped
+garbage v1: dropped
+v1 port too big: dropped
+v1 without CRLF in 108 bytes: dropped
+v2 version 1: dropped
+v2 oversize: dropped
+v2 crc wrong: dropped
+v2 tlv overruns: dropped
+header cut off: dropped
+requests handled: 13
+== optional, from a trusted address
+no header: peer=127.0.0.1:<ephemeral> key=127.0.0.1 proxy_version=- proxy_peer=- proxy_dst=- proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v1: peer=203.0.113.7:51234 key=203.0.113.7 proxy_version=1 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+v2: peer=198.51.100.4:40000 key=198.51.100.4 proxy_version=2 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+garbage after PROXY is still dropped: dropped
+a bad v2 is still dropped: dropped
+request with a leading CRLF: peer=127.0.0.1:<ephemeral> key=127.0.0.1 proxy_version=- proxy_peer=- proxy_dst=- proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+PRI is not PROXY: 505 HTTP Version Not Supported
+
+requests handled: 4
+== from an address that is not trusted
+required: a valid header: dropped
+required: no header: dropped
+requests handled: 0
+optional, refuse: a spoofed header: dropped
+optional, refuse: no header: peer=127.0.0.1:<ephemeral> key=127.0.0.1 proxy_version=- proxy_peer=- proxy_dst=- proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+requests handled: 1
+optional, ignore: a spoofed v1 header: peer=127.0.0.1:<ephemeral> key=127.0.0.1 proxy_version=- proxy_peer=- proxy_dst=- proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+optional, ignore: a spoofed v2 header: peer=127.0.0.1:<ephemeral> key=127.0.0.1 proxy_version=- proxy_peer=- proxy_dst=- proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+optional, ignore: no header: peer=127.0.0.1:<ephemeral> key=127.0.0.1 proxy_version=- proxy_peer=- proxy_dst=- proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+optional, ignore: a bad header is still dropped: dropped
+requests handled: 3
+== nothing allowed
+no allow-list: a valid header: dropped
+requests handled: 0
+== a small v2 cap
+tcp4 fits (28 bytes): peer=1.2.3.4:5 key=1.2.3.4 proxy_version=2 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=5.6.7.8:9 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+with a TLV over the cap: dropped
+requests handled: 1
+== through the client writer
+peer=198.51.100.77:4000 key=198.51.100.77 proxy_version=2 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+second request on the same connection: peer=198.51.100.77:4000 key=198.51.100.77 proxy_version=2 proxy_peer=127.0.0.1:<ephemeral> proxy_dst=192.0.2.1:443 proxy_alpn=- proxy_authority=- proxy_unique_id=- proxy_ssl_cn=-
+requests handled: 2

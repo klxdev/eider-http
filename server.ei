@@ -76,6 +76,7 @@ import http.middleware
 import http.metrics
 import http.compress
 import http.h2
+import http.proxyproto
 import compression
 
 pub type Config = {
@@ -93,6 +94,7 @@ pub type Config = {
     secure: Option[transport.Acceptor],
     h2: Option[h2.Options],
     h2_wrap: Option[h2.Middleware],
+    proxy_protocol: Option[proxyproto.Options],
 }
 
 /// 10,000 connections served at once, a queue of 64, 5 s idle, 10 s to read a request, 10 s to write a
@@ -108,9 +110,11 @@ pub type Config = {
 /// handshake (bounded by the acceptor's handshake timeout and limit on concurrent handshakes) before its
 /// first request. `h2` None: HTTP/1.1 only, as before; `Some(options)` (`h2.options()`) also serves HTTP/2 on the same
 /// port: a connection that opens with the HTTP/2 preface (prior-knowledge h2c) or that negotiated ALPN `h2` (https,
-/// `ServerTls.with_h2()`) is HTTP/2, every request stream calling the same handler (docs/services.md "HTTP/2").
+/// `ServerTls.with_h2()`) is HTTP/2, every request stream calling the same handler (docs/services.md "HTTP/2"). `proxy_protocol`
+/// None: off, as before; `Some(proxyproto.options(trust))`: every accepted connection opens with a HAProxy PROXY header (v1 or v2) from a
+/// trusted address, read before TLS and before the first request, and the client address it names is `Request.peer` (http/proxyproto, docs/ops.md).
 pub fn config() -> Config {
-    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan, Some(logging.new(logging.Error)), 0, None, None, None)
+    Config(10000, 64, time.seconds(5), time.seconds(10), time.seconds(10), 1000, http.limits(), true, no_plan, Some(logging.new(logging.Error)), 0, None, None, None, None)
 }
 
 fn no_plan(method: List[u8], path: List[u8]) -> http.Plan { http.Plan(0, false) }
@@ -610,17 +614,43 @@ fn serve_conn(c: i32, peer: List[u8], h: http.Handler, cfg: Config, sh: Hub, slo
     let pk = sync.parker()
     live_join(sh.live, id, pk)
     let sig = Sig(sh.live.flag, pk)
-    match cfg.secure {
-        None => { serve_slot(transport.plain(c), peer, h, cfg, sig, sh) }
-        Some(acc) => {
-            // the TLS handshake: it holds this slot (so a connection that stalls in it is bounded by the
-            // acceptor's deadline) and blocks this task only
-            let go = acc.accept
-            match go(c) {
-                Ok(t) => { serve_slot(t, peer, h, cfg, sig, sh) }
-                Err(why) => {
-                    bump(sh, 8)
+    // PROXY protocol (http/proxyproto): the header comes first, before any TLS; the client address it names
+    // replaces `peer`, and its fields go to the request context through a wrapped handler
+    let mut who = peer.copy()
+    let mut handler = h.copy()
+    let mut dropped = false
+    match cfg.proxy_protocol {
+        Some(po) => {
+            match proxyproto.accept_conn(c, peer, po) {
+                proxyproto.Pass(p, ctx) => {
+                    who = p
+                    if ctx.len() > 0 { handler = proxyproto.with_ctx(h, ctx) }
+                }
+                proxyproto.Drop(why) => {
+                    dropped = true
+                    match cfg.log {
+                        Some(lg) => lg.warn("proxy protocol: connection dropped", logging.fields().text("peer", sys.to_string(peer)).text("why", why))
+                        None => {}
+                    }
                     fd.close(c)
+                }
+            }
+        }
+        None => {}
+    }
+    if !dropped {
+        match cfg.secure {
+            None => { serve_slot(transport.plain(c), who, handler, cfg, sig, sh) }
+            Some(acc) => {
+                // the TLS handshake: it holds this slot (so a connection that stalls in it is bounded by the
+                // acceptor's deadline) and blocks this task only
+                let go = acc.accept
+                match go(c) {
+                    Ok(t) => { serve_slot(t, who, handler, cfg, sig, sh) }
+                    Err(why) => {
+                        bump(sh, 8)
+                        fd.close(c)
+                    }
                 }
             }
         }

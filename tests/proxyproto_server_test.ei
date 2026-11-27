@@ -1,0 +1,283 @@
+// http/proxyproto through the server over loopback TCP: what a handler sees as the client when a trusted
+// load balancer sends a PROXY header (v1, v2, TLVs, LOCAL), what happens to a connection with no header, a
+// bad header, a header from an address that is not trusted (refused, or skipped and not believed), a
+// header split into single bytes, and that no byte after the header is ever taken from the request.
+// Every wait has a deadline; nothing sleeps to synchronise.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.fd
+import std.io
+import std.net
+import std.time
+import std.task
+import http
+import http.parse
+import http.proxy
+import http.proxyproto
+import http.ratelimit
+import http.server
+import http.client
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn cat(a: str, b: String) -> String {
+    let mut t = String.from(a)
+    t.append(b)
+    t
+}
+
+fn ctx_or(q: http.Request, name: str) -> List[u8] {
+    match q.get_ctx(name) {
+        Some(v) => v
+        None => lit("-")
+    }
+}
+
+/// What the handler tells: the client address it sees (the port of a real loopback client is hidden: it
+/// is ephemeral), the rate-limit key, and the context a header gave.
+fn handler() -> http.Handler {
+    |q: http.Request| -> http.Response {
+        let mut p = q.peer.copy()
+        if bytes.starts_with(p, lit("127.0.0.1:")) { p = lit("127.0.0.1:<ephemeral>") }
+        let mut b = lit("peer=")
+        bytes.append(inout b, p)
+        bytes.append(inout b, lit(" key="))
+        bytes.append(inout b, ratelimit.address_key(q))
+        for n in ["proxy_version", "proxy_peer", "proxy_dst", "proxy_alpn", "proxy_authority", "proxy_unique_id", "proxy_ssl_cn"] {
+            bytes.append(inout b, lit(" "))
+            bytes.append(inout b, lit(n))
+            bytes.append(inout b, lit("="))
+            let v = ctx_or(q, n)
+            if bytes.starts_with(v, lit("127.0.0.1:")) { bytes.append(inout b, lit("127.0.0.1:<ephemeral>")) } else { bytes.append(inout b, v) }
+        }
+        http.respond(200, "text/plain", b)
+    }
+}
+
+fn start(cfg: server.Config, tok: task.Token) -> (net.Addr, Task[server.Stats]) uses net, io, clock, threads {
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let h = handler()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+    (srv.addr(), th)
+}
+
+fn config(o: proxyproto.Options) -> server.Config {
+    let mut c = server.config()
+    c.log = None
+    c.proxy_protocol = Some(o)
+    c.read_timeout = time.seconds(2)
+    c
+}
+
+fn raw(a: net.Addr) -> i32 uses net {
+    let s = net.socket(net.IPV4, net.STREAM, false).unwrap()
+    net.connect(s, a).unwrap()
+    s
+}
+
+fn get() -> List[u8] { lit("GET /who HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") }
+
+/// Sends `pre` then `req` (one write when `joined`, else two), and prints the response's body, or what
+/// ended the connection without one.
+fn talk(label: str, a: net.Addr, pre: List[u8], req: List[u8], joined: bool) uses io, clock, net {
+    let s = raw(a)
+    if joined { net.send_all(s, bytes.concat(pre, req)).unwrap() } else {
+        net.send_all(s, pre).unwrap()
+        net.send_all(s, req).unwrap()
+    }
+    answer(label, s)
+}
+
+fn answer(label: str, s: i32) uses io, clock, net {
+    let dl = time.after(time.seconds(5))
+    let mut p = parse.responses(http.limits())
+    let mut out = String.from(label)
+    out.push_str(": ")
+    let mut done = false
+    while !done {
+        match p.next() {
+            parse.Done(m) => {
+                let r = parse.to_response(m)
+                out.append(sys.to_string(r.body))
+                done = true
+                continue
+            }
+            parse.Bad(st, why) => {
+                out.push_str("garbage")
+                done = true
+                continue
+            }
+            parse.More => {}
+        }
+        match fd.read_by(s, 65536, dl) {
+            Ok(Some(b)) => {
+                if b.len() == 0 {
+                    out.push_str("dropped")
+                    done = true
+                } else {
+                    p.feed(b)
+                }
+            }
+            Ok(None) => {
+                out.push_str("timed out")
+                done = true
+            }
+            Err(e) => {
+                out.push_str("dropped")
+                done = true
+            }
+        }
+    }
+    print(out)
+    fd.close(s).unwrap()
+}
+
+fn v1(s: str) -> List[u8] { lit(s) }
+
+fn trusted() -> proxy.Trust { proxy.trust_none().allow("127.0.0.0/8").unwrap() }
+
+fn elsewhere() -> proxy.Trust { proxy.trust_none().allow("10.0.0.0/8").unwrap() }
+
+fn main() uses net, io, clock, threads {
+    let mut v6a: List[u8] = List.new()
+    for i in 0..16 { v6a.push(if i == 15 { 1 } else { 0 }) }
+
+    print("== required, from a trusted address")
+    let tok = task.root()
+    let (a, th) = start(config(proxyproto.options(trusted())), tok)
+    talk("v1 tcp4", a, v1("PROXY TCP4 203.0.113.7 192.0.2.1 51234 443\r\n"), get(), true)
+    talk("v1 tcp4, request after the header", a, v1("PROXY TCP4 203.0.113.7 192.0.2.1 51234 443\r\n"), get(), false)
+    talk("v1 tcp6", a, v1("PROXY TCP6 2001:db8::7 2001:db8::1 51234 443\r\n"), get(), true)
+    talk("v1 mapped", a, v1("PROXY TCP6 ::ffff:203.0.113.8 2001:db8::1 1 2\r\n"), get(), true)
+    talk("v1 unknown", a, v1("PROXY UNKNOWN\r\n"), get(), true)
+    talk("v2 tcp4", a, proxyproto.encode_v2(proxyproto.header(net.ipv4(198, 51, 100, 4, 40000), net.ipv4(192, 0, 2, 1, 443)), false).unwrap(), get(), true)
+    let rich = proxyproto.header(net.ipv4(198, 51, 100, 5, 40001), net.ipv4(192, 0, 2, 1, 443)).with_alpn(lit("h2")).with_authority(lit("shop.example")).with_unique_id(lit("req-42")).with_ssl(proxyproto.Ssl(1, 0, lit("TLSv1.3"), lit("client.example"), lit(""), lit(""), lit("")))
+    talk("v2 with tlvs and crc", a, proxyproto.encode_v2(rich, true).unwrap(), get(), true)
+    talk("v2 ipv6", a, proxyproto.encode_v2(proxyproto.header(net.ipv6(v6a, 9), net.ipv6(v6a, 443)), false).unwrap(), get(), true)
+    talk("v2 unix source", a, proxyproto.encode_v2(proxyproto.header(net.unix(lit("/run/lb.sock")), net.unix(lit("/run/app.sock"))), false).unwrap(), get(), true)
+    talk("v2 local", a, proxyproto.encode_v2(proxyproto.local(), false).unwrap(), get(), true)
+    talk("v2 local with tlvs", a, proxyproto.encode_v2(proxyproto.local().with_unique_id(lit("hc")), false).unwrap(), get(), true)
+
+    print("-- a header sent a byte at a time")
+    let slow = raw(a)
+    for c in v1("PROXY TCP4 203.0.113.9 192.0.2.1 777 443\r\n") {
+        let mut one: List[u8] = List.new()
+        one.push(c)
+        net.send_all(slow, one).unwrap()
+    }
+    net.send_all(slow, get()).unwrap()
+    answer("byte at a time", slow)
+    let slow2 = raw(a)
+    let w2 = proxyproto.encode_v2(rich, true).unwrap()
+    for c in w2 {
+        let mut one: List[u8] = List.new()
+        one.push(c)
+        net.send_all(slow2, one).unwrap()
+    }
+    net.send_all(slow2, get()).unwrap()
+    answer("v2 byte at a time", slow2)
+
+    print("-- no header, or a bad one: dropped")
+    talk("plain request", a, List.new(), get(), true)
+    talk("h2 preface", a, lit("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), List.new(), true)
+    talk("garbage v1", a, v1("PROXY TCP4 nonsense\r\n"), get(), true)
+    talk("v1 port too big", a, v1("PROXY TCP4 1.2.3.4 5.6.7.8 70000 1\r\n"), get(), true)
+    talk("v1 without CRLF in 108 bytes", a, bytes.concat(lit("PROXY UNKNOWN "), zeros(120, 97)), List.new(), true)
+    talk("v2 version 1", a, hx("0d0a0d0a000d0a515549540a1111000cc0a80001c0a8000bdc0401bb"), get(), true)
+    talk("v2 oversize", a, hx("0d0a0d0a000d0a515549540a2111ffff"), get(), true)
+    let mut tampered = proxyproto.encode_v2(rich, true).unwrap()
+    tampered[20] = tampered[20] ^ 1
+    talk("v2 crc wrong", a, tampered, get(), true)
+    talk("v2 tlv overruns", a, hx("0d0a0d0a000d0a515549540a2111000ec0a80001c0a8000bdc0401bb010005"), get(), true)
+    // a header that stops short, then the client goes away: the server must not hang on it
+    let cut = raw(a)
+    net.send_all(cut, lit("PROXY TCP4 1.2.3.4 5.6")).unwrap()
+    net.shutdown(cut, net.SHUT_WRITE).unwrap()
+    answer("header cut off", cut)
+    tok.cancel()
+    let st = th.join()
+    print(cat("requests handled: ", sys.to_string(bytes.from_u64(st.requests as u64))))
+
+    print("== optional, from a trusted address")
+    let tok2 = task.root()
+    let (a2, th2) = start(config(proxyproto.options(trusted()).optional()), tok2)
+    talk("no header", a2, List.new(), get(), true)
+    talk("v1", a2, v1("PROXY TCP4 203.0.113.7 192.0.2.1 51234 443\r\n"), get(), true)
+    talk("v2", a2, proxyproto.encode_v2(proxyproto.header(net.ipv4(198, 51, 100, 4, 40000), net.ipv4(192, 0, 2, 1, 443)), false).unwrap(), get(), true)
+    talk("garbage after PROXY is still dropped", a2, v1("PROXY TCP4 nonsense\r\n"), get(), true)
+    talk("a bad v2 is still dropped", a2, hx("0d0a0d0a000d0a515549540a3111000cc0a80001c0a8000bdc0401bb"), get(), true)
+    // the request's own first bytes are not mistaken for a header
+    talk("request with a leading CRLF", a2, lit("\r\n"), get(), true)
+    talk("PRI is not PROXY", a2, lit("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), List.new(), true)
+    tok2.cancel()
+    let st2 = th2.join()
+    print(cat("requests handled: ", sys.to_string(bytes.from_u64(st2.requests as u64))))
+
+    print("== from an address that is not trusted")
+    let tok3 = task.root()
+    let (a3, th3) = start(config(proxyproto.options(elsewhere())), tok3)
+    talk("required: a valid header", a3, v1("PROXY TCP4 203.0.113.7 192.0.2.1 51234 443\r\n"), get(), true)
+    talk("required: no header", a3, List.new(), get(), true)
+    tok3.cancel()
+    let st3 = th3.join()
+    print(cat("requests handled: ", sys.to_string(bytes.from_u64(st3.requests as u64))))
+    let tok4 = task.root()
+    let (a4, th4) = start(config(proxyproto.options(elsewhere()).optional()), tok4)
+    talk("optional, refuse: a spoofed header", a4, v1("PROXY TCP4 6.6.6.6 192.0.2.1 1 443\r\n"), get(), true)
+    talk("optional, refuse: no header", a4, List.new(), get(), true)
+    tok4.cancel()
+    let st4 = th4.join()
+    print(cat("requests handled: ", sys.to_string(bytes.from_u64(st4.requests as u64))))
+    let tok5 = task.root()
+    let (a5, th5) = start(config(proxyproto.options(elsewhere()).optional().ignore_untrusted()), tok5)
+    talk("optional, ignore: a spoofed v1 header", a5, v1("PROXY TCP4 6.6.6.6 192.0.2.1 1 443\r\n"), get(), true)
+    talk("optional, ignore: a spoofed v2 header", a5, proxyproto.encode_v2(proxyproto.header(net.ipv4(6, 6, 6, 6, 1), net.ipv4(192, 0, 2, 1, 443)).with_authority(lit("evil.example")), false).unwrap(), get(), true)
+    talk("optional, ignore: no header", a5, List.new(), get(), true)
+    talk("optional, ignore: a bad header is still dropped", a5, v1("PROXY TCP4 nonsense\r\n"), get(), true)
+    tok5.cancel()
+    let st5 = th5.join()
+    print(cat("requests handled: ", sys.to_string(bytes.from_u64(st5.requests as u64))))
+
+    print("== nothing allowed")
+    let tok6 = task.root()
+    let (a6, th6) = start(config(proxyproto.options(proxy.trust_none())), tok6)
+    talk("no allow-list: a valid header", a6, v1("PROXY TCP4 203.0.113.7 192.0.2.1 51234 443\r\n"), get(), true)
+    tok6.cancel()
+    let st6 = th6.join()
+    print(cat("requests handled: ", sys.to_string(bytes.from_u64(st6.requests as u64))))
+
+    print("== a small v2 cap")
+    let tok7 = task.root()
+    let (a7, th7) = start(config(proxyproto.options(trusted()).with_max_v2(40)), tok7)
+    talk("tcp4 fits (28 bytes)", a7, proxyproto.encode_v2(proxyproto.header(net.ipv4(1, 2, 3, 4, 5), net.ipv4(5, 6, 7, 8, 9)), false).unwrap(), get(), true)
+    talk("with a TLV over the cap", a7, proxyproto.encode_v2(proxyproto.header(net.ipv4(1, 2, 3, 4, 5), net.ipv4(5, 6, 7, 8, 9)).with_authority(lit("a-long-host-name.example")), false).unwrap(), get(), true)
+    tok7.cancel()
+    let st7 = th7.join()
+    print(cat("requests handled: ", sys.to_string(bytes.from_u64(st7.requests as u64))))
+
+    print("== through the client writer")
+    let tok8 = task.root()
+    let (a8, th8) = start(config(proxyproto.options(trusted())), tok8)
+    let dl = time.after(time.seconds(5))
+    let hdr = proxyproto.encode_v2(proxyproto.header(net.ipv4(198, 51, 100, 77, 4000), net.ipv4(192, 0, 2, 1, 443)), true).unwrap()
+    let mut c = proxyproto.connect(a8, hdr, dl).unwrap()
+    let r1 = c.request(http.request("GET", lit("/who")), dl).unwrap()
+    print(sys.to_string(r1.body))
+    let r2 = c.request(http.request("GET", lit("/who")), dl).unwrap()
+    print(cat("second request on the same connection: ", sys.to_string(r2.body)))
+    c.close()
+    tok8.cancel()
+    let st8 = th8.join()
+    print(cat("requests handled: ", sys.to_string(bytes.from_u64(st8.requests as u64))))
+}
+
+fn zeros(n: usize, b: u8) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    for i in 0..n { o.push(b) }
+    o
+}
+
+fn hx(s: str) -> List[u8] { encoding.unhex(lit(s)).unwrap() }

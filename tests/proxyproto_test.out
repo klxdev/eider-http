@@ -1,0 +1,122 @@
+-- crc32c
+E3069283
+-- v1
+tcp4: v1 192.168.0.1:56324 -> 192.168.0.11:443 tcp used=47 tlvs=0
+tcp6: v1 [2001:db8:0:0:0:0:0:1]:4000 -> [2001:db8:0:0:0:0:0:2]:80 tcp used=44 tlvs=0
+tcp6 mapped: v1 10.1.2.3:4000 -> [0:0:0:0:0:0:0:1]:80 tcp used=40 tlvs=0
+unknown: v1 (no address) used=15 tlvs=0
+unknown with a tail: v1 (no address) used=59 tlvs=0
+followed by a request: v1 1.2.3.4:1 -> 5.6.7.8:2 tcp used=32 tlvs=0
+max ports: v1 255.255.255.255:65535 -> 0.0.0.0:0 tcp used=44 tlvs=0
+-- v1 refused
+port 65536: invalid: proxy protocol v1: bad source port
+leading zero port: invalid: proxy protocol v1: bad source port
+leading zero octet: invalid: proxy protocol v1: bad source address
+v6 address in tcp4: invalid: proxy protocol v1: bad source address
+v4 address in tcp6: invalid: proxy protocol v1: bad source address
+double space: invalid: proxy protocol v1: expected two addresses and two ports, single-spaced
+missing port: invalid: proxy protocol v1: expected two addresses and two ports, single-spaced
+extra field: invalid: proxy protocol v1: expected two addresses and two ports, single-spaced
+lowercase proto: invalid: proxy protocol v1: the protocol is not TCP4, TCP6 or UNKNOWN
+udp4: invalid: proxy protocol v1: the protocol is not TCP4, TCP6 or UNKNOWN
+bare LF: invalid: proxy protocol v1: a control byte in the line
+control byte: invalid: proxy protocol v1: a control byte in the line
+107 bytes with CRLF: v1 (no address) used=107 tlvs=0
+108 bytes with CRLF: invalid: proxy protocol v1: the line is longer than 107 bytes
+no CRLF in 108 bytes: invalid: proxy protocol v1: the line is longer than 107 bytes
+-- v1 incomplete
+prefix: need more
+signature only: need more
+half a line: need more
+CR without LF: need more
+-- not a header
+http: absent
+h2 preface: absent
+PROXYX: absent
+crlf crlf then request: absent
+empty: need more
+tls hello: absent
+-- v2
+tcp4: v2 192.168.0.1:56324 -> 192.168.0.11:443 tcp used=28 tlvs=0
+udp4: v2 192.168.0.1:56324 -> 192.168.0.11:443 udp used=28 tlvs=0
+tcp6: v2 [2001:db8:0:0:0:0:0:1]:8080 -> [2001:db8:0:0:0:0:0:2]:80 tcp used=52 tlvs=0
+tcp6 mapped: v2 10.1.2.3:8080 -> [0:0:0:0:0:0:0:1]:80 tcp used=52 tlvs=0
+unix stream: v2 unix:/run/src -> unix:/run/dst tcp used=232 tlvs=0
+local: v2 local (no address) used=16 tlvs=0
+local with a block: v2 local (no address) used=28 tlvs=0
+proxy unspec with a block: v2 (no address) used=20 tlvs=0
+followed by a request: v2 192.168.0.1:56324 -> 192.168.0.11:443 tcp used=28 tlvs=0
+-- v2 tlvs
+tlvs: v2 192.168.0.1:56324 -> 192.168.0.11:443 tcp used=54 tlvs=5
+writer, with ssl and crc: v2 10.0.0.9:5000 -> 10.0.0.1:443 tcp used=153 tlvs=6 crc-ok
+alpn=h2
+authority=example.test
+unique=abc123
+ssl cn=client.test
+ssl version=TLSv1.3
+ssl cipher=TLS_AES_128_GCM_SHA256
+ssl flags=7
+peer=10.0.0.9:5000
+proxy_version=2
+proxy_peer=10.0.0.1:1234
+proxy_dst=10.0.0.1:443
+proxy_alpn=h2
+proxy_authority=example.test
+proxy_unique_id=abc123
+proxy_ssl=1
+proxy_ssl_verify=0
+proxy_ssl_version=TLSv1.3
+proxy_ssl_cn=client.test
+proxy_ssl_cipher=TLS_AES_128_GCM_SHA256
+-- v2 crc
+last byte flipped: invalid: proxy protocol v2: the CRC32c does not match
+unchecked: found
+address flipped under the checksum: invalid: proxy protocol v2: the CRC32c does not match
+crc from another implementation: v2 192.168.0.1:56324 -> 192.168.0.11:443 tcp used=40 tlvs=2 crc-ok
+-- v2 refused
+version 1: invalid: proxy protocol v2: the version is not 2
+version 3: invalid: proxy protocol v2: the version is not 2
+command 2: invalid: proxy protocol v2: unknown command
+family 4: invalid: proxy protocol v2: unknown address family
+transport 3: invalid: proxy protocol v2: unknown transport protocol
+transport unspec with ipv4: invalid: proxy protocol v2: an address family with an unspecified transport
+block shorter than ipv4: invalid: proxy protocol v2: the address block is cut short
+block shorter than ipv6: invalid: proxy protocol v2: the address block is cut short
+tlv header cut: invalid: proxy protocol v2: a TLV is cut short
+tlv value overruns: invalid: proxy protocol v2: a TLV runs past the header
+tlv overruns by one: invalid: proxy protocol v2: a TLV runs past the header
+crc tlv of 3 bytes: invalid: proxy protocol v2: the CRC32c TLV is not 4 bytes
+unique id of 129 bytes: invalid: proxy protocol v2: the unique id is longer than 128 bytes
+ssl tlv too short: invalid: proxy protocol v2: a malformed SSL TLV
+ssl sub-tlv overruns: invalid: proxy protocol v2: a malformed SSL TLV
+length over the cap: invalid: proxy protocol v2: the header is longer than the limit
+536 bytes: v2 192.168.0.1:56324 -> 192.168.0.11:443 tcp used=536 tlvs=1
+537 bytes: invalid: proxy protocol v2: the header is longer than the limit
+-- v2 incomplete
+signature only: need more
+12 bytes of the signature minus one: need more
+no length: need more
+short body: need more
+-- writer
+v1 tcp4: PROXY TCP4 1.2.3.4 5.6.7.8 5000 80\r\n
+v1 tcp6: PROXY TCP6 0:0:0:0:0:0:0:1 0:0:0:0:0:0:0:2 1 2\r\n
+v1 tcp6 read back: v1 [0:0:0:0:0:0:0:1]:1 -> [0:0:0:0:0:0:0:2]:2 tcp used=48 tlvs=0
+v1 unknown: PROXY UNKNOWN\r\n
+proxy protocol v1: the addresses are of different families
+proxy protocol v1 carries IPv4 and IPv6 only
+proxy protocol v1: bad port
+v2 local: 0d0a0d0a000d0a515549540a20000000
+v2 tcp4: 0d0a0d0a000d0a515549540a2111000cc0a80001c0a8000bdc0401bb
+v2 tcp4 read back: v2 192.168.0.1:56324 -> 192.168.0.11:443 tcp used=35 tlvs=1 crc-ok
+v2 udp6 read back: v2 [0:0:0:0:0:0:0:1]:1 -> [0:0:0:0:0:0:0:2]:2 udp used=52 tlvs=0
+v2 unix read back: v2 unix:/run/client.sock -> unix:/run/server.sock tcp used=232 tlvs=0
+proxy protocol v2: the addresses are not of the header's family
+proxy protocol v2: a unix path is longer than 108 bytes
+proxy protocol v2: the unique id is longer than 128 bytes
+-- trust
+10.1.2.3:80 trusted=yes
+11.1.2.3:80 trusted=no
+unix: trusted=yes
+garbage trusted=no
+10.1.2.3:80 trusted=no
+unix: trusted=no

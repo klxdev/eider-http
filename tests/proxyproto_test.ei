@@ -1,0 +1,307 @@
+// http/proxyproto: the PROXY protocol v1 and v2 parser and writer, with no socket: the specification's
+// own examples (all address families, TLVs, CRC32c), the writer read back by the parser, and what must
+// be refused (truncated, oversized and garbage input, a TLV that overruns, a wrong checksum). Pure.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import std.net
+import http
+import http.proxy
+import http.proxyproto
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+/// Hex text (spaces ignored) as bytes.
+fn hx(s: str) -> List[u8] {
+    let mut t: List[u8] = List.new()
+    for c in lit(s) {
+        if c != 32 { t.push(c) }
+    }
+    encoding.unhex(t).unwrap()
+}
+
+fn text(a: net.Addr) -> String { sys.to_string(proxyproto.peer_text(a)) }
+
+fn cat(a: str, b: String) -> String {
+    let mut t = String.from(a)
+    t.append(b)
+    t
+}
+
+fn show(label: str, buf: List[u8]) uses io {
+    let d = proxyproto.decode(buf, proxyproto.V2_MAX, true)
+    match d {
+        proxyproto.Found(h, used) => {
+            let mut l = String.from(label)
+            l.push_str(": v")
+            l.append(sys.to_string(bytes.from_u64(h.version as u64)))
+            if h.local { l.push_str(" local") }
+            if h.has_addr() {
+                l.push_str(" ")
+                l.append(text(h.src))
+                l.push_str(" -> ")
+                l.append(text(h.dst))
+                if h.transport == proxyproto.DGRAM { l.push_str(" udp") } else { l.push_str(" tcp") }
+            } else {
+                l.push_str(" (no address)")
+            }
+            l.push_str(" used=")
+            l.append(sys.to_string(bytes.from_u64(used as u64)))
+            l.push_str(" tlvs=")
+            l.append(sys.to_string(bytes.from_u64(h.tlvs.len() as u64)))
+            if h.crc { l.push_str(" crc-ok") }
+            print(l)
+        }
+        proxyproto.NeedMore => { print(cat(label, String.from(": need more"))) }
+        proxyproto.Absent => { print(cat(label, String.from(": absent"))) }
+        proxyproto.Invalid(why) => { print(cat(label, cat(": invalid: ", why))) }
+    }
+}
+
+fn found(buf: List[u8]) -> proxyproto.Header {
+    match proxyproto.decode(buf, proxyproto.V2_MAX, true) {
+        proxyproto.Found(h, used) => h
+        proxyproto.NeedMore => proxyproto.local()
+        proxyproto.Absent => proxyproto.local()
+        proxyproto.Invalid(why) => proxyproto.local()
+    }
+}
+
+fn sig() -> List[u8] { hx("0d0a0d0a000d0a515549540a") }
+
+fn v2(rest: str) -> List[u8] { bytes.concat(sig(), hx(rest)) }
+
+/// `v2(rest)` followed by `n` zero bytes.
+fn v2f(rest: str, n: usize) -> List[u8] {
+    let mut o = v2(rest)
+    for i in 0..n { o.push(0) }
+    o
+}
+
+fn main() uses io {
+    print("-- crc32c")
+    print(encoding.hex_upper(bytes_of_u32(proxyproto.crc32c(lit("123456789")))))
+
+    print("-- v1")
+    show("tcp4", lit("PROXY TCP4 192.168.0.1 192.168.0.11 56324 443\r\n"))
+    show("tcp6", lit("PROXY TCP6 2001:db8::1 2001:db8::2 4000 80\r\n"))
+    show("tcp6 mapped", lit("PROXY TCP6 ::ffff:10.1.2.3 ::1 4000 80\r\n"))
+    show("unknown", lit("PROXY UNKNOWN\r\n"))
+    show("unknown with a tail", lit("PROXY UNKNOWN ffff:f...f:ffff ffff:f...f:ffff 65535 65535\r\nGET / HTTP/1.1\r\n"))
+    show("followed by a request", lit("PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\nGET / HTTP/1.1\r\n\r\n"))
+    show("max ports", lit("PROXY TCP4 255.255.255.255 0.0.0.0 65535 0\r\n"))
+    print("-- v1 refused")
+    show("port 65536", lit("PROXY TCP4 1.2.3.4 5.6.7.8 65536 2\r\n"))
+    show("leading zero port", lit("PROXY TCP4 1.2.3.4 5.6.7.8 0443 2\r\n"))
+    show("leading zero octet", lit("PROXY TCP4 01.2.3.4 5.6.7.8 1 2\r\n"))
+    show("v6 address in tcp4", lit("PROXY TCP4 ::1 ::2 1 2\r\n"))
+    show("v4 address in tcp6", lit("PROXY TCP6 1.2.3.4 5.6.7.8 1 2\r\n"))
+    show("double space", lit("PROXY TCP4  1.2.3.4 5.6.7.8 1 2\r\n"))
+    show("missing port", lit("PROXY TCP4 1.2.3.4 5.6.7.8 1\r\n"))
+    show("extra field", lit("PROXY TCP4 1.2.3.4 5.6.7.8 1 2 3\r\n"))
+    show("lowercase proto", lit("PROXY tcp4 1.2.3.4 5.6.7.8 1 2\r\n"))
+    show("udp4", lit("PROXY UDP4 1.2.3.4 5.6.7.8 1 2\r\n"))
+    show("bare LF", lit("PROXY TCP4 1.2.3.4 5.6.7.8 1 2\n"))
+    let mut ctl = lit("PROXY TCP4 1.2.3.4 5.6.7.8 1 2")
+    ctl.push(1)
+    ctl.push(13)
+    ctl.push(10)
+    show("control byte", ctl)
+    let mut long = lit("PROXY UNKNOWN ")
+    for i in 0..94 { long.push(97) }
+    show("107 bytes with CRLF", bytes.concat(bytes.slice(long, 0, 105), lit("\r\n")))
+    show("108 bytes with CRLF", bytes.concat(bytes.slice(long, 0, 106), lit("\r\n")))
+    show("no CRLF in 108 bytes", long)
+    print("-- v1 incomplete")
+    show("prefix", lit("PRO"))
+    show("signature only", lit("PROXY "))
+    show("half a line", lit("PROXY TCP4 1.2.3.4 5.6"))
+    show("CR without LF", lit("PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r"))
+
+    print("-- not a header")
+    show("http", lit("GET / HTTP/1.1\r\n\r\n"))
+    show("h2 preface", lit("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
+    show("PROXYX", lit("PROXYX TCP4 1.2.3.4 5.6.7.8 1 2\r\n"))
+    show("crlf crlf then request", lit("\r\n\r\nGET / HTTP/1.1\r\n\r\n"))
+    show("empty", List.new())
+    show("tls hello", hx("160301"))
+
+    print("-- v2")
+    // the specification's example: TCP over IPv4, 192.168.0.1:56324 to 192.168.0.11:443
+    show("tcp4", v2("2111000cc0a80001c0a8000bdc0401bb"))
+    show("udp4", v2("2112000cc0a80001c0a8000bdc0401bb"))
+    show("tcp6", v2("21210024 20010db8000000000000000000000001 20010db8000000000000000000000002 1f90 0050"))
+    show("tcp6 mapped", v2("21210024 00000000000000000000ffff0a010203 00000000000000000000000000000001 1f90 0050"))
+    show("unix stream", bytes.concat(v2f("213100d8 2f72756e2f73726300", 99), bytes.concat(lit("/run/dst"), zeros_bytes(100))))
+    show("local", v2("20000000"))
+    show("local with a block", v2("2000000cc0a80001c0a8000bdc0401bb"))
+    show("proxy unspec with a block", v2("21000004deadbeef"))
+    show("followed by a request", bytes.concat(v2("2111000cc0a80001c0a8000bdc0401bb"), lit("GET / HTTP/1.1\r\n\r\n")))
+    print("-- v2 tlvs")
+    // ALPN "h2" (1), authority "a.b" (2), noop (4, 2 bytes), unique id "xyz" (5), an application TLV 0xe0
+    show("tlvs", v2("2111 0026 c0a80001 c0a8000b dc04 01bb 0100026832 020003612e62 0400020000 050003787a7a e00001ff"))
+    let withtlv = proxyproto.header(net.ipv4(10, 0, 0, 9, 5000), net.ipv4(10, 0, 0, 1, 443)).with_alpn(lit("h2")).with_authority(lit("example.test")).with_unique_id(lit("abc123"))
+    let ssl = proxyproto.Ssl(7, 0, lit("TLSv1.3"), lit("client.test"), lit("TLS_AES_128_GCM_SHA256"), lit("rsa-sha256"), lit("rsa2048"))
+    let full = withtlv.with_ssl(ssl).with_tlv(238, lit("custom"))
+    let wire = proxyproto.encode_v2(full, true).unwrap()
+    show("writer, with ssl and crc", wire)
+    let back = found(wire)
+    print(cat("alpn=", sys.to_string(back.alpn)))
+    print(cat("authority=", sys.to_string(back.authority)))
+    print(cat("unique=", sys.to_string(back.unique_id)))
+    match back.ssl {
+        Some(s) => {
+            print(cat("ssl cn=", sys.to_string(s.cn)))
+            print(cat("ssl version=", sys.to_string(s.version)))
+            print(cat("ssl cipher=", sys.to_string(s.cipher)))
+            print(cat("ssl flags=", sys.to_string(bytes.from_u64(s.client as u64))))
+        }
+        None => { print("no ssl") }
+    }
+    let ctxv = proxyproto.view(back, lit("10.0.0.1:1234"))
+    let (pp, cx) = ctxv
+    print(cat("peer=", sys.to_string(pp)))
+    for e in cx { print(cat2(sys.to_string(e.name), cat("=", sys.to_string(e.value)))) }
+    print("-- v2 crc")
+    let flipped = flip(wire, wire.len() - 1)
+    show("last byte flipped", flipped)
+    let ok_nocheck = proxyproto.decode(flipped, proxyproto.V2_MAX, false)
+    match ok_nocheck {
+        proxyproto.Found(h, n) => { print("unchecked: found") }
+        proxyproto.NeedMore => { print("unchecked: need more") }
+        proxyproto.Absent => { print("unchecked: absent") }
+        proxyproto.Invalid(w) => { print(cat("unchecked: ", w)) }
+    }
+    let bad_crc = flip(wire, 20)
+    show("address flipped under the checksum", bad_crc)
+
+    // computed by an independent CRC32c (python): the checksum is 0x76323a48
+    show("crc from another implementation", hx("0d0a0d0a000d0a515549540a21110018c0a80001c0a8000bdc0401bb010002683203000476323a48"))
+    print("-- v2 refused")
+    show("version 1", v2("1111000cc0a80001c0a8000bdc0401bb"))
+    show("version 3", v2("3111000cc0a80001c0a8000bdc0401bb"))
+    show("command 2", v2("2211000cc0a80001c0a8000bdc0401bb"))
+    show("family 4", v2("2141000cc0a80001c0a8000bdc0401bb"))
+    show("transport 3", v2("2113000cc0a80001c0a8000bdc0401bb"))
+    show("transport unspec with ipv4", v2("2110000cc0a80001c0a8000bdc0401bb"))
+    show("block shorter than ipv4", v2("2111000b c0a80001c0a8000bdc0401"))
+    show("block shorter than ipv6", v2("21210020 20010db8000000000000000000000001 20010db8000000000000000000000002"))
+    show("tlv header cut", v2("2111000d c0a80001c0a8000bdc0401bb 01"))
+    show("tlv value overruns", v2("2111000f c0a80001c0a8000bdc0401bb 010005"))
+    show("tlv overruns by one", v2("21110010 c0a80001c0a8000bdc0401bb 01000368 32"))
+    show("crc tlv of 3 bytes", v2("21110012 c0a80001c0a8000bdc0401bb 030003000000"))
+    show("unique id of 129 bytes", v2f("21110090 c0a80001c0a8000bdc0401bb 05008100", 128))
+    show("ssl tlv too short", v2("21110012 c0a80001c0a8000bdc0401bb 200003010000"))
+    show("ssl sub-tlv overruns", v2("21110017 c0a80001c0a8000bdc0401bb 2000080100000000 2100ff"))
+    show("length over the cap", v2("2111ffff"))
+    // 536 bytes in all is accepted, 537 is not
+    show("536 bytes", v2f("21110208 c0a80001c0a8000bdc0401bb 0401f9", 505))
+    show("537 bytes", v2f("21110209 c0a80001c0a8000bdc0401bb 0401fa", 506))
+    print("-- v2 incomplete")
+    show("signature only", sig())
+    show("12 bytes of the signature minus one", hx("0d0a0d0a000d0a51554954"))
+    show("no length", v2("2111"))
+    show("short body", v2("2111000cc0a80001"))
+
+    print("-- writer")
+    show_bytes("v1 tcp4", proxyproto.encode_v1(net.ipv4(1, 2, 3, 4, 5000), net.ipv4(5, 6, 7, 8, 80)).unwrap())
+    let mut v6a: List[u8] = List.new()
+    let mut v6b: List[u8] = List.new()
+    for i in 0..16 {
+        v6a.push(if i == 15 { 1 } else { 0 })
+        v6b.push(if i == 15 { 2 } else { 0 })
+    }
+    show_bytes("v1 tcp6", proxyproto.encode_v1(net.ipv6(v6a, 1), net.ipv6(v6b, 2)).unwrap())
+    show("v1 tcp6 read back", proxyproto.encode_v1(net.ipv6(v6a, 1), net.ipv6(v6b, 2)).unwrap())
+    show_bytes("v1 unknown", proxyproto.v1_unknown())
+    print(err_of(proxyproto.encode_v1(net.ipv4(1, 2, 3, 4, 5), net.ipv6(v6a, 2))))
+    print(err_of(proxyproto.encode_v1(net.unix(lit("/a")), net.unix(lit("/b")))))
+    print(err_of(proxyproto.encode_v1(net.ipv4(1, 2, 3, 4, 70000), net.ipv4(1, 2, 3, 4, 2))))
+    show_bytes("v2 local", proxyproto.encode_v2(proxyproto.local(), false).unwrap())
+    show_bytes("v2 tcp4", proxyproto.encode_v2(proxyproto.header(net.ipv4(192, 168, 0, 1, 56324), net.ipv4(192, 168, 0, 11, 443)), false).unwrap())
+    show("v2 tcp4 read back", proxyproto.encode_v2(proxyproto.header(net.ipv4(192, 168, 0, 1, 56324), net.ipv4(192, 168, 0, 11, 443)), true).unwrap())
+    show("v2 udp6 read back", proxyproto.encode_v2(proxyproto.header(net.ipv6(v6a, 1), net.ipv6(v6b, 2)).datagram(), false).unwrap())
+    show("v2 unix read back", proxyproto.encode_v2(proxyproto.header(net.unix(lit("/run/client.sock")), net.unix(lit("/run/server.sock"))), false).unwrap())
+    print(err_of(proxyproto.encode_v2(proxyproto.header(net.ipv4(1, 2, 3, 4, 5), net.ipv6(v6a, 2)), false)))
+    print(err_of(proxyproto.encode_v2(proxyproto.header(net.unix(zeros_text(109)), net.unix(lit("/x"))), false)))
+    print(err_of(proxyproto.encode_v2(proxyproto.header(net.ipv4(1, 2, 3, 4, 5), net.ipv4(1, 2, 3, 4, 5)).with_unique_id(bytes_n(129)), false)))
+
+    print("-- trust")
+    let t = proxy.trust_none().allow("10.0.0.0/8").unwrap().allow_unix()
+    print(trust_line("10.1.2.3:80", t))
+    print(trust_line("11.1.2.3:80", t))
+    print(trust_line("unix:", t))
+    print(trust_line("garbage", t))
+    print(trust_line("10.1.2.3:80", proxy.trust_none()))
+    print(trust_line("unix:", proxy.trust_none()))
+}
+
+fn trust_line(peer: str, t: proxy.Trust) -> String {
+    cat(peer, cat(" trusted=", String.from(if proxyproto.is_trusted(t, lit(peer)) { "yes" } else { "no" })))
+}
+
+fn bytes_of_u32(v: u32) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    encoding.push_u32_be(inout o, v)
+    o
+}
+
+fn bytes_n(n: usize) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    for i in 0..n { o.push(120) }
+    o
+}
+
+fn zeros_text(n: usize) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    for i in 0..n { o.push(97) }
+    o
+}
+
+fn zeros_bytes(n: usize) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    for i in 0..n { o.push(0) }
+    o
+}
+
+fn flip(b: List[u8], at: usize) -> List[u8] {
+    let mut o = b.copy()
+    o[at] = o[at] ^ 1
+    o
+}
+
+fn show_bytes(label: str, b: List[u8]) uses io {
+    let mut l = String.from(label)
+    l.push_str(": ")
+    if b.len() > 0 && b[0] == 80 {
+        let mut t = String.from("")
+        for c in b {
+            if c == 13 { t.push_str("\\r") } else { if c == 10 { t.push_str("\\n") } else { t.append(sys.to_string(lit_byte(c))) } }
+        }
+        l.append(t)
+    } else {
+        l.append(encoding.hex(b))
+    }
+    print(l)
+}
+
+fn lit_byte(c: u8) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    o.push(c)
+    o
+}
+
+fn cat2(a: String, b: String) -> String {
+    let mut t = a.copy()
+    t.append(b)
+    t
+}
+
+fn err_of(r: Result[List[u8], String]) -> String {
+    match r {
+        Ok(b) => String.from("ok")
+        Err(e) => e
+    }
+}
