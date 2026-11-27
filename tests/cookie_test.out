@@ -1,0 +1,132 @@
+-- Cookie header (RFC 6265 section 3.1)
+SID=[31d4d96e407aad42] lang=[en-US] 
+a=[1] b=[2] f=["q v"] g=[] 
+a=[1] a=[2] 
+a=[1] b=[2] c=[3] 
+3
+true
+a=1; b=2; c=3
+true
+true
+-- Set-Cookie built
+SID=31d4d96e407aad42
+SID=31d4d96e407aad42; Path=/; Secure; HttpOnly
+lang=en-US; Domain=example.com; Path=/
+lang=; Expires=Sun, 06 Nov 1994 08:49:37 GMT
+lang=en-US; Expires=Wed, 09 Jun 2021 10:18:14 GMT; Max-Age=3600; SameSite=Strict
+a=b; Secure; SameSite=None; Partitioned
+a=b; SameSite=Lax
+gone=; Path=/p; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0
+-- Set-Cookie refused
+ERR cookie: the name is not a token
+ERR cookie: the name is not a token
+ERR cookie: the value has a byte that is not allowed (use a signed or private jar, or encode it)
+ERR cookie: the value has a byte that is not allowed (use a signed or private jar, or encode it)
+ERR cookie: the value has a byte that is not allowed (use a signed or private jar, or encode it)
+ERR cookie: the value has a byte that is not allowed (use a signed or private jar, or encode it)
+ERR cookie: the value has a byte that is not allowed (use a signed or private jar, or encode it)
+ERR cookie: bad Path
+ERR cookie: bad Path
+ERR cookie: bad Domain
+ERR cookie: bad Domain
+ERR cookie: SameSite=None needs Secure
+ERR cookie: Partitioned needs Secure
+ERR a __Secure- cookie needs Secure
+__Secure-a=b; Secure
+ERR a __Host- cookie needs Path=/
+ERR a __Host- cookie has no Domain
+__Host-a=b; Path=/; Secure
+ERR a __Host- cookie needs Secure
+true
+true
+true
+true
+true
+2
+2
+-- Set-Cookie parsed
+SID=[31d4d96e407aad42]
+SID=[31d4d96e407aad42] path=/ secure httponly
+lang=[en-US] path=/ domain=example.com
+lang=[] expires=784111777
+lang=[en-US] expires=1623233894
+a=[b] path=/x domain=example.com max-age=60 secure partitioned lax
+a=[b] path=/2 max-age=-1
+a=[b]
+a=[b c] path=/x
+a=[b=c]
+a=[b] max-age=999999999999999999
+a=[b] secure none
+-- Set-Cookie parse refusals
+ERR set-cookie: no =
+ERR set-cookie: the name is empty or not a token
+ERR set-cookie: the name is empty or not a token
+ERR set-cookie: control byte
+true
+ERR a __Secure- cookie needs Secure
+__Secure-a=[b] secure
+ERR a __Host- cookie has no Domain
+ERR a __Host- cookie needs Path=/
+__HOST-a=[b] path=/ secure
+true
+true
+-- dates (RFC 6265 5.1.1)
+784111777
+784111777
+784111777
+0
+1623233894
+784111777
+3150953377
+26729377
+no date
+no date
+no date
+no date
+no date
+951825600
+-- signed jar
+true
+true
+47
+true
+u42
+true
+true
+true
+true
+true
+1
+true
+true
+true
+true
+true
+a.b.c
+true
+1
+false
+true
+true
+session=u42.Nm93hw2ZuTc991wvicPyqR3WF2npsXwVWzvmEDJII7k; Path=/; Secure; HttpOnly
+u42
+true
+-- private jar
+true
+true
+true
+true
+true
+user=42; secret stuff
+false
+true
+true
+true
+1
+true
+true
+true
+1
+false
+s=x; Path=/
+true

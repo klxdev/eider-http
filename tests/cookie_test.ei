@@ -1,0 +1,280 @@
+// http/cookie: the Cookie header, Set-Cookie built and parsed (the RFC 6265 examples, the 6265bis
+// limits and prefixes, header injection), the lenient date parser, and the signed and the private
+// jar (tamper cases, key rotation, a value moved to another cookie).
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import http
+import http.cookie
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn show_pairs(ps: List[http.Header]) uses io {
+    let mut o = String.from("")
+    for p in ps {
+        o.append(sys.to_string(p.name))
+        o.push_str("=[")
+        o.append(sys.to_string(p.value))
+        o.push_str("] ")
+    }
+    print(o)
+}
+
+fn built(c: cookie.Cookie) uses io {
+    match cookie.build(c) {
+        Ok(v) => print(sys.to_string(v))
+        Err(e) => { let mut o = String.from("ERR "); o.append(e); print(o) }
+    }
+}
+
+fn parsed(s: str) uses io {
+    match cookie.parse_set_cookie(lit(s)) {
+        Ok(c) => {
+            let mut o = String.from("")
+            o.append(sys.to_string(c.name))
+            o.push_str("=[")
+            o.append(sys.to_string(c.value))
+            o.push_str("]")
+            match c.path {
+                Some(p) => { o.push_str(" path=")
+                    o.append(sys.to_string(p)) }
+                None => {}
+            }
+            match c.domain {
+                Some(p) => { o.push_str(" domain=")
+                    o.append(sys.to_string(p)) }
+                None => {}
+            }
+            match c.max_age {
+                Some(p) => { o.push_str(" max-age=")
+                    o.append(String.from_int(p)) }
+                None => {}
+            }
+            match c.expires {
+                Some(p) => { o.push_str(" expires=")
+                    o.append(String.from_int(p)) }
+                None => {}
+            }
+            if c.secure { o.push_str(" secure") }
+            if c.http_only { o.push_str(" httponly") }
+            if c.partitioned { o.push_str(" partitioned") }
+            if c.same_site == cookie.SsLax { o.push_str(" lax") }
+            if c.same_site == cookie.SsStrict { o.push_str(" strict") }
+            if c.same_site == cookie.SsNone { o.push_str(" none") }
+            print(o)
+        }
+        Err(e) => {
+            let mut o = String.from("ERR ")
+            o.append(e)
+            print(o)
+        }
+    }
+}
+
+fn date(s: str) uses io {
+    match cookie.parse_date(lit(s)) {
+        Some(t) => print(t)
+        None => print("no date")
+    }
+}
+
+fn key(seed: u8) -> List[u8] {
+    let mut k: List[u8] = List.new()
+    for i in 0..(32 as u8) { k.push(seed + i) }
+    k
+}
+
+fn main() uses io {
+    print("-- Cookie header (RFC 6265 section 3.1)")
+    show_pairs(cookie.parse_cookie_header(lit("SID=31d4d96e407aad42; lang=en-US")))
+    show_pairs(cookie.parse_cookie_header(lit("  a = 1 ;b=2;;c;=x;d e=3;f=\"q v\";g=")))
+    show_pairs(cookie.parse_cookie_header(lit("a=1; a=2")))
+    let mut q = http.request("GET", lit("/"))
+    q.headers.push(http.Header(lit("Cookie"), lit("a=1; b=2")))
+    q.headers.push(http.Header(lit("cookie"), lit("c=3")))
+    show_pairs(cookie.request_cookies(q))
+    print(sys.to_string(cookie.request_cookie(q, "c").unwrap()))
+    print(cookie.request_cookie(q, "zz").is_none())
+    print(sys.to_string(cookie.cookie_header(cookie.request_cookies(q)).unwrap()))
+    print(cookie.cookie_header(List[http.Header(lit("a"), lit("x; admin=1"))]).is_err())
+    print(cookie.cookie_header(List[http.Header(lit("a b"), lit("x"))]).is_err())
+
+    print("-- Set-Cookie built")
+    built(cookie.text("SID", "31d4d96e407aad42"))
+    built(cookie.text("SID", "31d4d96e407aad42").path("/").secure().http_only())
+    built(cookie.text("lang", "en-US").path("/").domain("example.com"))
+    built(cookie.text("lang", "").expires(784111777))
+    built(cookie.text("lang", "en-US").expires(1623233894).max_age(3600).same_site(cookie.SsStrict))
+    built(cookie.text("a", "b").secure().partitioned().same_site(cookie.SsNone))
+    built(cookie.text("a", "b").same_site(cookie.SsLax))
+    built(cookie.text("gone", "x").path("/p").removal())
+    print("-- Set-Cookie refused")
+    built(cookie.text("a b", "x"))
+    built(cookie.text("", "x"))
+    built(cookie.text("a", "x;y"))
+    built(cookie.text("a", "x\r\nSet-Cookie: evil=1"))
+    built(cookie.text("a", "x y"))
+    built(cookie.text("a", "x\"y"))
+    built(cookie.text("a", "\"x y\""))
+    built(cookie.text("a", "b").path("/; Domain=evil.com"))
+    built(cookie.text("a", "b").path("/\r\nX: y"))
+    built(cookie.text("a", "b").domain("exa mple.com"))
+    built(cookie.text("a", "b").domain("a.com\r\nX: y"))
+    built(cookie.text("a", "b").same_site(cookie.SsNone))
+    built(cookie.text("a", "b").partitioned())
+    built(cookie.text("__Secure-a", "b"))
+    built(cookie.text("__Secure-a", "b").secure())
+    built(cookie.text("__Host-a", "b").secure())
+    built(cookie.text("__Host-a", "b").secure().path("/").domain("example.com"))
+    built(cookie.text("__Host-a", "b").secure().path("/"))
+    built(cookie.text("__host-a", "b").path("/"))
+    let mut big: List[u8] = List.new()
+    for i in 0..(4090 as i32) { big.push(97) }
+    print(cookie.build(cookie.new(lit("n"), big)).is_ok())
+    print(cookie.build(cookie.new(lit("name12"), big)).is_ok())
+    let mut r = http.response(200)
+    print(cookie.add(inout r, cookie.text("a", "1").path("/")).is_ok())
+    print(cookie.add(inout r, cookie.text("b", "2;3")).is_err())
+    print(cookie.add(inout r, cookie.text("c", "3").secure()).is_ok())
+    print(http.count_s(r.headers, "set-cookie"))
+    print(cookie.parse_set_cookies(r.headers).len())
+
+    print("-- Set-Cookie parsed")
+    parsed("SID=31d4d96e407aad42")
+    parsed("SID=31d4d96e407aad42; Path=/; Secure; HttpOnly")
+    parsed("lang=en-US; Path=/; Domain=example.com")
+    parsed("lang=; Expires=Sun, 06 Nov 1994 08:49:37 GMT")
+    parsed("lang=en-US; Expires=Wed, 09 Jun 2021 10:18:14 GMT")
+    parsed("a=b; PATH=/x; domain=.Example.COM; MAX-AGE=60; samesite=LAX; SECURE; partitioned")
+    parsed("a=b; Path=/1; Path=/2; Max-Age=5; Max-Age=-1")
+    parsed("a=b; Path=relative; Domain=; Max-Age=abc; Expires=nonsense; Unknown=1; SameSite=bogus")
+    parsed("a = b c ; Path = /x ")
+    parsed("a=b=c")
+    parsed("a=b; Max-Age=99999999999999999999999")
+    parsed("a=b; SameSite=None; Secure")
+    print("-- Set-Cookie parse refusals")
+    parsed("novalue")
+    parsed("=x")
+    parsed("a b=x")
+    parsed("a=b\r\nSet-Cookie: x=y")
+    let mut nul = lit("a=b"); nul.push(0); nul.push(99); print(cookie.parse_set_cookie(nul).is_err())
+    parsed("__Secure-a=b")
+    parsed("__Secure-a=b; Secure")
+    parsed("__Host-a=b; Secure; Path=/; Domain=x.com")
+    parsed("__Host-a=b; Secure; Path=/x")
+    parsed("__HOST-a=b; Secure; Path=/")
+    let mut huge = String.from("a=")
+    for i in 0..(4100 as i32) { huge.push_str("x") }
+    let mut hs = huge.bytes()
+    print(cookie.parse_set_cookie(hs).is_err())
+    let mut longattr = String.from("a=b; Path=/")
+    for i in 0..(1100 as i32) { longattr.push_str("x") }
+    print(cookie.parse_set_cookie(longattr.bytes()).unwrap().path.is_none())
+
+    print("-- dates (RFC 6265 5.1.1)")
+    date("Sun, 06 Nov 1994 08:49:37 GMT")
+    date("Sunday, 06-Nov-94 08:49:37 GMT")
+    date("Sun Nov  6 08:49:37 1994")
+    date("Thu, 01 Jan 1970 00:00:00 GMT")
+    date("Wed, 09 Jun 2021 10:18:14 GMT")
+    date("6 Nov 94 8:49:37")
+    date("Sun, 06 Nov 2069 08:49:37 GMT")
+    date("Sun, 06 Nov 70 08:49:37 GMT")
+    date("Sun, 32 Nov 1994 08:49:37 GMT")
+    date("Sun, 06 Nov 1994 24:49:37 GMT")
+    date("Sun, 06 Nov 1600 08:49:37 GMT")
+    date("Sun, 06 Nov 1994 GMT")
+    date("")
+    date("Tue, 29 Feb 2000 12:00:00 GMT")
+
+    print("-- signed jar")
+    print(cookie.signed_jar(List[]).is_err())
+    print(cookie.signed_jar(List[lit("short")]).is_err())
+    let jar = cookie.signed_jar(List[key(1)]).unwrap()
+    let sv = jar.sign_value(lit("session"), lit("u42")).unwrap()
+    print(sv.len())
+    print(sv == jar.sign_value(lit("session"), lit("u42")).unwrap())
+    let ok = jar.verify(lit("session"), sv.copy()).unwrap()
+    print(sys.to_string(ok.value))
+    print(ok.current)
+    // tamper cases
+    print(jar.verify(lit("other"), sv.copy()).is_none())
+    let mut t1 = sv.copy()
+    t1[0] = 118
+    print(jar.verify(lit("session"), t1).is_none())
+    let mut t2 = sv.copy()
+    t2[t2.len() - 1] = if t2[t2.len() - 1] == 65 { 66 } else { 65 }
+    print(jar.verify(lit("session"), t2).is_none())
+    print(jar.verify(lit("session"), bytes.slice(sv, 0, sv.len() - 1)).is_none())
+    // only one spelling of the tag verifies: of the 64 characters that can end it, exactly one does
+    let alphabet = lit("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    let mut accepted = 0
+    for ch in alphabet {
+        let mut v = sv.copy()
+        v[v.len() - 1] = ch
+        if jar.verify(lit("session"), v).is_some() { accepted += 1 }
+    }
+    print(accepted)
+    print(jar.verify(lit("session"), lit("u42")).is_none())
+    print(jar.verify(lit("session"), lit("")).is_none())
+    print(jar.verify(lit("session"), lit("u42.")).is_none())
+    let forged = bytes.concat(lit("admin."), bytes.slice(sv, 4, sv.len()))
+    print(jar.verify(lit("session"), forged).is_none())
+    let other = cookie.signed_jar(List[key(9)]).unwrap()
+    print(other.verify(lit("session"), sv.copy()).is_none())
+    // a value that contains dots and the separators still round-trips
+    let dv = jar.sign_value(lit("n"), lit("a.b.c")).unwrap()
+    print(sys.to_string(jar.verify(lit("n"), dv).unwrap().value))
+    print(jar.sign_value(lit("n"), lit("a;b")).is_err())
+    // rotation
+    let rot = cookie.signed_jar(List[key(9), key(1)]).unwrap()
+    let old = rot.verify(lit("session"), sv.copy()).unwrap()
+    print(old.key_index)
+    print(old.current)
+    let fresh = rot.sign_value(lit("session"), lit("u42")).unwrap()
+    print(rot.verify(lit("session"), fresh.copy()).unwrap().current)
+    print(jar.verify(lit("session"), fresh).is_none())
+    // through a request
+    let c = jar.sign(cookie.text("session", "u42").secure().http_only().path("/")).unwrap()
+    built(c.copy())
+    let mut rq = http.request("GET", lit("/"))
+    rq.headers.push(http.Header(lit("Cookie"), cookie.cookie_header(List[http.Header(c.name.copy(), c.value.copy())]).unwrap()))
+    print(sys.to_string(jar.get(rq.copy(), "session").unwrap().value))
+    print(jar.get(rq, "nope").is_none())
+
+    print("-- private jar")
+    print(cookie.private_jar(List[key(1)]).is_ok())
+    print(cookie.private_jar(List[lit("short")]).is_err())
+    print(cookie.private_jar(List[]).is_err())
+    let pj = cookie.private_jar(List[key(1)]).unwrap()
+    let ev = pj.encrypt_value(lit("session"), lit("user=42; secret stuff")).unwrap()
+    print(cookie.valid_value(ev.copy()))
+    print(bytes.find(ev, lit("secret"), 0).is_none())
+    print(sys.to_string(pj.decrypt(lit("session"), ev.copy()).unwrap().value))
+    // a fresh nonce each time
+    print(ev == pj.encrypt_value(lit("session"), lit("user=42; secret stuff")).unwrap())
+    print(pj.decrypt(lit("other"), ev.copy()).is_none())
+    let mut e1 = ev.copy()
+    e1[5] = if e1[5] == 65 { 66 } else { 65 }
+    print(pj.decrypt(lit("session"), e1).is_none())
+    print(pj.decrypt(lit("session"), bytes.slice(ev, 0, ev.len() - 4)).is_none())
+    let mut accepted2 = 0
+    for ch in alphabet {
+        let mut v = ev.copy()
+        v[v.len() - 1] = ch
+        if pj.decrypt(lit("session"), v).is_some() { accepted2 += 1 }
+    }
+    print(accepted2)
+    print(pj.decrypt(lit("session"), lit("")).is_none())
+    print(pj.decrypt(lit("session"), lit("!!!!")).is_none())
+    print(cookie.private_jar(List[key(9)]).unwrap().decrypt(lit("session"), ev.copy()).is_none())
+    let prot = cookie.private_jar(List[key(9), key(1)]).unwrap()
+    let po = prot.decrypt(lit("session"), ev.copy()).unwrap()
+    print(po.key_index)
+    print(po.current)
+    let pc = pj.encrypt(cookie.text("s", "binary").path("/")).unwrap()
+    built(cookie.Cookie(pc.name.copy(), lit("x"), pc.path.copy(), None, None, None, false, false, cookie.SsUnset, false))
+    print(pc.value.len() > 20)
+}
