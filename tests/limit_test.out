@@ -1,0 +1,215 @@
+-- shed: no queue
+first: 0
+second: 0
+third (refused): 2
+admitted=2 queued=0 shed=1 expired=0 running=2 waiting=0 limit=2
+after a release: 0
+admitted=3 queued=0 shed=1 expired=0 running=0 waiting=0 limit=2
+-- queue: FIFO hand-off
+holder: 0
+admitted=1 queued=4 shed=0 expired=0 running=1 waiting=4 limit=1
+served in order: 1 2 3 4 5
+waiter result: 0
+waiter result: 0
+waiter result: 0
+waiter result: 0
+waiter result: 0
+admitted=6 queued=5 shed=0 expired=0 running=0 waiting=0 limit=1
+high water: 1
+-- queue full
+holder: 0
+third (queue full): 2
+the waiter got in: 0
+admitted=2 queued=1 shed=1 expired=0 running=0 waiting=0 limit=1
+-- a wait that runs out
+holder: 0
+waiter (max_wait over): 5
+admitted=1 queued=1 shed=1 expired=1 running=1 waiting=0 limit=1
+slot free again: 0
+holder: 0
+waiter (request deadline over): 5
+admitted=1 queued=1 shed=1 expired=1 running=1 waiting=0 limit=1
+-- one cap per key
+tenant a: 0
+tenant b: 0
+tenant a again (refused): 2
+tenant a after release: 0
+admitted=3 queued=0 shed=1 expired=0 running=0 waiting=0 limit=1
+-- the layer: 503 problem+json with Retry-After, skip, traps
+503 Content-Type=application/problem+json Retry-After=7 | {"type":"about:blank","title":"Service Unavailable","status":503,"detail":"too many requests are being handled"}
+200 Content-Type=text/plain; charset=utf-8 | ok
+200 Content-Type=text/plain; charset=utf-8 | done
+running after: 0
+500 Content-Type=text/plain; charset=utf-8 | 500 Internal Server Error
+
+false
+running after a trap: 0
+admitted=2 queued=0 shed=1 expired=0 running=0 waiting=0 limit=1
+-- load: queueing, 16 threads x 150 requests, cap 4
+served: 2400
+max in flight within cap 4: 1
+limiter high water within cap: 1
+admitted: 2400
+shed: 0
+running at the end: 0
+waiting at the end: 0
+-- load: shedding, 16 threads x 150 requests, cap 4
+admitted + shed: 2400
+callers saw the same shed count: 1
+handler ran as often as admitted: 1
+max in flight within cap 4: 1
+running at the end: 0
+-- load with a barrier: 16 callers at once, cap 4
+admitted: 4
+shed: 12
+running while they hold: 4
+admitted=4 queued=0 shed=12 expired=0 running=0 waiting=0 limit=4
+-- load with a barrier: 16 callers at once, cap 4, queue of 16
+running: 4
+waiting: 12
+shed: 0
+all served (sum of results is 0): 0
+admitted: 16
+high water: 4
+-- adaptive cap on a fixed clock
+starts at: 10
+admit: 0
+admit: 0
+admit: 0
+one slow: cut by a tenth: 9
+another slow within the target window: not again: 9
+slow after the window: cut again: 8
+a failure cuts too: 7
+fast ones, below a window's worth: 7
+a full window of fast ones: up by one: 8
+floor: 2
+-- adaptive: a queue that is backed up sheds newcomers
+holder: 0
+newcomer 20 ms after the head queued (head older than 10 ms): 3: 3
+503 Content-Type=application/problem+json Retry-After=1 | {"type":"about:blank","title":"Service Unavailable","status":503,"detail":"the queue is backed up: requests are waiting too long"}
+the queued one got in: 0
+admitted=2 queued=1 shed=1 expired=0 running=0 waiting=0 limit=1
+-- timeout: 504, counters, the late handler's result is dropped
+200 Content-Type=text/plain; charset=utf-8 | deadline set
+504 Content-Type=application/problem+json | {"type":"about:blank","title":"Gateway Timeout","status":504,"detail":"the handler did not answer within 30 ms"}
+false
+200 Content-Type=text/plain; charset=utf-8 | deadline set
+500 Content-Type=text/plain; charset=utf-8 | 500 Internal Server Error
+
+started: 4
+timed out: 1
+rejected: 0
+trapped: 1
+late handler finished before shutdown returned: 1
+-- timeout: no worker free is a 503, not a 504
+504 Content-Type=application/problem+json | {"type":"about:blank","title":"Gateway Timeout","status":504,"detail":"the handler did not answer within 40 ms"}
+504 Content-Type=application/problem+json | {"type":"about:blank","title":"Gateway Timeout","status":504,"detail":"the handler did not answer within 40 ms"}
+503 Content-Type=application/problem+json Retry-After=1 | {"type":"about:blank","title":"Service Unavailable","status":503,"detail":"no worker was free in time"}
+started: 3
+timed out: 2
+rejected: 1
+-- retry: scripted outcomes
+503 503 200: 200, attempts 3
+100,200
+POST is not repeated: 503, attempts 1
+POST with Idempotency-Key is repeated: 200, attempts 2
+POST with any_method: 200, attempts 2
+404 is final: 404, attempts 1
+errors are retried: 200, attempts 3
+attempts used up: the last 503: 503, attempts 3
+6 attempts allowed, backoff capped: 200, attempts 6
+100,200,300,300,300
+-- retry: Retry-After
+Retry-After 2 beats the 100 ms backoff: 200, attempts 2
+2000
+Retry-After 120 is over the 30 s accepted: not retried: 503, attempts 1
+Retry-After ignored when not honoured: 200, attempts 2
+100
+an HTTP-date Retry-After falls back to the backoff: 200, attempts 2
+100
+the wait would pass the deadline: not retried: 503, attempts 1
+-- retry: the budget
+first request spends the only retry: 200, attempts 2
+second finds the budget empty: 503, attempts 1
+requests: 15
+retries: 17
+budget exhausted: 1
+request 1 earns half a retry: 503, attempts 1
+request 2 has earned the whole: 200, attempts 2
+-- retry over the real client
+200 finally
+1000,1000
+requests: 1
+retries: 2
+-- metrics
+a: 0
+b: 2
+# HELP http_requests_total Requests answered, by method and status code.
+# TYPE http_requests_total counter
+# HELP http_requests_in_flight Requests being handled now.
+# TYPE http_requests_in_flight gauge
+http_requests_in_flight 0
+# HELP http_request_duration_seconds Time to answer a request.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.005"} 0
+http_request_duration_seconds_bucket{le="0.01"} 0
+http_request_duration_seconds_bucket{le="0.025"} 0
+http_request_duration_seconds_bucket{le="0.05"} 0
+http_request_duration_seconds_bucket{le="0.1"} 0
+http_request_duration_seconds_bucket{le="0.25"} 0
+http_request_duration_seconds_bucket{le="0.5"} 0
+http_request_duration_seconds_bucket{le="1"} 0
+http_request_duration_seconds_bucket{le="2.5"} 0
+http_request_duration_seconds_bucket{le="5"} 0
+http_request_duration_seconds_bucket{le="10"} 0
+http_request_duration_seconds_bucket{le="+Inf"} 0
+http_request_duration_seconds_sum 0
+http_request_duration_seconds_count 0
+# HELP http_limit_render_api_admitted_total Requests the limiter let in.
+# TYPE http_limit_render_api_admitted_total counter
+http_limit_render_api_admitted_total 1
+# HELP http_limit_render_api_queued_total Requests that waited in the limiter's queue.
+# TYPE http_limit_render_api_queued_total counter
+http_limit_render_api_queued_total 0
+# HELP http_limit_render_api_shed_total Requests the limiter refused (503).
+# TYPE http_limit_render_api_shed_total counter
+http_limit_render_api_shed_total 1
+# HELP http_limit_render_api_expired_total Queued requests that waited out their time (a part of shed).
+# TYPE http_limit_render_api_expired_total counter
+http_limit_render_api_expired_total 0
+# HELP http_limit_render_api_in_flight Requests running the handler now.
+# TYPE http_limit_render_api_in_flight gauge
+http_limit_render_api_in_flight 1
+# HELP http_limit_render_api_waiting Requests in the queue now.
+# TYPE http_limit_render_api_waiting gauge
+http_limit_render_api_waiting 0
+# HELP http_limit_render_api_in_flight_max The most requests that ever ran at once.
+# TYPE http_limit_render_api_in_flight_max gauge
+http_limit_render_api_in_flight_max 1
+# HELP http_limit_render_api_limit The concurrency cap now.
+# TYPE http_limit_render_api_limit gauge
+http_limit_render_api_limit 1
+# HELP http_timeout_render_started_total Requests run under the handler timeout.
+# TYPE http_timeout_render_started_total counter
+http_timeout_render_started_total 0
+# HELP http_timeout_render_timed_out_total Requests answered 504 because the handler was late.
+# TYPE http_timeout_render_timed_out_total counter
+http_timeout_render_timed_out_total 0
+# HELP http_timeout_render_rejected_total Requests answered 503 because no worker was free.
+# TYPE http_timeout_render_rejected_total counter
+http_timeout_render_rejected_total 0
+# HELP http_timeout_render_trapped_total Handlers that trapped (answered 500).
+# TYPE http_timeout_render_trapped_total counter
+http_timeout_render_trapped_total 0
+# HELP http_client_retry_requests_total Requests sent through the retry helper.
+# TYPE http_client_retry_requests_total counter
+http_client_retry_requests_total 1
+# HELP http_client_retry_retries_total Retries made.
+# TYPE http_client_retry_retries_total counter
+http_client_retry_retries_total 2
+# HELP http_client_retry_budget_exhausted_total Retries not made because the budget was empty.
+# TYPE http_client_retry_budget_exhausted_total counter
+http_client_retry_budget_exhausted_total 0
+# HELP http_client_retry_gave_up_total Retries not made: Retry-After too long or no time left.
+# TYPE http_client_retry_gave_up_total counter
+http_client_retry_gave_up_total 0

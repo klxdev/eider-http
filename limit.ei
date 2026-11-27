@@ -1,0 +1,806 @@
+//! http/limit: tower-style layers that keep a service standing under load: a concurrency
+//! limit that queues or sheds, an adaptive variant, a handler timeout that answers 504, and a
+//! retry helper for the client. The server limits connections; this limits work, globally or
+//! per route or key. Each layer is an `http.Handler` wrapper (see http/middleware).
+//!
+//!     let lim = limit.limiter(64, limit.queue(128, time.millis(500)))   // 64 at once, 128 may wait <= 500 ms
+//!     lim.expose(m, "api")                                               // counters on /metrics
+//!     r.post("/render", limit.middleware(lim, render))                  // per route
+//!     let app = limit.concurrency(256, limit.shed(), router.handler(r)) // or: global, shed at once
+//!
+//! Concurrency (`limiter`, `middleware`, `concurrency`): at most `n` requests run the wrapped
+//! handler at the same time (per key with `by`: `n` for each key, e.g. each tenant). A request
+//! over the cap waits in a FIFO queue when the policy has one (`queue(len, wait)`: at most
+//! `len` waiting, each at most `wait`, and never past the request's own `deadline`), else it is
+//! shed. A shed request, a full queue and a wait that ran out are all `503 Service Unavailable`
+//! (problem+json) with `Retry-After`. A slot freed while requests wait is handed to the oldest
+//! waiter directly, so a newcomer cannot overtake the queue and the in-flight count never
+//! exceeds `n` even for an instant. The slot is released when the handler returns (or traps:
+//! the trap is then answered 500 and the connection closed, as `middleware.recover` does,
+//! without a log record); a streamed response body (`Response.stream`) is sent after that.
+//!
+//! Adaptive (`shedder`, `load_shed`): the cap moves between `min` and `max` by AIMD on the
+//! handler's latency: `limit` completions at or under `target` (and not 5xx) raise it by one,
+//! a slow or failed one cuts it by a tenth (at most once per `target`). A request that would
+//! queue behind a head that has waited longer than `max_queue_age` is shed at once: a
+//! standing queue is a queue that will not drain, and waiting in it only adds latency.
+//!
+//! Timeout (`timeout`, `Timeouts`): see the function. The server's own deadlines
+//! (`read_timeout`, `write_timeout`, `idle_timeout`, http/server) cover the connection, not the
+//! handler; `middleware.timeout` bounds a handler too but answers 503 and counts nothing.
+//! `limit.timeout` is the 504 form with counters. Nothing in this runtime can interrupt a
+//! running handler and the server has no per-request cancel token, so the semantics are: the
+//! response is sent at the deadline and the late handler runs to its end on its pool worker
+//! with its result discarded. Order the layers `timeout(limit.middleware(h))`: then the slot
+//! is held until the handler really ends, so the cap bounds work, not just waiting clients.
+//!
+//! Retry (`Retry`): a client helper over `client.fetch` / `client.fetch_host`: bounded
+//! attempts, exponential backoff with jitter, `Retry-After` honoured, a budget
+//! (retries are capped to a fraction of requests, so a failing dependency is not hit with a
+//! retry storm), idempotent methods only by default.
+//!
+//! Everything is shared by copies and safe across threads: state lives behind one
+//! `sync.Lock`, waiters park on a `sync.Parker` and the lock holder unparks them. Time
+//! enters through `now_ns` arguments in the `_at` functions, for tests.
+
+import core.sys
+import std.bytes
+import std.net
+import std.random
+import std.sync
+import std.task
+import std.time
+import http
+import http.client
+import http.metrics
+import http.problem
+
+// ---- policy
+
+/// What a limiter does with a request over the cap: `max_queue` requests may wait (0: none,
+/// shed at once), each at most `max_wait`; `retry_after` is the seconds in the 503's
+/// `Retry-After`.
+pub type Policy = { max_queue: usize, max_wait: time.Duration, retry_after: i64 }
+
+/// No queue: a request over the cap is shed at once.
+pub fn shed() -> Policy { Policy(0, time.zero(), 1) }
+
+/// At most `len` requests wait, each at most `wait` (and no longer than the request's deadline).
+pub fn queue(len: usize, wait: time.Duration) -> Policy { Policy(len, wait, 1) }
+
+impl Policy {
+    /// The same policy with `Retry-After: secs` on the 503 (at least 1).
+    fn retry_after_secs(self, secs: i64) -> Policy {
+        Policy(self.max_queue, self.max_wait, if secs < 1 { 1 as i64 } else { secs })
+    }
+}
+
+/// The adaptive cap (see the module comment): between `min` and `max` (at least 1), starting at
+/// `initial`; a handler slower than `target` counts as overload; `max_queue_age` (zero: off)
+/// is the age of the head of the queue above which newcomers are shed instead of queued.
+pub type Adaptive = { min: i64, max: i64, initial: i64, target: time.Duration, max_queue_age: time.Duration }
+
+/// An adaptive cap between `min` and `max` starting at `max`, for handlers that should answer
+/// within `target`; the queue age limit is `target` times 10.
+pub fn adaptive(min: i64, max: i64, target: time.Duration) -> Adaptive {
+    let lo: i64 = if min < 1 { 1 as i64 } else { min }
+    let hi: i64 = if max < lo { lo } else { max }
+    Adaptive(lo, hi, hi, target, target.times(10))
+}
+
+// ---- the limiter
+
+type Waiter = { id: i64, p: sync.Parker, at_ns: i64 }
+
+type Slot = { running: i64, q: List[Waiter] }
+
+type State = {
+    slots: Map[List[u8], Slot],
+    next_id: i64,
+    granted: List[i64],
+    running: i64,
+    waiting: i64,
+    high_water: i64,
+    admitted: i64,
+    queued: i64,
+    shed: i64,
+    expired: i64,
+    limit: i64,
+    good: i64,
+    last_dec_ns: i64,
+    decreased: bool,
+}
+
+type Cfg = {
+    n: i64,
+    policy: Policy,
+    adaptive: bool,
+    min: i64,
+    max: i64,
+    target_ns: i64,
+    max_age_ns: i64,
+    name: List[u8],
+}
+
+/// A concurrency limiter shared by its copies (one Lock).
+pub type Limiter = {
+    cfg: Cfg,
+    st: sync.Lock[State],
+    key: fn(http.Request) -> List[u8],
+    skip: fn(http.Request) -> bool,
+}
+
+/// A snapshot of a limiter's numbers: `admitted` requests let in (queued ones when they got a
+/// slot), `queued` requests that had to wait, `shed` refused with 503 (full or no queue, a
+/// queue too old, or `expired`), `expired` the part of `shed` that waited and ran out of
+/// time, `running` and `waiting` now, `high_water` the most that ever ran at once, `limit` the
+/// cap now (it moves only for an adaptive limiter).
+pub type Counts = { admitted: i64, queued: i64, shed: i64, expired: i64, running: i64, waiting: i64, high_water: i64, limit: i64 }
+
+fn fresh(limit: i64) -> State {
+    State(Map.new(), 0, List.new(), 0, 0, 0, 0, 0, 0, 0, limit, 0, 0, false)
+}
+
+fn global_key(q: http.Request) -> List[u8] { List.new() }
+
+fn never_skip(q: http.Request) -> bool { false }
+
+/// A limiter of at most `n` (at least 1) requests at a time, with `policy` for the rest.
+pub fn limiter(n: i64, policy: Policy) -> Limiter {
+    let c: i64 = if n < 1 { 1 as i64 } else { n }
+    Limiter(Cfg(c, policy, false, c, c, 0, 0, List.new()), sync.lock(fresh(c)), global_key, never_skip)
+}
+
+/// A limiter with an adaptive cap (see the module comment).
+pub fn shedder(a: Adaptive, policy: Policy) -> Limiter {
+    let lo: i64 = if a.min < 1 { 1 as i64 } else { a.min }
+    let hi: i64 = if a.max < lo { lo } else { a.max }
+    let mut ini = a.initial
+    if ini < lo { ini = lo }
+    if ini > hi { ini = hi }
+    Limiter(Cfg(ini, policy, true, lo, hi, a.target.as_ns(), a.max_queue_age.as_ns(), List.new()), sync.lock(fresh(ini)), global_key, never_skip)
+}
+
+/// `middleware(limiter(n, policy), h)`.
+pub fn concurrency(n: i64, policy: Policy, h: http.Handler) -> http.Handler uses io, clock {
+    middleware(limiter(n, policy), h)
+}
+
+/// `middleware(shedder(a, policy), h)`.
+pub fn load_shed(a: Adaptive, policy: Policy, h: http.Handler) -> http.Handler uses io, clock {
+    middleware(shedder(a, policy), h)
+}
+
+fn slot_of(inout s: State, key: List[u8]) -> Slot {
+    match s.slots.get(key) {
+        Some(x) => x
+        None => Slot(0, List.new())
+    }
+}
+
+fn put(inout s: State, key: List[u8], sl: Slot) {
+    if sl.running <= 0 && sl.q.len() == 0 {
+        let gone = s.slots.remove(key)
+    } else {
+        s.slots.insert(key, sl)
+    }
+}
+
+fn adapt(inout s: State, c: Cfg, lat_ns: i64, ok: bool, now_ns: i64) {
+    if !c.adaptive || lat_ns < 0 { return }
+    if ok && lat_ns <= c.target_ns {
+        s.good += 1
+        if s.good >= s.limit {
+            s.good = 0
+            if s.limit < c.max { s.limit += 1 }
+        }
+        return
+    }
+    s.good = 0
+    if !s.decreased || now_ns - s.last_dec_ns >= c.target_ns {
+        let mut nl = s.limit * 9 / 10
+        if nl >= s.limit { nl = s.limit - 1 }
+        if nl < c.min { nl = c.min }
+        s.limit = nl
+        s.last_dec_ns = now_ns
+        s.decreased = true
+    }
+}
+
+fn cut(key: List[u8]) -> List[u8] { if key.len() > 128 { bytes.slice(key, 0, 128) } else { key } }
+
+impl Limiter {
+    /// The same limiter with one cap per key `f(request)` (a tenant, an API key, a route): `n`
+    /// each. A key longer than 128 bytes is cut. Memory is bounded by the requests in flight
+    /// and queued (a key is forgotten when it has neither). Copies share the numbers.
+    fn by(self, f: fn(http.Request) -> List[u8]) -> Limiter { Limiter(self.cfg, self.st, f, self.skip) }
+
+    /// The same limiter not applied to requests `f` is true for (health checks, `/metrics`).
+    fn except(self, f: fn(http.Request) -> bool) -> Limiter { Limiter(self.cfg, self.st, self.key, f) }
+
+    /// The same limiter named `name` in its metrics (lower-case letters, digits and `_`; others
+    /// become `_`).
+    fn named(self, name: str) -> Limiter {
+        let mut c = self.cfg.copy()
+        c.name = metric_name(name)
+        Limiter(c, self.st, self.key, self.skip)
+    }
+
+    /// Takes a slot for `key`, waiting until `dl` (and the policy's `max_wait`) when the policy
+    /// queues: 0 admitted (call `release` when done), 2 refused (queue full, or no queue),
+    /// 3 refused (the queue is too old, adaptive), 5 waited and ran out of time.
+    fn acquire(self, key: List[u8], dl: time.Deadline) -> i64 uses io, clock {
+        self.acquire_at(key, dl, time.mono_ns())
+    }
+
+    /// `acquire` with `now_ns` as the arrival time (the wait itself uses the real clock).
+    fn acquire_at(self, key: List[u8], dl: time.Deadline, now_ns: i64) -> i64 uses io, clock {
+        let k = cut(key)
+        let first = self.enter(k.copy(), now_ns, sync.no_parker(), false)
+        if first.0 != 4 { return first.0 }
+        let me = sync.parker()
+        let second = self.enter(k.copy(), now_ns, me, true)
+        if second.0 == 1 {
+            let wdl = time.after(self.cfg.policy.max_wait).earlier(dl)
+            return self.wait(k, second.1, me, wdl)
+        }
+        me.close()
+        second.0
+    }
+
+    /// Admits, queues (`have`: with parker `p`), or refuses, under the lock. Returns (0, _)
+    /// admitted, (1, id) queued, (2|3, _) refused, (4, _) would queue but has no parker yet.
+    fn enter(self, key: List[u8], now_ns: i64, p: sync.Parker, have: bool) -> (i64, i64) uses io {
+        let c = self.cfg.copy()
+        self.st.modify(|inout s: State| -> (i64, i64) {
+            let mut sl = slot_of(inout s, key.copy())
+            if sl.running < s.limit && sl.q.len() == 0 {
+                sl.running += 1
+                s.running += 1
+                s.admitted += 1
+                if s.running > s.high_water { s.high_water = s.running }
+                put(inout s, key.copy(), sl)
+                return (0, 0)
+            }
+            if c.policy.max_queue == 0 || sl.q.len() >= c.policy.max_queue {
+                s.shed += 1
+                return (2, 0)
+            }
+            if c.max_age_ns > 0 && sl.q.len() > 0 && now_ns - sl.q[0].at_ns > c.max_age_ns {
+                s.shed += 1
+                return (3, 0)
+            }
+            if !have { return (4, 0) }
+            s.next_id += 1
+            let id = s.next_id
+            sl.q.push(Waiter(id, p, now_ns))
+            s.waiting += 1
+            s.queued += 1
+            put(inout s, key.copy(), sl)
+            (1, id)
+        })
+    }
+
+    /// Waits as ticket `id` in `key`'s queue until a releaser hands over a slot (0) or `wdl`
+    /// passes (5: the ticket leaves the queue under the lock, so a grant and the timeout
+    /// cannot both happen; a grant that came first wins).
+    fn wait(self, key: List[u8], id: i64, me: sync.Parker, wdl: time.Deadline) -> i64 uses io, clock {
+        while true {
+            me.park(wdl)
+            let r = self.st.modify(|inout s: State| -> i64 {
+                let mut at = s.granted.len()
+                for i in 0..s.granted.len() {
+                    if s.granted[i] == id { at = i }
+                }
+                if at < s.granted.len() {
+                    let mut rest: List[i64] = List.new()
+                    for i in 0..s.granted.len() {
+                        if i != at { rest.push(s.granted[i]) }
+                    }
+                    s.granted = rest
+                    return 1
+                }
+                if wdl.expired() {
+                    let mut sl = slot_of(inout s, key.copy())
+                    let mut keep: List[Waiter] = List.new()
+                    for w in sl.q {
+                        if w.id != id { keep.push(w) }
+                    }
+                    sl.q = keep
+                    s.waiting -= 1
+                    s.expired += 1
+                    s.shed += 1
+                    put(inout s, key.copy(), sl)
+                    return 2
+                }
+                0
+            })
+            if r == 1 {
+                me.close()
+                return 0
+            }
+            if r == 2 {
+                me.close()
+                return 5
+            }
+        }
+        5
+    }
+
+    /// Frees a slot of `key`: `release_at` now, no latency observation.
+    fn release(self, key: List[u8]) uses io { self.release_at(key, -1, true, 0) }
+
+    /// Frees a slot of `key` after a handler that took `lat_ns` (negative: not observed) and
+    /// did (`ok`) or did not succeed, at `now_ns`: feeds the adaptive cap, then hands slots to
+    /// the oldest waiters, in order.
+    fn release_at(self, key: List[u8], lat_ns: i64, ok: bool, now_ns: i64) uses io {
+        let k = cut(key)
+        let c = self.cfg.copy()
+        self.st.modify(|inout s: State| -> () {
+            let mut sl = slot_of(inout s, k.copy())
+            sl.running -= 1
+            s.running -= 1
+            adapt(inout s, c, lat_ns, ok, now_ns)
+            while sl.q.len() > 0 && sl.running < s.limit {
+                let w = sl.q[0].copy()
+                let mut rest: List[Waiter] = List.new()
+                for i in 1..sl.q.len() { rest.push(sl.q[i]) }
+                sl.q = rest
+                sl.running += 1
+                s.running += 1
+                s.waiting -= 1
+                s.admitted += 1
+                if s.running > s.high_water { s.high_water = s.running }
+                s.granted.push(w.id)
+                w.p.unpark()
+            }
+            put(inout s, k.copy(), sl)
+        })
+    }
+
+    /// The numbers now.
+    fn counts(self) -> Counts {
+        self.st.modify(|inout s: State| -> Counts {
+            Counts(s.admitted, s.queued, s.shed, s.expired, s.running, s.waiting, s.high_water, s.limit)
+        })
+    }
+
+    /// The 503 for refusal code `code` of `acquire`.
+    fn refuse(self, code: i64) -> http.Response {
+        let mut why = sys.lit("too many requests are being handled")
+        if code == 3 {
+            why = sys.lit("the queue is backed up: requests are waiting too long")
+        } else if code == 5 {
+            why = sys.lit("no slot came free within ")
+            bytes.append(inout why, bytes.from_i64(self.cfg.policy.max_wait.as_ms()))
+            bytes.append(inout why, sys.lit(" ms"))
+        } else if self.cfg.policy.max_queue > 0 {
+            why = sys.lit("too many requests are being handled and the queue is full")
+        }
+        let mut r = problem.with_detail(503, why).response()
+        r.set_header("Retry-After", bytes.from_i64(self.cfg.policy.retry_after))
+        r
+    }
+
+    /// Adds counters `http_limit_<name>_admitted_total`, `_queued_total`, `_shed_total`,
+    /// `_expired_total` and gauges `_in_flight`, `_waiting`, `_in_flight_max`, `_limit` to
+    /// `m`'s exposition (`name` is used when `named` was not called).
+    fn expose(self, m: metrics.Metrics, name: str) {
+        let lm = if self.cfg.name.len() == 0 { self.named(name) } else { self }
+        m.add_source(|| -> List[u8] {
+            let c = lm.counts()
+            let mut o: List[u8] = List.new()
+            let p = prefix("http_limit_", lm.cfg.name)
+            bytes.append(inout o, series(p, "_admitted_total", "Requests the limiter let in.", "counter", c.admitted))
+            bytes.append(inout o, series(p, "_queued_total", "Requests that waited in the limiter's queue.", "counter", c.queued))
+            bytes.append(inout o, series(p, "_shed_total", "Requests the limiter refused (503).", "counter", c.shed))
+            bytes.append(inout o, series(p, "_expired_total", "Queued requests that waited out their time (a part of shed).", "counter", c.expired))
+            bytes.append(inout o, series(p, "_in_flight", "Requests running the handler now.", "gauge", c.running))
+            bytes.append(inout o, series(p, "_waiting", "Requests in the queue now.", "gauge", c.waiting))
+            bytes.append(inout o, series(p, "_in_flight_max", "The most requests that ever ran at once.", "gauge", c.high_water))
+            bytes.append(inout o, series(p, "_limit", "The concurrency cap now.", "gauge", c.limit))
+            o
+        })
+    }
+}
+
+fn metric_name(n: str) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    for c in sys.lit(n) {
+        if (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 {
+            o.push(c)
+        } else if c >= 65 && c <= 90 {
+            o.push(c + 32)
+        } else {
+            o.push(95)
+        }
+    }
+    o
+}
+
+fn prefix(pre: str, name: List[u8]) -> List[u8] {
+    let mut p = sys.lit(pre)
+    bytes.append(inout p, name)
+    p
+}
+
+fn series(pre: List[u8], suffix: str, help: str, kind: str, v: i64) -> List[u8] {
+    let mut name = pre.copy()
+    bytes.append(inout name, sys.lit(suffix))
+    let mut out: List[u8] = List.new()
+    bytes.append(inout out, sys.lit("# HELP "))
+    bytes.append(inout out, name)
+    out.push(32)
+    bytes.append(inout out, sys.lit(help))
+    out.push(10)
+    bytes.append(inout out, sys.lit("# TYPE "))
+    bytes.append(inout out, name)
+    out.push(32)
+    bytes.append(inout out, sys.lit(kind))
+    out.push(10)
+    bytes.append(inout out, name)
+    out.push(32)
+    bytes.append(inout out, bytes.from_i64(v))
+    out.push(10)
+    out
+}
+
+/// The limiter as a layer (see the module comment): requests `skip` is true for go straight to
+/// `h`; the others take a slot (per key) before `h` and give it back after.
+pub fn middleware(lim: Limiter, h: http.Handler) -> http.Handler uses io, clock {
+    |req: http.Request| -> http.Response {
+        if lim.skip(req) { return h(req) }
+        let key = cut(lim.key(req))
+        let code = lim.acquire(key.copy(), req.deadline)
+        if code != 0 { return lim.refuse(code) }
+        let t0 = time.mono_ns()
+        match task.catch(|| -> http.Response { h(req) }) {
+            Ok(resp) => {
+                let t1 = time.mono_ns()
+                lim.release_at(key, t1 - t0, resp.status < 500, t1)
+                resp
+            }
+            Err(why) => {
+                lim.release_at(key, time.mono_ns() - t0, false, time.mono_ns())
+                let mut resp = http.error_response(500)
+                resp.keep_alive = false
+                resp
+            }
+        }
+    }
+}
+
+// ---- timeouts
+
+type TState = { started: i64, timed_out: i64, rejected: i64, trapped: i64 }
+
+/// Counters of the handler timeouts made from it (shared by copies).
+pub type Timeouts = { st: sync.Lock[TState] }
+
+/// New counters for `Timeouts.wrap`.
+pub fn timeouts() -> Timeouts { Timeouts(sync.lock(TState(0, 0, 0, 0))) }
+
+/// `timeouts().wrap(d, pool, h)`.
+pub fn timeout(d: time.Duration, pool: task.Pool, h: http.Handler) -> http.Handler uses io, clock {
+    timeouts().wrap(d, pool, h)
+}
+
+impl Timeouts {
+    /// Runs `h` on a worker of `pool` and waits for it until `d` from now (or the request's own
+    /// deadline, if earlier), which it also puts in `req.deadline` so a handler that waits on
+    /// something can wait no longer. If `h` is not done by then the answer is `504 Gateway
+    /// Timeout` (problem+json, `Connection: close`). If the pool's queue stays full until the
+    /// deadline the answer is `503` with `Retry-After` (counted as `rejected`, not as a
+    /// timeout: the handler never started). A handler that traps is a `500` at once.
+    ///
+    /// Semantics of a late handler: nothing in this runtime interrupts a running handler (and
+    /// the server has no cancel token per request), so the 504 is sent at the deadline, and
+    /// the handler runs on to its end on its worker with its result discarded; a pool of its
+    /// own per route bounds how many workers slow handlers can hold. See the module comment
+    /// for where to put the concurrency limit.
+    fn wrap(self, d: time.Duration, pool: task.Pool, h: http.Handler) -> http.Handler uses io, clock {
+        let me = self
+        |req: http.Request| -> http.Response {
+            let dl = time.after(d).earlier(req.deadline)
+            let mut r = req.copy()
+            r.deadline = dl
+            me.st.modify(|inout s: TState| -> () { s.started += 1 })
+            match pool.run(|| -> http.Response { h(r) }, dl) {
+                Ok(fut) => {
+                    match fut.result(dl) {
+                        Some(Ok(resp)) => resp
+                        Some(Err(why)) => {
+                            me.st.modify(|inout s: TState| -> () { s.trapped += 1 })
+                            let mut resp = http.error_response(500)
+                            resp.keep_alive = false
+                            resp
+                        }
+                        None => {
+                            me.st.modify(|inout s: TState| -> () { s.timed_out += 1 })
+                            let mut msg = sys.lit("the handler did not answer within ")
+                            bytes.append(inout msg, bytes.from_i64(d.as_ms()))
+                            bytes.append(inout msg, sys.lit(" ms"))
+                            let mut resp = problem.with_detail(504, msg).response()
+                            resp.keep_alive = false
+                            resp
+                        }
+                    }
+                }
+                Err(e) => {
+                    me.st.modify(|inout s: TState| -> () { s.rejected += 1 })
+                    let mut resp = problem.with_detail(503, sys.lit("no worker was free in time")).response()
+                    resp.set_header("Retry-After", sys.lit("1"))
+                    resp.keep_alive = false
+                    resp
+                }
+            }
+        }
+    }
+
+    /// (started, timed out, rejected, trapped) so far.
+    fn counts(self) -> (i64, i64, i64, i64) {
+        self.st.modify(|inout s: TState| -> (i64, i64, i64, i64) { (s.started, s.timed_out, s.rejected, s.trapped) })
+    }
+
+    /// Adds `http_timeout_<name>_started_total`, `_timed_out_total`, `_rejected_total` and
+    /// `_trapped_total` to `m`'s exposition.
+    fn expose(self, m: metrics.Metrics, name: str) {
+        let tm = self
+        let nm = metric_name(name)
+        m.add_source(|| -> List[u8] {
+            let (a, b, c, d) = tm.counts()
+            let p = prefix("http_timeout_", nm)
+            let mut o: List[u8] = List.new()
+            bytes.append(inout o, series(p, "_started_total", "Requests run under the handler timeout.", "counter", a))
+            bytes.append(inout o, series(p, "_timed_out_total", "Requests answered 504 because the handler was late.", "counter", b))
+            bytes.append(inout o, series(p, "_rejected_total", "Requests answered 503 because no worker was free.", "counter", c))
+            bytes.append(inout o, series(p, "_trapped_total", "Handlers that trapped (answered 500).", "counter", d))
+            o
+        })
+    }
+}
+
+// ---- client retry
+
+type RCfg = {
+    max_attempts: i64,
+    base_ns: i64,
+    max_backoff_ns: i64,
+    ratio_m: i64,
+    cap_m: i64,
+    any_method: bool,
+    statuses: List[i32],
+    honor_retry_after: bool,
+    max_retry_after_ns: i64,
+}
+
+type RStats = { requests: i64, retries: i64, exhausted: i64, gave_up: i64 }
+
+/// The client retry helper (see the module comment), shared by copies.
+pub type Retry = {
+    cfg: RCfg,
+    budget: sync.Lock[i64],
+    stats: sync.Lock[RStats],
+    sleep: fn(i64),
+    jitter: fn(i64) -> i64,
+}
+
+fn real_sleep(ns: i64) uses clock { time.sleep_ns(ns) }
+
+/// Jitter of the default: equal jitter, a number in [bound/2, bound).
+fn real_jitter(bound: i64) -> i64 uses io {
+    if bound < 2 { return bound }
+    let half = bound / 2
+    match random.below((bound - half) as u64) {
+        Ok(v) => half + (v as i64)
+        Err(e) => half
+    }
+}
+
+/// The default: 3 attempts in all, backoff 100 ms doubling to at most 5 s with equal jitter,
+/// retries on 429, 502, 503 and 504 and on errors (no connection, deadline), idempotent
+/// methods only (GET, HEAD, OPTIONS, TRACE, PUT, DELETE, or any request with an
+/// `Idempotency-Key` header), `Retry-After` in seconds honoured up to 30 s (a server that asks for
+/// longer is not retried), a budget of 10 retries saved up and 20% of the requests earned,
+/// cap 100.
+pub fn retry() -> Retry uses io, clock {
+    let mut sts: List[i32] = List.new()
+    for c in [429, 502, 503, 504] { sts.push(c as i32) }
+    Retry(
+        RCfg(3, 100000000, 5000000000, 200, 100000, false, sts, true, 30000000000),
+        sync.lock(10000),
+        sync.lock(RStats(0, 0, 0, 0)),
+        real_sleep,
+        real_jitter)
+}
+
+impl Retry {
+    fn with_cfg(self, c: RCfg) -> Retry { Retry(c, self.budget, self.stats, self.sleep, self.jitter) }
+
+    /// At most `n` attempts in all (at least 1).
+    fn attempts(self, n: i64) -> Retry {
+        let mut c = self.cfg.copy()
+        c.max_attempts = if n < 1 { 1 as i64 } else { n }
+        self.with_cfg(c)
+    }
+
+    /// Backoff before retry k: `base` doubled k-1 times, at most `cap`, then jittered.
+    fn backoff(self, base: time.Duration, cap: time.Duration) -> Retry {
+        let mut c = self.cfg.copy()
+        c.base_ns = if base.as_ns() < 1 { 1 as i64 } else { base.as_ns() }
+        c.max_backoff_ns = if cap.as_ns() < c.base_ns { c.base_ns } else { cap.as_ns() }
+        self.with_cfg(c)
+    }
+
+    /// A budget of its own (see `retry()`): `initial` retries to start, `ratio_pct` percent of one earned per
+    /// request, at most `cap` saved.
+    fn with_budget(self, initial: i64, ratio_pct: i64, cap: i64) -> Retry {
+        let mut c = self.cfg.copy()
+        c.ratio_m = ratio_pct * 10
+        c.cap_m = cap * 1000
+        Retry(c, sync.lock(initial * 1000), self.stats, self.sleep, self.jitter)
+    }
+
+    /// Retries every method, not only idempotent ones. Only for requests that are safe to
+    /// repeat for another reason (the server de-duplicates them).
+    fn any_method(self) -> Retry {
+        let mut c = self.cfg.copy()
+        c.any_method = true
+        self.with_cfg(c)
+    }
+
+    /// Retries on these statuses (and on errors) instead of the default list.
+    fn on_statuses(self, sts: List[i32]) -> Retry {
+        let mut c = self.cfg.copy()
+        c.statuses = sts
+        self.with_cfg(c)
+    }
+
+    /// Whether `Retry-After` is honoured, and the longest wait asked for that is accepted.
+    fn retry_after(self, honor: bool, longest: time.Duration) -> Retry {
+        let mut c = self.cfg.copy()
+        c.honor_retry_after = honor
+        c.max_retry_after_ns = longest.as_ns()
+        self.with_cfg(c)
+    }
+
+    /// Replaces the sleeper (`ns` to wait) and the jitter (`bound` to a number below it), for tests.
+    fn with_clock(self, sleep: fn(i64), jitter: fn(i64) -> i64) -> Retry {
+        Retry(self.cfg, self.budget, self.stats, sleep, jitter)
+    }
+
+    /// Whether a request may be repeated at all (see `retry()`).
+    fn repeatable(self, req: http.Request) -> bool {
+        if self.cfg.any_method { return true }
+        for m in ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"] {
+            if bytes.eq(req.method, sys.lit(m)) { return true }
+        }
+        match req.header("idempotency-key") {
+            Some(v) => true
+            None => false
+        }
+    }
+
+    /// The wait before retry number `attempt` (1 for the first), before jitter: base doubled
+    /// `attempt - 1` times, at most the cap.
+    fn backoff_ns(self, attempt: i64) -> i64 {
+        let mut d = self.cfg.base_ns
+        let mut i: i64 = 1
+        while i < attempt && d < self.cfg.max_backoff_ns {
+            d = d * 2
+            i += 1
+        }
+        if d > self.cfg.max_backoff_ns { self.cfg.max_backoff_ns } else { d }
+    }
+
+    /// Takes one retry from the budget: false when there is none.
+    fn withdraw(self) -> bool {
+        self.budget.modify(|inout t: i64| -> bool {
+            if t >= 1000 {
+                t -= 1000
+                return true
+            }
+            false
+        })
+    }
+
+    fn deposit(self) {
+        let r = self.cfg.ratio_m
+        let cap = self.cfg.cap_m
+        self.budget.modify(|inout t: i64| -> () {
+            t += r
+            if t > cap { t = cap }
+        })
+    }
+
+    /// Sends `req` with `f` (`client.fetch` and `client.fetch_host` are the usual ones: see
+    /// `fetch` and `fetch_host`), repeating it per the policy within `dl`. The last outcome is
+    /// returned: a final 503 is an `Ok` response, not an error. A retry is not made when the
+    /// method may not be repeated, the attempts are used, the budget is empty, `Retry-After`
+    /// asks for more than the policy accepts, or the wait would pass `dl`.
+    fn send(self, f: fn(http.Request, time.Deadline) -> Result[http.Response, String], req: http.Request, dl: time.Deadline) -> Result[http.Response, String] uses io, clock {
+        self.stats.modify(|inout s: RStats| -> () { s.requests += 1 })
+        self.deposit()
+        let can = self.repeatable(req)
+        let mut attempt: i64 = 1
+        while true {
+            let res = f(req.copy(), dl)
+            let mut again = false
+            let mut asked: i64 = 0
+            match res {
+                Ok(r) => {
+                    for c in self.cfg.statuses {
+                        if c == r.status { again = true }
+                    }
+                    if again && self.cfg.honor_retry_after {
+                        match r.header("retry-after") {
+                            Some(v) => {
+                                match bytes.parse_u64(v) {
+                                    Some(sec) => {
+                                        if sec > 1000000 { asked = self.cfg.max_retry_after_ns + 1 } else { asked = (sec as i64) * 1000000000 }
+                                    }
+                                    None => {}
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                Err(e) => { again = true }
+            }
+            if !again || !can || attempt >= self.cfg.max_attempts { return res }
+            if asked > self.cfg.max_retry_after_ns {
+                self.stats.modify(|inout s: RStats| -> () { s.gave_up += 1 })
+                return res
+            }
+            let jit = self.jitter
+            let mut wait = jit(self.backoff_ns(attempt))
+            if asked > wait { wait = asked }
+            if !dl.is_never() && dl.remaining().as_ns() <= wait {
+                self.stats.modify(|inout s: RStats| -> () { s.gave_up += 1 })
+                return res
+            }
+            if !self.withdraw() {
+                self.stats.modify(|inout s: RStats| -> () { s.exhausted += 1 })
+                return res
+            }
+            self.stats.modify(|inout s: RStats| -> () { s.retries += 1 })
+            let sl = self.sleep
+            sl(wait)
+            attempt += 1
+        }
+        Err(String.from("unreachable"))
+    }
+
+    /// `send` over `client.fetch` to `a`.
+    fn fetch(self, a: net.Addr, req: http.Request, dl: time.Deadline) -> Result[http.Response, String] uses io, net, clock {
+        self.send(|q: http.Request, d: time.Deadline| -> Result[http.Response, String] { client.fetch(a, q, d) }, req, dl)
+    }
+
+    /// `send` over `client.fetch_host` to `name:port` (each attempt resolves the name again).
+    fn fetch_host(self, name: str, port: i32, req: http.Request, dl: time.Deadline) -> Result[http.Response, String] uses io, net, clock {
+        self.send(|q: http.Request, d: time.Deadline| -> Result[http.Response, String] { client.fetch_host(name, port, q, d) }, req, dl)
+    }
+
+    /// (requests, retries made, refused for an empty budget, given up for a long `Retry-After`
+    /// or a short deadline) so far.
+    fn counts(self) -> (i64, i64, i64, i64) {
+        self.stats.modify(|inout s: RStats| -> (i64, i64, i64, i64) { (s.requests, s.retries, s.exhausted, s.gave_up) })
+    }
+
+    /// Adds `http_client_retry_requests_total`, `_retries_total`, `_budget_exhausted_total`
+    /// and `_gave_up_total` to `m`'s exposition.
+    fn expose(self, m: metrics.Metrics) {
+        let rt = self
+        m.add_source(|| -> List[u8] {
+            let (a, b, c, d) = rt.counts()
+            let p = sys.lit("http_client_retry")
+            let mut o: List[u8] = List.new()
+            bytes.append(inout o, series(p, "_requests_total", "Requests sent through the retry helper.", "counter", a))
+            bytes.append(inout o, series(p, "_retries_total", "Retries made.", "counter", b))
+            bytes.append(inout o, series(p, "_budget_exhausted_total", "Retries not made because the budget was empty.", "counter", c))
+            bytes.append(inout o, series(p, "_gave_up_total", "Retries not made: Retry-After too long or no time left.", "counter", d))
+            o
+        })
+    }
+}
