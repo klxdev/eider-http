@@ -1,0 +1,666 @@
+// http/multipart: the parser on whole bodies and in pieces (every split of a body must give the
+// same parts), boundary edge cases, limits and their statuses, the streaming reader, collecting
+// (with a spill directory), the builder, filename sanitising, and a streamed upload over loopback.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.fs
+import std.io
+import std.net
+import std.random
+import std.stream
+import std.strings
+import std.task
+import std.time
+import http.tests.rng as fuzz
+import http
+import http.multipart
+import http.router
+import http.server
+import http.client
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+/// `\n` is CRLF (so a body reads as written); `\\n` in the text is not available: use `lf()`.
+fn wire(s: str) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for c in sys.lit(s) {
+        if c == 10 {
+            out.push(13)
+            out.push(10)
+        } else {
+            out.push(c)
+        }
+    }
+    out
+}
+
+/// A body text with CR and LF shown.
+fn esc(b: List[u8]) -> String {
+    let mut t = String.from("")
+    for c in b {
+        if c == 13 {
+            t.push_str("\\r")
+        } else if c == 10 {
+            t.push_str("\\n")
+        } else if c < 32 || c > 126 {
+            t.push_str("\\x")
+            t.append(sys.to_string(bytes.hex(bytes.slice(b, 0, 0))))
+            let one: List[u8] = List[c]
+            t.append(sys.to_string(bytes.hex(one)))
+        } else {
+            let one: List[u8] = List[c]
+            t.append(sys.to_string(one))
+        }
+    }
+    t
+}
+
+fn cat(a: str, b: String) -> String {
+    let mut t = String.from(a)
+    t.append(b)
+    t
+}
+
+fn nulname() -> List[u8] {
+    let mut v = lit("a")
+    v.push(0)
+    bytes.append(inout v, lit("b.txt"))
+    v
+}
+
+fn say(s: String) uses io { io.outln(s.bytes()) }
+
+/// A reader that gives `data` in pieces of the sizes in `sizes` (cycling), for splitting a body anywhere.
+type Chunker = { data: List[u8], pos: usize, sizes: List[usize], idx: usize }
+
+fn chunker(data: List[u8], sizes: List[usize]) -> Chunker { Chunker(data, 0, sizes, 0) }
+
+impl stream.Reader for Chunker {
+    fn read(inout self, max: usize) -> Result[List[u8], stream.Error] uses io {
+        if self.pos >= self.data.len() { return Ok(List.new()) }
+        let mut n = self.sizes[self.idx % self.sizes.len()]
+        self.idx += 1
+        if n > max { n = max }
+        if n == 0 { n = 1 }
+        if self.pos + n > self.data.len() { n = self.data.len() - self.pos }
+        let out = bytes.slice(self.data, self.pos, self.pos + n)
+        self.pos += n
+        Ok(out)
+    }
+
+    fn read_by(inout self, max: usize, dl: time.Deadline) -> Result[List[u8], stream.Error] uses io, clock { self.read(max) }
+}
+
+/// What a parse of `body` gives, as text: one line per part, or the error's kind and status.
+/// `sizes`: the pieces the input arrives in; `rd`: the size of the reads of the part's body.
+fn transcript(body: List[u8], boundary: str, lim: multipart.Limits, sizes: List[usize], rd: usize) -> String uses io {
+    let mut out = String.from("")
+    let mut f = match multipart.form(lit(boundary), lim) {
+        Ok(f) => f
+        Err(e) => { return String.from("form: bad boundary") }
+    }
+    let mut src = chunker(body, sizes)
+    while true {
+        match f.next_part(inout src) {
+            Ok(Some(p)) => {
+                out.push_str("[")
+                out.append(esc(p.name))
+                out.push_str("]")
+                match p.filename {
+                    Some(n) => {
+                        out.push_str(" file=")
+                        out.append(esc(n))
+                    }
+                    None => {}
+                }
+                out.push_str(" ct=")
+                out.append(esc(p.content_type))
+                out.push_str(" body=")
+                let mut data: List[u8] = List.new()
+                while true {
+                    match f.read(inout src, rd) {
+                        Ok(b) => {
+                            if b.len() == 0 { break }
+                            bytes.append(inout data, b)
+                        }
+                        Err(e) => {
+                            out.append(esc(data))
+                            out.push_str(" ERROR ")
+                            out.append(String.from_int(e.status() as i64))
+                            out.push_str(" ")
+                            out.append(e.message.copy())
+                            return out
+                        }
+                    }
+                }
+                out.append(esc(data))
+                out.push_str("\n")
+            }
+            Ok(None) => {
+                out.push_str("end")
+                return out
+            }
+            Err(e) => {
+                out.push_str("ERROR ")
+                out.append(String.from_int(e.status() as i64))
+                out.push_str(" ")
+                out.append(e.message.copy())
+                return out
+            }
+        }
+    }
+    out
+}
+
+fn sz(n: usize) -> List[usize] {
+    let mut v: List[usize] = List.new()
+    v.push(n)
+    v
+}
+
+fn show(label: str, t: String) uses io {
+    print(label)
+    say(t)
+}
+
+const BASIC: str = "--XX\nContent-Disposition: form-data; name=\"title\"\n\nhello world\n--XX\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\nContent-Type: text/plain\n\nline1\nline2\n--XX--\n"
+
+fn boundaries() uses io {
+    print("-- boundary_of")
+    for ct in List["multipart/form-data; boundary=abc", "Multipart/Form-Data;boundary=\"a b:c\"", "multipart/form-data; charset=utf-8; BOUNDARY=x-y", "multipart/form-data; boundary=\"a\\\"b\"", "multipart/form-data", "multipart/form-data; boundary=", "multipart/form-data; boundary=\"", "multipart/mixed; boundary=abc", "application/json", "multipart/form-data; boundary=a<b", "multipart/form-data; boundary=\"ends \""] {
+        match multipart.boundary_of(lit(ct)) {
+            Ok(b) => { say(cat("ok  ", esc(b))) }
+            Err(e) => {
+                let mut t = String.from("err ")
+                t.append(String.from_int(e.status() as i64))
+                t.push_str(" ")
+                t.append(e.message.copy())
+                say(t)
+            }
+        }
+    }
+    let mut long: List[u8] = List.new()
+    for i in 0..70 { long.push(97) }
+    print(multipart.check_boundary(long).is_ok())
+    long.push(97)
+    print(multipart.check_boundary(long).is_ok())
+}
+
+fn parsing() uses io {
+    print("-- a form, whole and in pieces")
+    let lim = multipart.limits()
+    show("whole", transcript(wire(BASIC), "XX", lim, sz(100000), 64))
+    show("1-byte pieces", transcript(wire(BASIC), "XX", lim, sz(1), 3))
+    show("7-byte pieces", transcript(wire(BASIC), "XX", lim, sz(7), 1))
+
+    print("-- preamble, epilogue, padding, the first delimiter with no CRLF before it")
+    show("preamble+epilogue", transcript(wire("this is the preamble\nit may say anything --XX\n--XX \t\nContent-Disposition: form-data; name=\"a\"\n\n1\n--XX--\nepilogue\n--XX\nnot a part"), "XX", lim, sz(5), 4))
+    show("no CRLF first", transcript(wire("--XX\nContent-Disposition: form-data; name=\"a\"\n\n1\n--XX--"), "XX", lim, sz(100), 4))
+    show("empty form", transcript(wire("--XX--\n"), "XX", lim, sz(3), 4))
+    show("empty body", transcript(wire("--XX\nContent-Disposition: form-data; name=\"a\"\n\n\n--XX--\n"), "XX", lim, sz(2), 4))
+    show("no headers is refused", transcript(wire("--XX\n\nbody\n--XX--\n"), "XX", lim, sz(100), 4))
+
+    print("-- boundary-like text in the content")
+    show("prefix of a longer line", transcript(wire("--XX\nContent-Disposition: form-data; name=\"a\"\n\nbefore\n--XXYZ and --X and\n--XX-x\n--XX \tq\nafter\n--XX--\n"), "XX", lim, sz(100), 5))
+    show("same, split everywhere", transcript(wire("--XX\nContent-Disposition: form-data; name=\"a\"\n\nbefore\n--XXYZ and --X and\n--XX-x\n--XX \tq\nafter\n--XX--\n"), "XX", lim, sz(1), 2))
+    show("bare LF and CR in content", transcript(bytes.concat(wire("--XX\nContent-Disposition: form-data; name=\"a\"\n\nx"), bytes.concat(List[13 as u8, 10 as u8, 45 as u8, 45 as u8, 88 as u8], wire("\n--XX--\n"))), "XX", lim, sz(100), 5))
+    show("binary content", transcript(bytes.concat(wire("--XX\nContent-Disposition: form-data; name=\"a\"; filename=\"b\"\n\n"), bytes.concat(List[0 as u8, 255 as u8, 13 as u8, 0 as u8, 10 as u8, 45 as u8], wire("\n--XX--\n"))), "XX", lim, sz(3), 2))
+    show("a one-character boundary that is common text", transcript(wire("--a\nContent-Disposition: form-data; name=\"x\"\n\n--a--a\n--a--\n"), "a", lim, sz(100), 8))
+
+    print("-- headers")
+    show("filename* wins, quotes and backslashes", transcript(wire("--XX\nContent-Disposition: form-data; name=\"a\\\"b\\\\c\"; filename=\"plain.txt\"; filename*=UTF-8''%e2%82%ac%20rates.txt\nContent-Type: Text/CSV; charset=utf-8\nX-Other:  spaced  \n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("filename*=ISO-8859-1", transcript(wire("--XX\nContent-Disposition: form-data; name=a; filename*=iso-8859-1'en'caf%E9.txt\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("bad filename* falls back", transcript(wire("--XX\nContent-Disposition: form-data; name=a; filename=\"f.txt\"; filename*=KOI8-R''%e2\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("Windows path is kept as sent", transcript(wire("--XX\nContent-Disposition: form-data; name=a; filename=\"C:\\Users\\me\\a.txt\"\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("a ; inside a quoted filename", transcript(wire("--XX\nContent-Disposition: form-data; name=\"a;b\"; filename=\"x;y.txt\"\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("no content-type: field", transcript(wire("--XX\nContent-Disposition: form-data; name=a\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("duplicate names kept in order", transcript(wire("--XX\nContent-Disposition: form-data; name=a\n\n1\n--XX\nContent-Disposition: form-data; name=a\n\n2\n--XX--\n"), "XX", lim, sz(100), 9))
+
+    print("-- malformed")
+    show("no Content-Disposition", transcript(wire("--XX\nContent-Type: text/plain\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("not form-data", transcript(wire("--XX\nContent-Disposition: attachment; name=a\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("no name", transcript(wire("--XX\nContent-Disposition: form-data\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("two Content-Disposition", transcript(wire("--XX\nContent-Disposition: form-data; name=a\nContent-Disposition: form-data; name=b\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("folded header", transcript(wire("--XX\nContent-Disposition: form-data;\n name=a\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("header without colon", transcript(wire("--XX\nContent-Disposition form-data\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("bad header name", transcript(wire("--XX\nContent Disposition: form-data; name=a\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("NUL in filename", transcript(bytes.concat(wire("--XX\nContent-Disposition: form-data; name=a; filename=\"a"), bytes.concat(List[0 as u8], wire(".txt\"\n\nd\n--XX--\n"))), "XX", lim, sz(100), 9))
+    show("NUL in name", transcript(bytes.concat(wire("--XX\nContent-Disposition: form-data; name=\"a"), bytes.concat(List[0 as u8], wire("b\"\n\nd\n--XX--\n"))), "XX", lim, sz(100), 9))
+    show("NUL by percent-encoding in filename*", transcript(wire("--XX\nContent-Disposition: form-data; name=a; filename*=UTF-8''a%00.txt\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("bare LF in header", transcript(bytes.concat(wire("--XX\nContent-Disposition: form-data; name=a"), bytes.concat(List[10 as u8], wire("X-A: b\n\nd\n--XX--\n"))), "XX", lim, sz(100), 9))
+    show("unclosed quote", transcript(wire("--XX\nContent-Disposition: form-data; name=\"a\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+    show("text after the boundary", transcript(wire("--XXjunk\nContent-Disposition: form-data; name=a\n\nd\n--XX--\n"), "XX", lim, sz(100), 9))
+
+    print("-- truncated")
+    show("no closing delimiter", transcript(wire("--XX\nContent-Disposition: form-data; name=a\n\nd\n"), "XX", lim, sz(100), 9))
+    show("cut in the content", transcript(wire("--XX\nContent-Disposition: form-data; name=a\n\ndata"), "XX", lim, sz(100), 9))
+    show("cut in a delimiter", transcript(wire("--XX\nContent-Disposition: form-data; name=a\n\nd\n--X"), "XX", lim, sz(100), 9))
+    show("cut in the headers", transcript(wire("--XX\nContent-Disposition: form-da"), "XX", lim, sz(100), 9))
+    show("no delimiter at all", transcript(wire("just some text"), "XX", lim, sz(100), 9))
+    show("nothing", transcript(lit(""), "XX", lim, sz(100), 9))
+}
+
+fn limit_tests() uses io {
+    print("-- limits")
+    let one = "--XX\nContent-Disposition: form-data; name=\"a\"\n\n0123456789\n--XX--\n"
+    let mut l = multipart.limits()
+    l.max_part_bytes = 10
+    show("part exactly at the limit", transcript(wire(one), "XX", l, sz(100), 4))
+    l.max_part_bytes = 9
+    show("part over", transcript(wire(one), "XX", l, sz(100), 4))
+    show("part over, 1-byte pieces", transcript(wire(one), "XX", l, sz(1), 4))
+    let mut l2 = multipart.limits()
+    l2.max_total_bytes = wire(one).len()
+    show("total at the limit", transcript(wire(one), "XX", l2, sz(100), 4))
+    l2.max_total_bytes = wire(one).len() - 3
+    show("total over", transcript(wire(one), "XX", l2, sz(100), 4))
+    show("total over, 1-byte pieces", transcript(wire(one), "XX", l2, sz(1), 4))
+    let mut l3 = multipart.limits()
+    l3.max_header_bytes = 39
+    show("headers over", transcript(wire(one), "XX", l3, sz(100), 4))
+    show("headers over, 1-byte pieces", transcript(wire(one), "XX", l3, sz(1), 4))
+    l3.max_header_bytes = 40
+    show("headers at the limit", transcript(wire(one), "XX", l3, sz(100), 4))
+    // a header block that never ends is cut off by the limit, not buffered
+    let mut endless = wire("--XX\nContent-Disposition: form-data; name=a\nX: ")
+    for i in 0..20000 { endless.push(97) }
+    let mut l4 = multipart.limits()
+    l4.max_header_bytes = 1000
+    show("endless header", transcript(endless, "XX", l4, sz(512), 4))
+    let two = "--XX\nContent-Disposition: form-data; name=\"a\"\n\n1\n--XX\nContent-Disposition: form-data; name=\"b\"; filename=\"f\"\n\n2\n--XX\nContent-Disposition: form-data; name=\"c\"\n\n3\n--XX--\n"
+    let mut l5 = multipart.limits()
+    l5.max_parts = 2
+    show("too many parts", transcript(wire(two), "XX", l5, sz(100), 4))
+    l5.max_parts = 3
+    show("parts at the limit", transcript(wire(two), "XX", l5, sz(100), 4))
+    l5.max_fields = 1
+    show("too many fields (the file does not count)", transcript(wire(two), "XX", l5, sz(100), 4))
+    l5.max_fields = 2
+    show("fields at the limit", transcript(wire(two), "XX", l5, sz(100), 4))
+    print("-- errors as problem+json")
+    let mut f = multipart.from_request(post_with("multipart/form-data; boundary=XX", lit("")), multipart.limits()).unwrap()
+    let mut src = chunker(lit(""), sz(1))
+    match f.next_part(inout src) {
+        Ok(p) => print("unexpected")
+        Err(e) => {
+            let r = e.response()
+            print(r.status)
+            say(sys.to_string(r.body))
+        }
+    }
+    match multipart.from_request(post_with("text/plain", lit("")), multipart.limits()) {
+        Ok(x) => print("unexpected")
+        Err(e) => {
+            let r = e.response()
+            print(r.status)
+            say(sys.to_string(r.body))
+        }
+    }
+    match multipart.from_request(http.request("POST", lit("/")), multipart.limits()) {
+        Ok(x) => print("unexpected")
+        Err(e) => print(e.status())
+    }
+}
+
+fn post_with(ct: str, body: List[u8]) -> http.Request {
+    let mut q = http.request("POST", lit("/up"))
+    q.headers.push(http.Header(lit("Content-Type"), lit(ct)))
+    q.body = body
+    q
+}
+
+/// Random bodies, random splits: the transcript never changes.
+fn splits() uses io {
+    print("-- random splits parse identically")
+    let mut r = fuzz.rng(20260126)
+    let words = List[lit("a"), lit("--"), lit("-"), lit("\r"), lit("\n"), lit("\r\n"), lit("--B"), lit("\r\n--B"), lit("\r\n--BX"), lit("\r\n--B-"), lit("\r\n--B \r"), lit("xyz"), lit(" "), lit("\r\n--B--"), lit("\r\n\r\n")]
+    let mut checked = 0
+    let mut bad = 0
+    for round in 0..60 {
+        // a body of 1 to 4 parts with content made of the delimiter's pieces
+        let mut b: List[u8] = wire("preamble\n")
+        let np = 1 + fuzz.below(inout r, 4)
+        for pi in 0..np {
+            bytes.append(inout b, lit("--B\r\nContent-Disposition: form-data; name=\"p"))
+            bytes.append(inout b, bytes.from_u64(pi as u64))
+            bytes.append(inout b, lit("\"\r\n\r\n"))
+            let nw = fuzz.below(inout r, 12)
+            for wi in 0..nw { bytes.append(inout b, fuzz.pick(inout r, words)) }
+            b.push(13)
+            b.push(10)
+        }
+        bytes.append(inout b, lit("--B--\r\nepilogue"))
+        let lim = multipart.limits()
+        let whole = transcript(b, "B", lim, sz(1000000), 65536)
+        for k in 0..8 {
+            let mut sizes: List[usize] = List.new()
+            let n = 1 + fuzz.below(inout r, 5)
+            for i in 0..n { sizes.push(1 + fuzz.below(inout r, 40)) }
+            let rd = 1 + fuzz.below(inout r, 20)
+            let t = transcript(b, "B", lim, sizes, rd)
+            checked += 1
+            if t != whole {
+                bad += 1
+                print("MISMATCH")
+                say(whole)
+                say(t)
+            }
+        }
+        // cut anywhere: an error or a complete parse, never a hang or a different complete parse
+        let cut = fuzz.below(inout r, b.len())
+        let t = transcript(bytes.slice(b, 0, cut), "B", lim, sz(1 + fuzz.below(inout r, 9)), 7)
+        checked += 1
+        if !strings.contains(t, String.from("end")) && !strings.contains(t, String.from("ERROR 400")) { bad += 1 }
+    }
+    print(checked)
+    print(bad)
+    // every split of BASIC in two, the second piece's size also varied
+    let body = wire(BASIC)
+    let whole = transcript(body, "XX", multipart.limits(), sz(100000), 64)
+    let mut all_same = true
+    for cut in 1..body.len() {
+        let t = transcript(body, "XX", multipart.limits(), sz(cut), 5)
+        if t != whole { all_same = false }
+    }
+    print(all_same)
+}
+
+fn collecting() uses io, fs {
+    print("-- collect")
+    let body = wire("--XX\nContent-Disposition: form-data; name=\"title\"\n\nhello\n--XX\nContent-Disposition: form-data; name=\"file\"; filename=\"../../etc/a.txt\"\nContent-Type: text/plain\n\n0123456789\n--XX\nContent-Disposition: form-data; name=\"tag\"\n\nx\n--XX\nContent-Disposition: form-data; name=\"tag\"\n\ny\n--XX--\n")
+    let mut cfg = multipart.config()
+    let mut f = multipart.form(lit("XX"), cfg.lim).unwrap()
+    let mut src = chunker(body, sz(6))
+    match multipart.collect(inout f, inout src, cfg) {
+        Ok(c) => {
+            print(c.fields.len())
+            say(esc(c.text("title").unwrap()))
+            let file = c.get("file").unwrap()
+            print(file.size)
+            print(file.path.len())
+            say(esc(file.data))
+            say(esc(file.part.filename.unwrap()))
+            say(esc(file.part.safe_name().unwrap()))
+            print(c.all("tag").len())
+            print(c.text("nope").is_none())
+        }
+        Err(e) => say(e.message)
+    }
+    // a file over max_memory with no directory: refused; with a directory: spilled
+    cfg.max_memory = 4
+    let mut f2 = multipart.form(lit("XX"), cfg.lim).unwrap()
+    let mut src2 = chunker(body, sz(6))
+    match multipart.collect(inout f2, inout src2, cfg) {
+        Ok(c) => print("unexpected")
+        Err(e) => {
+            print(e.status())
+            say(e.message)
+        }
+    }
+    let dir = bytes.concat(lit("/tmp/eider-mp-test-"), bytes.hex(random_bytes()))
+    cfg.spill_dir = dir
+    let mut f3 = multipart.form(lit("XX"), cfg.lim).unwrap()
+    let mut src3 = chunker(body, sz(6))
+    match multipart.collect(inout f3, inout src3, cfg) {
+        Ok(c) => {
+            let file = c.get("file").unwrap()
+            print(file.size)
+            print(file.data.len())
+            print(file.path.len() > 0)
+            say(esc(fs.read(file.path).unwrap()))
+            print(bytes.starts_with(file.path, dir))
+            print(c.text("file").is_none())
+            say(esc(c.text("title").unwrap()))
+            c.cleanup()
+            print(fs.exists(file.path))
+        }
+        Err(e) => say(e.message)
+    }
+    // an error after a spill removes the file: the body is cut off
+    let cut = bytes.slice(body, 0, 150)
+    let mut f4 = multipart.form(lit("XX"), cfg.lim).unwrap()
+    let mut src4 = chunker(cut, sz(6))
+    match multipart.collect(inout f4, inout src4, cfg) {
+        Ok(c) => print("unexpected")
+        Err(e) => print(e.status())
+    }
+    print(fs.list(dir).unwrap().len())
+    // a text field over max_field_bytes
+    let mut cfg2 = multipart.config()
+    cfg2.max_field_bytes = 3
+    let mut f5 = multipart.form(lit("XX"), cfg2.lim).unwrap()
+    let mut src5 = chunker(body, sz(100))
+    match multipart.collect(inout f5, inout src5, cfg2) {
+        Ok(c) => print("unexpected")
+        Err(e) => {
+            print(e.status())
+            say(e.message)
+        }
+    }
+    let gone = fs.remove_all(dir)
+    print("-- parse_request, buffered")
+    let q = post_with("multipart/form-data; boundary=XX", body)
+    match multipart.parse_request(q, multipart.config()) {
+        Ok(c) => {
+            print(c.fields.len())
+            say(esc(c.text("title").unwrap()))
+        }
+        Err(e) => say(e.message)
+    }
+    match multipart.parse_request(post_with("application/x-www-form-urlencoded", lit("a=b")), multipart.config()) {
+        Ok(c) => print("unexpected")
+        Err(e) => print(e.status())
+    }
+}
+
+fn random_bytes() -> List[u8] uses io {
+    let mut b: List[u8] = List.new()
+    match random.bytes(6) {
+        Ok(r) => { b = r }
+        Err(e) => { b = lit("fallback") }
+    }
+    b
+}
+
+fn sanitising() uses io {
+    print("-- safe_filename and header_safe")
+    for n in List["report.pdf", "../../etc/passwd", "C:\\Users\\me\\a.txt", "dir/", "..", ".", "", "a/b\\c.txt", ".hidden", "a b.txt"] {
+        match multipart.safe_filename(lit(n)) {
+            Some(s) => { say(cat("ok  ", esc(s))) }
+            None => { say(cat("no  ", esc(lit(n)))) }
+        }
+    }
+    let nul: List[u8] = List[97 as u8, 0 as u8, 98 as u8]
+    print(multipart.safe_filename(nul).is_none())
+    print(multipart.safe_filename(lit("a\r\nX-Injected: 1")).is_none())
+    let mut long: List[u8] = List.new()
+    for i in 0..256 { long.push(97) }
+    print(multipart.safe_filename(long).is_none())
+    print(multipart.header_safe(lit("text/plain")))
+    print(multipart.header_safe(lit("a\r\nb")))
+    print(multipart.header_safe(nul))
+}
+
+fn building() uses io {
+    print("-- the builder")
+    let mut b = multipart.builder_with(lit("BB")).unwrap()
+    b.field(lit("title"), lit("hello")).unwrap()
+    b.file(lit("up"), lit("a.txt"), lit("text/plain"), lit("data\r\nmore")).unwrap()
+    b.file(lit("up2"), lit("caf\u{e9} \"q\" \\x.bin"), lit(""), List[0 as u8, 1 as u8, 2 as u8]).unwrap()
+    b.field(lit("we\"ird\r\nname"), lit("v")).unwrap()
+    let body = b.finish()
+    say(esc(body))
+    say(esc(b.content_type()))
+    let again = b.finish()
+    print(again.len() == body.len())
+    print("round trip")
+    show("parsed", transcript(body, "BB", multipart.limits(), sz(11), 5))
+    print("-- the builder refuses")
+    let mut c = multipart.builder_with(lit("CC")).unwrap()
+    print(c.field(lit("a"), lit("x\r\n--CC\r\nevil")).is_err())
+    print(c.field(nulname(), lit("x")).is_err())
+    print(c.file(lit("a"), nulname(), lit(""), lit("x")).is_err())
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header(lit("Content-Disposition"), lit("form-data; name=\"a\"\r\nX-Injected: 1")))
+    print(c.part(hs, lit("x")).is_err())
+    let mut hs2: List[http.Header] = List.new()
+    hs2.push(http.Header(lit("Bad Name"), lit("v")))
+    print(c.part(hs2, lit("x")).is_err())
+    print(multipart.builder_with(lit("")).is_err())
+    print(multipart.builder_with(lit("a\"b")).is_err())
+    print("-- random boundaries")
+    let r1 = multipart.builder()
+    let r2 = multipart.builder()
+    print(r1.boundary.len())
+    print(!bytes.eq(r1.boundary, r2.boundary))
+    print(multipart.check_boundary(r1.boundary).is_ok())
+    let mut rb = multipart.builder()
+    rb.field(lit("k"), lit("v")).unwrap()
+    let rbody = rb.finish()
+    let ct = rb.content_type()
+    print(multipart.boundary_of(ct).unwrap().len() == r1.boundary.len())
+    let mut ff2 = multipart.form(multipart.boundary_of(ct).unwrap(), multipart.limits()).unwrap()
+    let mut rs = chunker(rbody, sz(3))
+    match ff2.next_part(inout rs) {
+        Ok(Some(p)) => say(esc(p.name))
+        _ => print("unexpected")
+    }
+}
+
+fn app() -> router.Router uses io, fs {
+    let mut r = router.new()
+    r.route_with("POST", "/up", http.Plan(0, true), |q: http.Request| -> http.Response {
+        // streaming by hand: the sizes only, never the whole upload
+        let mut f = match multipart.from_request(q, multipart.limits()) {
+            Ok(f) => f
+            Err(e) => { return e.response() }
+        }
+        let mut body = q.stream.unwrap()
+        let mut t = String.from("")
+        while true {
+            match f.next_part(inout body) {
+                Ok(Some(p)) => {
+                    let mut n: usize = 0
+                    let mut reads: usize = 0
+                    while true {
+                        match f.read(inout body, 1000) {
+                            Ok(b) => {
+                                if b.len() == 0 { break }
+                                n += b.len()
+                                reads += 1
+                            }
+                            Err(e) => { return e.response() }
+                        }
+                    }
+                    t.append(esc(p.name))
+                    t.push_str("=")
+                    t.append(String.from_int(n as i64))
+                    t.push_str(if reads > 1 { " (in pieces) " } else { " " })
+                }
+                Ok(None) => { break }
+                Err(e) => { return e.response() }
+            }
+        }
+        http.respond(200, "text/plain", t.bytes())
+    })
+    r.route_with("POST", "/form", http.Plan(5000, true), |q: http.Request| -> http.Response {
+        match multipart.parse_request(q, multipart.config()) {
+            Ok(c) => http.respond(200, "text/plain", String.from_int(c.fields.len() as i64).bytes())
+            Err(e) => e.response()
+        }
+    })
+    r
+}
+
+fn loopback() uses io, net, clock, threads, fs {
+    print("-- over loopback")
+    let dl = time.after_ms(20000)
+    let mut cfg = server.config()
+    cfg.workers = 2
+    let r = app()
+    cfg.plan = r.planner()
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let a = srv.addr()
+    let h = router.handler(r)
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+    let mut b = multipart.builder_with(lit("loop-boundary")).unwrap()
+    b.field(lit("note"), lit("hi")).unwrap()
+    let mut big: List[u8] = List.new()
+    for i in 0..4000 { big.push((97 + i % 26) as u8) }
+    b.file(lit("big"), lit("big.bin"), lit(""), big).unwrap()
+    let body = b.finish()
+    let mut c = client.connect(a, dl).unwrap()
+    let mut q = http.request("POST", lit("/up"))
+    q.headers.push(http.Header(lit("Content-Type"), b.content_type()))
+    q.body = body
+    match c.request(q, dl) {
+        Ok(resp) => {
+            print(resp.status)
+            say(sys.to_string(resp.body))
+        }
+        Err(e) => print(e)
+    }
+    let mut q2 = http.request("POST", lit("/up"))
+    q2.headers.push(http.Header(lit("Content-Type"), lit("application/json")))
+    q2.body = lit("{{}}")
+    match c.request(q2, dl) {
+        Ok(resp) => {
+            print(resp.status)
+            say(sys.to_string(resp.body))
+        }
+        Err(e) => print(e)
+    }
+    let mut q3 = http.request("POST", lit("/form"))
+    q3.headers.push(http.Header(lit("Content-Type"), b.content_type()))
+    q3.body = bytes.slice(body, 0, 100)
+    match c.request(q3, dl) {
+        Ok(resp) => {
+            print(resp.status)
+            say(sys.to_string(resp.body))
+        }
+        Err(e) => print(e)
+    }
+    // over the route's body limit (5000): refused by the server before the form is looked at
+    let mut b2 = multipart.builder_with(lit("loop-boundary")).unwrap()
+    let mut huge: List[u8] = List.new()
+    for i in 0..6000 { huge.push(98) }
+    b2.file(lit("huge"), lit("h"), lit(""), huge).unwrap()
+    let mut q4 = http.request("POST", lit("/form"))
+    q4.headers.push(http.Header(lit("Content-Type"), b2.content_type()))
+    q4.body = b2.finish()
+    match c.request(q4, dl) {
+        Ok(resp) => print(resp.status)
+        Err(e) => print(e)
+    }
+    c.close()
+    let mut c2 = client.connect(a, dl).unwrap()
+    let mut q5 = http.request("POST", lit("/form"))
+    q5.headers.push(http.Header(lit("Content-Type"), b.content_type()))
+    q5.body = b.finish()
+    match c2.request(q5, dl) {
+        Ok(resp) => {
+            print(resp.status)
+            say(sys.to_string(resp.body))
+        }
+        Err(e) => print(e)
+    }
+    c2.close()
+    tok.cancel()
+    let stats = th.join()
+    print(stats.requests)
+}
+
+fn main() uses io, net, clock, threads, fs {
+    boundaries()
+    parsing()
+    limit_tests()
+    splits()
+    collecting()
+    sanitising()
+    building()
+    loopback()
+}

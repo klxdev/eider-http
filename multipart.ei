@@ -1,0 +1,990 @@
+//! http/multipart: `multipart/form-data` request bodies (RFC 7578 on RFC 2046), parsed as a
+//! stream and built for clients and tests.
+//!
+//! Three layers, each usable alone:
+//!
+//! - `Parser`: bytes in (`feed`), events out (`next`: a part's head, pieces of its body, its
+//!   end). It never reads and never blocks, so it can be fed in any chunking (the result is the
+//!   same wherever the chunks split, even inside a boundary).
+//! - `Form`: a `Parser` driven by a `stream.Reader` (a streamed request body, `Request.stream`,
+//!   or `stream.reader(q.body)`): `next_part` gives the next part, `read` its body in chunks. Nothing
+//!   is held but the chunk being parsed, so a large upload is never in memory.
+//! - `collect` / `parse_request`: the convenience for forms: every part read into a `Field`,
+//!   text in memory, files in memory up to `max_memory` and above it in a temporary file under
+//!   `spill_dir` (or refused when there is no directory).
+//!
+//!     r.route_with("POST", "/upload", http.Plan(0, true), |q: http.Request| -> http.Response {
+//!         let cfg = multipart.config()
+//!         match multipart.parse_request(q, cfg) {
+//!             Ok(form) => http.text(200, "got {form.fields.len()} parts")
+//!             Err(e) => e.response()                  // 400, 413 or 415 as problem+json
+//!         }
+//!     })
+//!
+//! Streaming by hand:
+//!
+//!     let mut f = multipart.from_request(q, multipart.limits())?
+//!     let mut body = q.stream.unwrap()
+//!     while true {
+//!         match f.next_part(inout body)? {
+//!             Some(part) => { ... loop f.read(inout body, 65536) until it gives no bytes ... }
+//!             None => break
+//!         }
+//!     }
+//!
+//! The parser is strict where being lax is a security problem and tolerant where browsers and
+//! curl differ:
+//!
+//! - The boundary comes from the request's `Content-Type` (`boundary_of`): a token or quoted
+//!   string of 1 to 70 characters from RFC 2046's set; anything else is refused (400), a
+//!   different media type is 415.
+//! - A delimiter is CRLF `--boundary`, then optional blanks and CRLF, or `--`. The same
+//!   characters that are not followed so (a line of content that starts with the boundary text) are
+//!   content. The preamble before the first delimiter and the epilogue after the last are
+//!   skipped (they count toward the total limit). The first delimiter needs no CRLF before it.
+//! - A body that ends before the closing delimiter is `Truncated` (400).
+//! - Part headers end at a blank line, are `name: value` lines with token names and no
+//!   obsolete folding, no NUL, no bare CR or LF; `Content-Disposition: form-data` with a `name` is required.
+//! - `filename*` (RFC 5987/2231: `UTF-8''%e2%82%ac.txt`, UTF-8 or ISO-8859-1) wins over `filename`.
+//!   Neither is decoded further: a `%22` in a quoted name stays text. Use `safe_filename` before a
+//!   client-supplied name is made a path.
+//!
+//! Limits (`Limits`): parts, bytes of a part's headers, bytes of a part's body, bytes of the
+//! whole body, and the number of non-file fields. Each failure has its own `Kind` and an HTTP
+//! status (`Error.status`): 413 for a limit, 415 for another media type, 400 for the rest; `Error.problem` and
+//! `Error.response` make the problem+json of http/problem. The server's own body limit
+//! (`http.Plan.max_body`, 413 from the stream) applies underneath and is reported as `TotalTooLarge`.
+//!
+//! `Builder` writes a body (`field`, `file`, `part`, `finish`) with a random boundary
+//! that is checked not to occur in the content. Names and filenames are written as RFC 7578
+//! 5.1.1 and browsers do: UTF-8 as it is, `"` and `\` escaped with a backslash, CR and LF as
+//! `%0D` and `%0A` (never `filename*`, which RFC 7578 4.2 forbids in form-data); a NUL, or a CR or
+//! LF in a header value, is refused.
+
+import core.sys
+import std.bytes
+import std.stream
+import std.fs
+import std.random
+import std.utf8
+import http
+import http.problem
+
+// ---- errors
+
+/// What went wrong, to act on. The HTTP status of each is `Error.status`.
+pub type Kind =
+    | NotMultipart
+    | BadBoundary
+    | Malformed
+    | Truncated
+    | Io
+    | TooManyParts
+    | TooManyFields
+    | HeaderTooLarge
+    | PartTooLarge
+    | TotalTooLarge
+    | Unsafe
+
+/// A failure: its `kind` and a message for people.
+pub type Error = { kind: Kind, message: String }
+
+fn err(kind: Kind, message: str) -> Error { Error(kind, String.from(message)) }
+
+impl Error {
+    /// The response status: 415 for `NotMultipart`, 413 for a limit, 400 for the rest.
+    fn status(self) -> i32 {
+        match self.kind {
+            NotMultipart => 415
+            TooManyParts => 413
+            TooManyFields => 413
+            HeaderTooLarge => 413
+            PartTooLarge => 413
+            TotalTooLarge => 413
+            _ => 400
+        }
+    }
+
+    /// The error as problem+json (http/problem), with the status of `status`.
+    fn problem(self) -> problem.ApiError { problem.with_detail(self.status(), self.message.bytes()) }
+
+    /// `problem` as a response.
+    fn response(self) -> http.Response { self.problem().response() }
+}
+
+// ---- limits
+
+/// The limits of a parse. `max_parts` parts of any kind, `max_header_bytes` for one part's
+/// header block, `max_part_bytes` for one part's body, `max_total_bytes` for everything read
+/// (preamble and epilogue included), `max_fields` parts that are not files (no `filename`).
+/// A limit of 0 is "none" except for `max_parts` and `max_fields`, where 0 refuses every part.
+pub type Limits = { max_parts: usize, max_header_bytes: usize, max_part_bytes: usize, max_total_bytes: usize, max_fields: usize }
+
+/// 100 parts, 8 KiB of headers a part, 10 MiB a part, 32 MiB in all, 100 fields.
+pub fn limits() -> Limits { Limits(100, 8192, 10485760, 33554432, 100) }
+
+// ---- parts
+
+/// One part: the `name` of its field, its `filename` when it is a file (as the client wrote it:
+/// run it through `safe_filename`), its `content_type` (the header, parameters included;
+/// `text/plain` for a field and `application/octet-stream` for a file without one) and all its
+/// `headers` in order.
+pub type Part = { name: List[u8], filename: Option[List[u8]], content_type: List[u8], headers: List[http.Header] }
+
+impl Part {
+    /// The value of the part's header `name` (case-insensitive).
+    fn header(self, name: str) -> Option[List[u8]] { http.find_s(self.headers, name) }
+
+    /// Whether the part is a file (it has a `filename`).
+    fn is_file(self) -> bool {
+        match self.filename {
+            Some(f) => true
+            None => false
+        }
+    }
+
+    /// `safe_filename` of the part's filename; None when it has none or it is not safe.
+    fn safe_name(self) -> Option[List[u8]] {
+        match self.filename {
+            Some(f) => safe_filename(f)
+            None => None
+        }
+    }
+}
+
+/// A client-supplied filename made safe to use as a name in a directory of yours: the part
+/// after the last `/` or `\`, so no path component survives. None (refuse the upload or make a
+/// name yourself) for a name with NUL or any other control character (CR and LF would split a
+/// header you copy it into), for an empty one, "." and "..", and one over 255 bytes. It does
+/// not otherwise change the name: keep the original only as text, and name your file yourself.
+pub fn safe_filename(raw: List[u8]) -> Option[List[u8]] {
+    let mut start: usize = 0
+    for i in 0..raw.len() {
+        let c = raw[i]
+        if c < 32 || c == 127 { return None }
+        if c == 47 || c == 92 { start = i + 1 }
+    }
+    let base = bytes.slice(raw, start, raw.len())
+    if base.len() == 0 || base.len() > 255 { return None }
+    if base.len() == 1 && base[0] == 46 { return None }
+    if base.len() == 2 && base[0] == 46 && base[1] == 46 { return None }
+    Some(base)
+}
+
+/// Whether `v` can be written into a header: no NUL, CR or LF.
+pub fn header_safe(v: List[u8]) -> bool {
+    for c in v {
+        if c == 0 || c == 10 || c == 13 { return false }
+    }
+    true
+}
+
+// ---- header parameters
+
+fn is_blank(c: u8) -> bool { c == 32 || c == 9 }
+
+/// The first token of a header value (before its first `;`) and its `name=value` parameters:
+/// names lowercased, quoted strings unquoted (`\\` and `\"` are the only escapes, as in Go;
+/// any other backslash stays, which keeps `C:\dir\file` readable). None when a quote is not
+/// closed.
+pub fn params(v: List[u8]) -> Option[(List[u8], List[http.Header])] {
+    let n = v.len()
+    let mut i: usize = 0
+    let mut first: List[u8] = List.new()
+    while i < n && v[i] != 59 {
+        first.push(v[i])
+        i += 1
+    }
+    let mut out: List[http.Header] = List.new()
+    while i < n {
+        // at a ';'
+        i += 1
+        while i < n && is_blank(v[i]) { i += 1 }
+        let mut name: List[u8] = List.new()
+        while i < n && v[i] != 61 && v[i] != 59 {
+            name.push(v[i])
+            i += 1
+        }
+        let mut value: List[u8] = List.new()
+        if i < n && v[i] == 61 {
+            i += 1
+            while i < n && is_blank(v[i]) { i += 1 }
+            if i < n && v[i] == 34 {
+                i += 1
+                let mut closed = false
+                while i < n {
+                    let c = v[i]
+                    if c == 92 && i + 1 < n && (v[i + 1] == 34 || v[i + 1] == 92) {
+                        value.push(v[i + 1])
+                        i += 2
+                    } else if c == 34 {
+                        closed = true
+                        i += 1
+                        break
+                    } else {
+                        value.push(c)
+                        i += 1
+                    }
+                }
+                if !closed { return None }
+                while i < n && v[i] != 59 { i += 1 }
+            } else {
+                while i < n && v[i] != 59 {
+                    value.push(v[i])
+                    i += 1
+                }
+                value = http.trim_ows(value)
+            }
+        }
+        let key = http.lower(http.trim_ows(name))
+        if key.len() > 0 { out.push(http.Header(key, value)) }
+    }
+    Some((http.trim_ows(first), out))
+}
+
+fn param(ps: List[http.Header], name: str) -> Option[List[u8]] { http.find_s(ps, name) }
+
+/// The boundary of a `multipart/form-data` Content-Type value. `NotMultipart` for another
+/// media type, `BadBoundary` for a missing, empty, over-long (70) or ill-formed one.
+pub fn boundary_of(content_type: List[u8]) -> Result[List[u8], Error] {
+    let pr = match params(content_type) {
+        Some(x) => x
+        None => { return Err(err(BadBoundary, "the Content-Type has an unclosed quote")) }
+    }
+    let (mt, ps) = pr
+    if !http.eq_ci_s(mt, "multipart/form-data") {
+        return Err(err(NotMultipart, "the request body is not multipart/form-data"))
+    }
+    let b = match param(ps, "boundary") {
+        Some(b) => b
+        None => { return Err(err(BadBoundary, "multipart/form-data without a boundary")) }
+    }
+    check_boundary(b)?
+    Ok(b)
+}
+
+/// Whether `b` is a boundary RFC 2046 allows (1 to 70 of letters, digits and `'()+_,-./:=?`
+/// and spaces, not ending with a space).
+pub fn check_boundary(b: List[u8]) -> Result[bool, Error] {
+    if b.len() == 0 { return Err(err(BadBoundary, "the boundary is empty")) }
+    if b.len() > 70 { return Err(err(BadBoundary, "the boundary is longer than 70 characters")) }
+    for c in b {
+        let ok = bytes.is_alpha(c) || bytes.is_digit(c) || c == 39 || c == 40 || c == 41 || c == 43 || c == 95 || c == 44 || c == 45 || c == 46 || c == 47 || c == 58 || c == 61 || c == 63 || c == 32
+        if !ok { return Err(err(BadBoundary, "the boundary has a character that is not allowed")) }
+    }
+    if b[b.len() - 1] == 32 { return Err(err(BadBoundary, "the boundary ends with a space")) }
+    Ok(true)
+}
+
+// RFC 5987 ext-value: charset ' [language] ' percent-encoded
+fn ext_value(v: List[u8]) -> Option[List[u8]] {
+    let a = match bytes.find_byte(v, 39, 0) {
+        Some(i) => i
+        None => { return None }
+    }
+    let b = match bytes.find_byte(v, 39, a + 1) {
+        Some(i) => i
+        None => { return None }
+    }
+    let charset = http.lower(bytes.slice(v, 0, a))
+    let raw = match http.pct_decode(bytes.slice(v, b + 1, v.len()), false) {
+        Some(r) => r
+        None => { return None }
+    }
+    if bytes.eq(charset, sys.lit("utf-8")) {
+        if !utf8.valid(raw) { return None }
+        return Some(raw)
+    }
+    if bytes.eq(charset, sys.lit("iso-8859-1")) {
+        let mut out: List[u8] = List.new()
+        for c in raw {
+            if c < 128 {
+                out.push(c)
+            } else {
+                out.push(192 + c / 64)
+                out.push(128 + c % 64)
+            }
+        }
+        return Some(out)
+    }
+    None
+}
+
+fn has_nul(v: List[u8]) -> bool {
+    for c in v {
+        if c == 0 { return true }
+    }
+    false
+}
+
+/// The part described by a header block (the lines, CRLF-separated, without the blank line).
+fn read_part(block: List[u8]) -> Result[Part, Error] {
+    let mut headers: List[http.Header] = List.new()
+    if block.len() > 0 {
+        let mut from: usize = 0
+        while true {
+            let stop = match bytes.find(block, sys.lit("\r\n"), from) {
+                Some(i) => i
+                None => block.len()
+            }
+            let line = bytes.slice(block, from, stop)
+            if line.len() == 0 { return Err(err(Malformed, "an empty line inside a part's headers")) }
+            if is_blank(line[0]) { return Err(err(Malformed, "a folded part header")) }
+            let colon = match bytes.find_byte(line, 58, 0) {
+                Some(i) => i
+                None => { return Err(err(Malformed, "a part header without a colon")) }
+            }
+            let name = bytes.slice(line, 0, colon)
+            if !http.is_token(name) { return Err(err(Malformed, "a part header with an invalid name")) }
+            let value = http.trim_ows(bytes.slice(line, colon + 1, line.len()))
+            if !http.valid_value(value) { return Err(err(Malformed, "a part header with an invalid value")) }
+            headers.push(http.Header(name, value))
+            if stop >= block.len() { break }
+            from = stop + 2
+        }
+    }
+    if http.count_s(headers, "content-disposition") != 1 {
+        return Err(err(Malformed, "a part needs exactly one Content-Disposition"))
+    }
+    let cd = http.find_s(headers, "content-disposition").unwrap()
+    let pr = match params(cd) {
+        Some(x) => x
+        None => { return Err(err(Malformed, "Content-Disposition has an unclosed quote")) }
+    }
+    let (kind, ps) = pr
+    if !http.eq_ci_s(kind, "form-data") { return Err(err(Malformed, "Content-Disposition is not form-data")) }
+    let name = match param(ps, "name") {
+        Some(n) => n
+        None => { return Err(err(Malformed, "Content-Disposition without a name")) }
+    }
+    if has_nul(name) { return Err(err(Malformed, "a NUL in a field name")) }
+    let mut filename: Option[List[u8]] = None
+    match param(ps, "filename") {
+        Some(f) => { filename = Some(f) }
+        None => {}
+    }
+    match param(ps, "filename*") {
+        Some(x) => {
+            match ext_value(x) {
+                Some(f) => { filename = Some(f) }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    match filename {
+        Some(f) => {
+            if has_nul(f) { return Err(err(Malformed, "a NUL in a filename")) }
+        }
+        None => {}
+    }
+    let ct = match http.find_s(headers, "content-type") {
+        Some(c) => c
+        None => {
+            match filename {
+                Some(f) => sys.lit("application/octet-stream")
+                None => sys.lit("text/plain")
+            }
+        }
+    }
+    Ok(Part(name, filename, ct, headers))
+}
+
+// ---- the parser
+
+/// What `Parser.next` found.
+/// - `More`: it needs more input (`feed`), or `finish` when there is none.
+/// - `Start(part)`: a part begins.
+/// - `Data(b)`: the next piece of the current part's body.
+/// - `PartEnd`: the current part is complete.
+/// - `End`: the closing delimiter: the form is complete.
+/// - `Fail(e)`: refused; every later `next` gives the same.
+pub type Event = | More | Start(part: Part) | Data(b: List[u8]) | PartEnd | End | Fail(e: Error)
+
+const PREAMBLE: i32 = 0
+const HEADERS: i32 = 1
+const BODY: i32 = 2
+const DONE: i32 = 3
+
+/// An incremental parser (see the module comment).
+pub type Parser = {
+    delim: List[u8],
+    lim: Limits,
+    buf: List[u8],
+    pos: usize,
+    state: i32,
+    eof: bool,
+    failed: Option[Error],
+    parts: usize,
+    fields: usize,
+    total: usize,
+    part_bytes: usize,
+    over: bool,
+}
+
+/// A parser for `boundary` (checked as `check_boundary` does).
+pub fn parser(boundary: List[u8], lim: Limits) -> Result[Parser, Error] {
+    check_boundary(boundary)?
+    // the stream is taken to start after a CRLF, so the first delimiter is found like the rest
+    let mut d: List[u8] = List.new()
+    d.push(13)
+    d.push(10)
+    d.push(45)
+    d.push(45)
+    bytes.append(inout d, boundary)
+    let mut b: List[u8] = List.new()
+    b.push(13)
+    b.push(10)
+    Ok(Parser(d, lim, b, 0, PREAMBLE, false, None, 0, 0, 0, 0, false))
+}
+
+/// What follows a delimiter's text at `at`: (0, _) not known yet, (1, _) not a delimiter
+/// (content), (2, end) padding and CRLF up to `end` (another part), (3, end) `--` up to `end`
+/// (the last).
+fn classify(buf: List[u8], at: usize) -> (i32, usize) {
+    let n = buf.len()
+    if at >= n { return (0, 0) }
+    if buf[at] == 45 {
+        if at + 1 >= n { return (0, 0) }
+        if buf[at + 1] == 45 { return (3, at + 2) }
+        return (1, 0)
+    }
+    let mut j = at
+    while j < n && is_blank(buf[j]) { j += 1 }
+    if j - at > 256 { return (1, 0) }
+    if j >= n { return (0, 0) }
+    if buf[j] == 13 {
+        if j + 1 >= n { return (0, 0) }
+        if buf[j + 1] == 10 { return (2, j + 2) }
+    }
+    (1, 0)
+}
+
+impl Parser {
+    /// Adds input. The total limit is checked here: past it the parser has failed.
+    fn feed(inout self, data: List[u8]) {
+        match self.failed {
+            Some(e) => { return }
+            None => {}
+        }
+        if self.pos > 0 {
+            self.buf = bytes.slice(self.buf, self.pos, self.buf.len())
+            self.pos = 0
+        }
+        // the limit is on the input up to the closing delimiter: what is past it is dropped, and
+        // the parse fails only if it still needs more, so the outcome does not depend on how the
+        // input was split
+        let mut take = data.copy()
+        if self.lim.max_total_bytes > 0 {
+            let room = if self.total < self.lim.max_total_bytes { self.lim.max_total_bytes - self.total } else { 0 }
+            if data.len() > room {
+                take = bytes.slice(data, 0, room)
+                self.over = true
+            }
+        }
+        self.total += take.len()
+        bytes.append(inout self.buf, take)
+    }
+
+    /// Says the input is over: a `next` that would wait gives `Fail(Truncated)` instead.
+    fn finish(inout self) { self.eof = true }
+
+    fn fail(inout self, kind: Kind, message: str) -> Event {
+        let e = err(kind, message)
+        self.failed = Some(e.copy())
+        Fail(e)
+    }
+
+    fn want(inout self) -> Event {
+        if self.over { return self.fail(TotalTooLarge, "the multipart body is over the size limit") }
+        if self.eof { return self.fail(Truncated, "the multipart body ended before its closing boundary") }
+        More
+    }
+
+    fn data(inout self, upto: usize) -> Event {
+        let piece = bytes.slice(self.buf, self.pos, upto)
+        self.pos = upto
+        self.part_bytes += piece.len()
+        if self.lim.max_part_bytes > 0 && self.part_bytes > self.lim.max_part_bytes {
+            return self.fail(PartTooLarge, "a part is over the size limit")
+        }
+        Data(piece)
+    }
+
+    /// The next event (see `Event`).
+    fn next(inout self) -> Event {
+        match self.failed {
+            Some(e) => { return Fail(e.copy()) }
+            None => {}
+        }
+        while true {
+            if self.state == DONE { return End }
+            if self.state == HEADERS {
+                let avail = self.buf.len() - self.pos
+                let mut block: List[u8] = List.new()
+                if avail >= 2 && self.buf[self.pos] == 13 && self.buf[self.pos + 1] == 10 {
+                    self.pos += 2
+                } else {
+                    let end = bytes.find(self.buf, sys.lit("\r\n\r\n"), self.pos)
+                    match end {
+                        Some(j) => {
+                            if self.lim.max_header_bytes > 0 && j - self.pos > self.lim.max_header_bytes {
+                                return self.fail(HeaderTooLarge, "a part's headers are over the size limit")
+                            }
+                            block = bytes.slice(self.buf, self.pos, j)
+                            self.pos = j + 4
+                        }
+                        None => {
+                            if self.lim.max_header_bytes > 0 && avail > self.lim.max_header_bytes + 3 {
+                                return self.fail(HeaderTooLarge, "a part's headers are over the size limit")
+                            }
+                            return self.want()
+                        }
+                    }
+                }
+                self.parts += 1
+                if self.parts > self.lim.max_parts { return self.fail(TooManyParts, "too many parts") }
+                match read_part(block) {
+                    Ok(p) => {
+                        if !p.is_file() {
+                            self.fields += 1
+                            if self.fields > self.lim.max_fields { return self.fail(TooManyFields, "too many form fields") }
+                        }
+                        self.state = BODY
+                        self.part_bytes = 0
+                        return Start(p)
+                    }
+                    Err(e) => {
+                        self.failed = Some(e.copy())
+                        return Fail(e)
+                    }
+                }
+            }
+            // PREAMBLE and BODY look for the next delimiter
+            let dl = self.delim.len()
+            let found = bytes.find(self.buf, self.delim, self.pos)
+            match found {
+                Some(i) => {
+                    let (k, used) = classify(self.buf, i + dl)
+                    if k == 0 {
+                        if self.state == BODY && i > self.pos { return self.piece(i) }
+                        if self.state == PREAMBLE { self.pos = i }
+                        return self.want()
+                    }
+                    if k == 1 {
+                        // boundary-like text inside content: content up to and with its CR
+                        if self.state == BODY { return self.piece(i + 1) }
+                        self.pos = i + 1
+                    } else {
+                        if self.state == BODY && i > self.pos { return self.piece(i) }
+                        self.pos = used
+                        let closing = k == 3
+                        if self.state == BODY {
+                            self.state = if closing { DONE } else { HEADERS }
+                            return PartEnd
+                        }
+                        self.state = if closing { DONE } else { HEADERS }
+                    }
+                }
+                None => {
+                    let avail = self.buf.len() - self.pos
+                    if avail >= dl {
+                        // all but what could be the start of a delimiter
+                        let upto = self.buf.len() - (dl - 1)
+                        if self.state == BODY { return self.piece(upto) }
+                        self.pos = upto
+                    }
+                    return self.want()
+                }
+            }
+        }
+        More
+    }
+
+    fn piece(inout self, upto: usize) -> Event { self.data(upto) }
+}
+
+// ---- driving a parser from a reader
+
+/// A parser fed from a `stream.Reader` (see the module comment). Call `next_part`, then
+/// `read` until it returns no bytes, then `next_part` again; `next_part` skips what is left
+/// of a part.
+pub type Form = { p: Parser, in_part: bool, finished: bool, carry: List[u8] }
+
+/// A form for the multipart body of `boundary`.
+pub fn form(boundary: List[u8], lim: Limits) -> Result[Form, Error] {
+    let p = parser(boundary, lim)?
+    Ok(Form(p, false, false, List.new()))
+}
+
+/// A form for the request `q`: its `Content-Type` must be multipart/form-data with a
+/// boundary (415 and 400 otherwise).
+pub fn from_request(q: http.Request, lim: Limits) -> Result[Form, Error] {
+    let ct = match q.header("content-type") {
+        Some(c) => c
+        None => { return Err(err(NotMultipart, "the request has no Content-Type")) }
+    }
+    form(boundary_of(ct)?, lim)
+}
+
+fn io_error(e: stream.Error) -> Error {
+    if e.kind == stream.InvalidData {
+        if bytes.find(e.message.bytes(), sys.lit("too large"), 0).is_some() {
+            return Error(TotalTooLarge, e.message.copy())
+        }
+        return Error(Malformed, e.message.copy())
+    }
+    Error(Io, e.message.copy())
+}
+
+impl Form {
+    /// Reads from `src` and feeds the parser.
+    fn fill[R: stream.Reader](inout self, inout src: R) -> Result[(), Error] uses io {
+        match src.read(65536) {
+            Ok(b) => {
+                if b.len() == 0 { self.p.finish() } else { self.p.feed(b) }
+                Ok(())
+            }
+            Err(e) => Err(io_error(e))
+        }
+    }
+
+    /// The next part, skipping the rest of the current one; None after the last.
+    fn next_part[R: stream.Reader](inout self, inout src: R) -> Result[Option[Part], Error] uses io {
+        if self.finished { return Ok(None) }
+        self.carry = List.new()
+        while true {
+            match self.p.next() {
+                More => { self.fill(inout src)? }
+                Start(part) => {
+                    self.in_part = true
+                    return Ok(Some(part))
+                }
+                Data(b) => {}
+                PartEnd => { self.in_part = false }
+                End => {
+                    self.in_part = false
+                    self.finished = true
+                    return Ok(None)
+                }
+                Fail(e) => { return Err(e) }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The next 1 to `max` bytes of the current part's body; empty when the part is over (or
+    /// there is no current part).
+    fn read[R: stream.Reader](inout self, inout src: R, max: usize) -> Result[List[u8], Error] uses io {
+        if max == 0 { return Err(err(Io, "read of 0 bytes")) }
+        if self.carry.len() > 0 {
+            let c = self.carry.copy()
+            if c.len() <= max {
+                self.carry = List.new()
+                return Ok(c)
+            }
+            self.carry = bytes.slice(c, max, c.len())
+            return Ok(bytes.slice(c, 0, max))
+        }
+        if !self.in_part { return Ok(List.new()) }
+        while true {
+            match self.p.next() {
+                More => { self.fill(inout src)? }
+                Start(part) => { return Err(err(Malformed, "a part started inside a part")) }
+                Data(b) => {
+                    if b.len() <= max { return Ok(b) }
+                    self.carry = bytes.slice(b, max, b.len())
+                    return Ok(bytes.slice(b, 0, max))
+                }
+                PartEnd => {
+                    self.in_part = false
+                    return Ok(List.new())
+                }
+                End => {
+                    self.in_part = false
+                    self.finished = true
+                    return Ok(List.new())
+                }
+                Fail(e) => { return Err(e) }
+            }
+        }
+        Ok(List.new())
+    }
+
+    /// The rest of the current part's body (bounded by `Limits.max_part_bytes`).
+    fn read_part[R: stream.Reader](inout self, inout src: R) -> Result[List[u8], Error] uses io {
+        let mut out: List[u8] = List.new()
+        while true {
+            let b = self.read(inout src, 65536)?
+            if b.len() == 0 { break }
+            bytes.append(inout out, b)
+        }
+        Ok(out)
+    }
+}
+
+// ---- collecting a form
+
+/// How `collect` keeps parts. `lim` the parser's limits; `max_field_bytes` the longest text
+/// field (a part without `filename`) kept, longer is `PartTooLarge`; `max_memory` the largest
+/// file kept in memory, larger ones go to a temporary file in `spill_dir` (made if need be,
+/// mode 0600, a random name that does not come from the client), or are `PartTooLarge` when `spill_dir` is empty.
+pub type Config = { lim: Limits, max_field_bytes: usize, max_memory: usize, spill_dir: List[u8] }
+
+/// The default limits, 64 KiB text fields, files up to 1 MiB in memory and no spilling.
+pub fn config() -> Config { Config(limits(), 65536, 1048576, List.new()) }
+
+/// One collected part: `data` is its body, unless it was spilled to `path` (then `data` is
+/// empty); `size` is its length either way.
+pub type Field = { part: Part, data: List[u8], path: List[u8], size: usize }
+
+/// The parts of a form, in order.
+pub type Collected = { fields: List[Field] }
+
+impl Collected {
+    /// The first part called `name`.
+    fn get(self, name: str) -> Option[Field] {
+        for f in self.fields {
+            if http.eq_s(f.part.name, name) { return Some(f) }
+        }
+        None
+    }
+
+    /// The body of the first part called `name` that is in memory (a text field).
+    fn text(self, name: str) -> Option[List[u8]] {
+        match self.get(name) {
+            Some(f) => {
+                if f.path.len() > 0 { None } else { Some(f.data) }
+            }
+            None => None
+        }
+    }
+
+    /// Every part called `name`.
+    fn all(self, name: str) -> List[Field] {
+        let mut out: List[Field] = List.new()
+        for f in self.fields {
+            if http.eq_s(f.part.name, name) { out.push(f) }
+        }
+        out
+    }
+
+    /// Deletes the temporary files of spilled parts.
+    fn cleanup(self) uses fs {
+        for f in self.fields {
+            if f.path.len() > 0 {
+                let gone = fs.remove_all(f.path)
+            }
+        }
+    }
+}
+
+fn hex_name(n: usize) -> Result[List[u8], Error] uses io {
+    match random.bytes(n as i64) {
+        Ok(b) => Ok(bytes.hex(b))
+        Err(e) => Err(Error(Io, e.copy()))
+    }
+}
+
+/// Reads the rest of the form from `src` (see `Config`). On an error the files it made are
+/// deleted.
+pub fn collect[R: stream.Reader](inout f: Form, inout src: R, cfg: Config) -> Result[Collected, Error] uses io, fs {
+    let mut out = Collected(List.new())
+    match collect_into(inout f, inout src, cfg, inout out) {
+        Ok(z) => Ok(out)
+        Err(e) => {
+            out.cleanup()
+            Err(e)
+        }
+    }
+}
+
+fn collect_into[R: stream.Reader](inout f: Form, inout src: R, cfg: Config, inout out: Collected) -> Result[bool, Error] uses io, fs {
+    while true {
+        let part = match f.next_part(inout src)? {
+            Some(p) => p
+            None => { return Ok(true) }
+        }
+        let file = part.is_file()
+        let mut data: List[u8] = List.new()
+        let mut path: List[u8] = List.new()
+        let mut size: usize = 0
+        while true {
+            let b = f.read(inout src, 65536)?
+            if b.len() == 0 { break }
+            size += b.len()
+            if !file {
+                if size > cfg.max_field_bytes { return Err(err(PartTooLarge, "a form field is over the size limit")) }
+                bytes.append(inout data, b)
+            } else if path.len() == 0 && size <= cfg.max_memory {
+                bytes.append(inout data, b)
+            } else {
+                if cfg.spill_dir.len() == 0 { return Err(err(PartTooLarge, "an uploaded file is over the in-memory limit")) }
+                if path.len() == 0 {
+                    match fs.mkdir_all(cfg.spill_dir) {
+                        Ok(z) => {}
+                        Err(e) => { return Err(Error(Io, e.copy())) }
+                    }
+                    let mut p = fs.join(cfg.spill_dir, sys.lit("mp-"))
+                    bytes.append(inout p, hex_name(12)?)
+                    match fs.write_mode(p, data, 384) {
+                        Ok(z) => {}
+                        Err(e) => { return Err(Error(Io, e.copy())) }
+                    }
+                    path = p
+                    data = List.new()
+                }
+                match fs.append(path, b) {
+                    Ok(z) => {}
+                    Err(e) => { return Err(Error(Io, e.copy())) }
+                }
+            }
+        }
+        out.fields.push(Field(part, data, path, size))
+    }
+    Ok(true)
+}
+
+/// Collects the multipart body of the request `q`, from its stream when the route streams
+/// bodies (`http.Plan.stream`) and from its buffered body otherwise.
+pub fn parse_request(q: http.Request, cfg: Config) -> Result[Collected, Error] uses io, fs {
+    let mut f = from_request(q, cfg.lim)?
+    match q.stream {
+        Some(body) => {
+            let mut src = body.copy()
+            collect(inout f, inout src, cfg)
+        }
+        None => {
+            let mut src = stream.reader(q.body.copy())
+            collect(inout f, inout src, cfg)
+        }
+    }
+}
+
+// ---- writing
+
+/// A multipart body under construction.
+pub type Builder = { boundary: List[u8], out: List[u8], closed: bool }
+
+/// A builder with a random boundary (`----eider` and 32 hex digits).
+pub fn builder() -> Builder uses io {
+    let mut b = sys.lit("----eider")
+    match random.bytes(16) {
+        Ok(r) => { bytes.append(inout b, bytes.hex(r)) }
+        Err(e) => { bytes.append(inout b, sys.lit("00000000000000000000000000000000")) }
+    }
+    Builder(b, List.new(), false)
+}
+
+/// A builder with the boundary `boundary` (checked as `check_boundary`).
+pub fn builder_with(boundary: List[u8]) -> Result[Builder, Error] {
+    check_boundary(boundary)?
+    Ok(Builder(boundary, List.new(), false))
+}
+
+/// `v` as the inside of a quoted string: `"` and `\` escaped, CR and LF as %0D and %0A; Err
+/// for NUL.
+fn quoted(v: List[u8]) -> Result[List[u8], Error] {
+    let mut out: List[u8] = List.new()
+    for c in v {
+        if c == 0 { return Err(err(Unsafe, "a NUL in a name")) }
+        if c == 13 {
+            bytes.append(inout out, sys.lit("%0D"))
+        } else if c == 10 {
+            bytes.append(inout out, sys.lit("%0A"))
+        } else if c == 34 || c == 92 {
+            out.push(92)
+            out.push(c)
+        } else {
+            out.push(c)
+        }
+    }
+    Ok(out)
+}
+
+impl Builder {
+    /// The Content-Type of the body: `multipart/form-data; boundary=...`.
+    fn content_type(self) -> List[u8] {
+        let mut ct = sys.lit("multipart/form-data; boundary=")
+        let mut plain = true
+        for c in self.boundary {
+            if !(bytes.is_alpha(c) || bytes.is_digit(c) || c == 45 || c == 95 || c == 46) { plain = false }
+        }
+        if plain {
+            bytes.append(inout ct, self.boundary)
+        } else {
+            ct.push(34)
+            bytes.append(inout ct, self.boundary)
+            ct.push(34)
+        }
+        ct
+    }
+
+    /// A part with `headers` (all of them, Content-Disposition included) and `data`. Err for
+    /// a closed builder, a header that is not `header_safe` or a name that is not a token,
+    /// and `data` that contains the delimiter.
+    fn part(inout self, headers: List[http.Header], data: List[u8]) -> Result[(), Error] {
+        if self.closed { return Err(err(Unsafe, "the multipart body is already finished")) }
+        let mut delim = sys.lit("\r\n--")
+        bytes.append(inout delim, self.boundary)
+        if bytes.find(bytes.concat(sys.lit("\r\n"), data), delim, 0).is_some() {
+            return Err(err(Unsafe, "the boundary occurs in a part's content"))
+        }
+        let mut head: List[u8] = List.new()
+        for h in headers {
+            if !http.is_token(h.name) || !header_safe(h.value) || !http.valid_value(h.value) {
+                return Err(err(Unsafe, "a part header that is not safe to write"))
+            }
+            bytes.append(inout head, h.name)
+            bytes.append(inout head, sys.lit(": "))
+            bytes.append(inout head, h.value)
+            bytes.append(inout head, sys.lit("\r\n"))
+        }
+        bytes.append(inout self.out, sys.lit("--"))
+        bytes.append(inout self.out, self.boundary)
+        bytes.append(inout self.out, sys.lit("\r\n"))
+        bytes.append(inout self.out, head)
+        bytes.append(inout self.out, sys.lit("\r\n"))
+        bytes.append(inout self.out, data)
+        bytes.append(inout self.out, sys.lit("\r\n"))
+        Ok(())
+    }
+
+    /// A text field.
+    fn field(inout self, name: List[u8], value: List[u8]) -> Result[(), Error] {
+        let mut cd = sys.lit("form-data; name=\"")
+        bytes.append(inout cd, quoted(name)?)
+        cd.push(34)
+        let mut hs: List[http.Header] = List.new()
+        hs.push(http.Header(sys.lit("Content-Disposition"), cd))
+        self.part(hs, value)
+    }
+
+    /// A file: `filename` as the client's name for it, written raw (UTF-8 as it is, `"` and `\`
+    /// escaped, CR and LF as %0D and %0A: RFC 7578 5.1.1 and what browsers send; `filename*` is
+    /// not written, RFC 7578 4.2 forbids it), `content_type` empty for `application/octet-stream`.
+    /// Err for a NUL.
+    fn file(inout self, name: List[u8], filename: List[u8], content_type: List[u8], data: List[u8]) -> Result[(), Error] {
+        let mut cd = sys.lit("form-data; name=\"")
+        bytes.append(inout cd, quoted(name)?)
+        bytes.append(inout cd, sys.lit("\"; filename=\""))
+        bytes.append(inout cd, quoted(filename)?)
+        cd.push(34)
+        let mut hs: List[http.Header] = List.new()
+        hs.push(http.Header(sys.lit("Content-Disposition"), cd))
+        let ct = if content_type.len() == 0 { sys.lit("application/octet-stream") } else { content_type }
+        hs.push(http.Header(sys.lit("Content-Type"), ct))
+        self.part(hs, data)
+    }
+
+    /// Ends the body (the closing delimiter, once) and returns it.
+    fn finish(inout self) -> List[u8] {
+        if !self.closed {
+            bytes.append(inout self.out, sys.lit("--"))
+            bytes.append(inout self.out, self.boundary)
+            bytes.append(inout self.out, sys.lit("--\r\n"))
+            self.closed = true
+        }
+        self.out.copy()
+    }
+}

@@ -1,0 +1,253 @@
+-- boundary_of
+ok  abc
+ok  a b:c
+ok  x-y
+err 400 the boundary has a character that is not allowed
+err 400 multipart/form-data without a boundary
+err 400 the boundary is empty
+err 400 the Content-Type has an unclosed quote
+err 415 the request body is not multipart/form-data
+err 415 the request body is not multipart/form-data
+err 400 the boundary has a character that is not allowed
+err 400 the boundary ends with a space
+true
+false
+-- a form, whole and in pieces
+whole
+[title] ct=text/plain body=hello world
+[file] file=a.txt ct=text/plain body=line1\r\nline2
+end
+1-byte pieces
+[title] ct=text/plain body=hello world
+[file] file=a.txt ct=text/plain body=line1\r\nline2
+end
+7-byte pieces
+[title] ct=text/plain body=hello world
+[file] file=a.txt ct=text/plain body=line1\r\nline2
+end
+-- preamble, epilogue, padding, the first delimiter with no CRLF before it
+preamble+epilogue
+[a] ct=text/plain body=1
+end
+no CRLF first
+[a] ct=text/plain body=1
+end
+empty form
+end
+empty body
+[a] ct=text/plain body=
+end
+no headers is refused
+ERROR 400 a part needs exactly one Content-Disposition
+-- boundary-like text in the content
+prefix of a longer line
+[a] ct=text/plain body=before\r\n--XXYZ and --X and\r\n--XX-x\r\n--XX \x09q\r\nafter
+end
+same, split everywhere
+[a] ct=text/plain body=before\r\n--XXYZ and --X and\r\n--XX-x\r\n--XX \x09q\r\nafter
+end
+bare LF and CR in content
+[a] ct=text/plain body=x\r\n--X
+end
+binary content
+[a] file=b ct=application/octet-stream body=\x00\xff\r\x00\n-
+end
+a one-character boundary that is common text
+[x] ct=text/plain body=--a--a
+end
+-- headers
+filename* wins, quotes and backslashes
+[a"b\c] file=\xe2\x82\xac rates.txt ct=Text/CSV; charset=utf-8 body=d
+end
+filename*=ISO-8859-1
+[a] file=caf\xc3\xa9.txt ct=application/octet-stream body=d
+end
+bad filename* falls back
+[a] file=f.txt ct=application/octet-stream body=d
+end
+Windows path is kept as sent
+[a] file=C:\Users\me\a.txt ct=application/octet-stream body=d
+end
+a ; inside a quoted filename
+[a;b] file=x;y.txt ct=application/octet-stream body=d
+end
+no content-type: field
+[a] ct=text/plain body=d
+end
+duplicate names kept in order
+[a] ct=text/plain body=1
+[a] ct=text/plain body=2
+end
+-- malformed
+no Content-Disposition
+ERROR 400 a part needs exactly one Content-Disposition
+not form-data
+ERROR 400 Content-Disposition is not form-data
+no name
+ERROR 400 Content-Disposition without a name
+two Content-Disposition
+ERROR 400 a part needs exactly one Content-Disposition
+folded header
+ERROR 400 a folded part header
+header without colon
+ERROR 400 a part header without a colon
+bad header name
+ERROR 400 a part header with an invalid name
+NUL in filename
+ERROR 400 a part header with an invalid value
+NUL in name
+ERROR 400 a part header with an invalid value
+NUL by percent-encoding in filename*
+ERROR 400 a NUL in a filename
+bare LF in header
+ERROR 400 a part header with an invalid value
+unclosed quote
+ERROR 400 Content-Disposition has an unclosed quote
+text after the boundary
+end
+-- truncated
+no closing delimiter
+[a] ct=text/plain body= ERROR 400 the multipart body ended before its closing boundary
+cut in the content
+[a] ct=text/plain body= ERROR 400 the multipart body ended before its closing boundary
+cut in a delimiter
+[a] ct=text/plain body=d ERROR 400 the multipart body ended before its closing boundary
+cut in the headers
+ERROR 400 the multipart body ended before its closing boundary
+no delimiter at all
+ERROR 400 the multipart body ended before its closing boundary
+nothing
+ERROR 400 the multipart body ended before its closing boundary
+-- limits
+part exactly at the limit
+[a] ct=text/plain body=0123456789
+end
+part over
+[a] ct=text/plain body= ERROR 413 a part is over the size limit
+part over, 1-byte pieces
+[a] ct=text/plain body=012345678 ERROR 413 a part is over the size limit
+total at the limit
+[a] ct=text/plain body=0123456789
+end
+total over
+[a] ct=text/plain body=0123456789 ERROR 413 the multipart body is over the size limit
+total over, 1-byte pieces
+[a] ct=text/plain body=0123456789 ERROR 413 the multipart body is over the size limit
+headers over
+ERROR 413 a part's headers are over the size limit
+headers over, 1-byte pieces
+ERROR 413 a part's headers are over the size limit
+headers at the limit
+[a] ct=text/plain body=0123456789
+end
+endless header
+ERROR 413 a part's headers are over the size limit
+too many parts
+[a] ct=text/plain body=1
+[b] file=f ct=application/octet-stream body=2
+ERROR 413 too many parts
+parts at the limit
+[a] ct=text/plain body=1
+[b] file=f ct=application/octet-stream body=2
+[c] ct=text/plain body=3
+end
+too many fields (the file does not count)
+[a] ct=text/plain body=1
+[b] file=f ct=application/octet-stream body=2
+ERROR 413 too many form fields
+fields at the limit
+[a] ct=text/plain body=1
+[b] file=f ct=application/octet-stream body=2
+[c] ct=text/plain body=3
+end
+-- errors as problem+json
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"the multipart body ended before its closing boundary"}
+415
+{"type":"about:blank","title":"Unsupported Media Type","status":415,"detail":"the request body is not multipart/form-data"}
+415
+-- random splits parse identically
+540
+0
+true
+-- collect
+4
+hello
+10
+0
+0123456789
+../../etc/a.txt
+a.txt
+2
+true
+413
+an uploaded file is over the in-memory limit
+10
+0
+true
+0123456789
+true
+true
+hello
+false
+400
+0
+413
+a form field is over the size limit
+-- parse_request, buffered
+4
+hello
+415
+-- safe_filename and header_safe
+ok  report.pdf
+ok  passwd
+ok  a.txt
+no  dir/
+no  ..
+no  .
+no  
+ok  c.txt
+ok  .hidden
+ok  a b.txt
+true
+true
+true
+true
+false
+false
+-- the builder
+--BB\r\nContent-Disposition: form-data; name="title"\r\n\r\nhello\r\n--BB\r\nContent-Disposition: form-data; name="up"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\ndata\r\nmore\r\n--BB\r\nContent-Disposition: form-data; name="up2"; filename="caf\xc3\xa9 \"q\" \\x.bin"\r\nContent-Type: application/octet-stream\r\n\r\n\x00\x01\x02\r\n--BB\r\nContent-Disposition: form-data; name="we\"ird%0D%0Aname"\r\n\r\nv\r\n--BB--\r\n
+multipart/form-data; boundary=BB
+true
+round trip
+parsed
+[title] ct=text/plain body=hello
+[up] file=a.txt ct=text/plain body=data\r\nmore
+[up2] file=caf\xc3\xa9 "q" \x.bin ct=application/octet-stream body=\x00\x01\x02
+[we"ird%0D%0Aname] ct=text/plain body=v
+end
+-- the builder refuses
+true
+true
+true
+true
+true
+true
+true
+-- random boundaries
+41
+true
+true
+true
+k
+-- over loopback
+200
+note=2 big=4000 (in pieces) 
+415
+{"type":"about:blank","title":"Unsupported Media Type","status":415,"detail":"the request body is not multipart/form-data"}
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"the multipart body ended before its closing boundary"}
+413
+200
+2
+4
