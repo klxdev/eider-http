@@ -1,0 +1,485 @@
+//! http/extract: typed extractors, a `http.Request` read into a `@[derive(Deserialize)]` type
+//! (the way axum's `Json<T>`, `Query<T>`, `Form<T>` and `Path<T>` do), and `respond_json`, the
+//! way back.
+//!
+//!     @[derive(Serialize, Deserialize)]
+//!     type NewTodo = { title: String, @[check(max_len = 80)] note: Option[String] }
+//!
+//!     fn create(req: http.Request) -> http.Response {
+//!         match extract.json[NewTodo](req) {
+//!             Ok(t) => extract.respond_json(201, t)
+//!             Err(e) => e.response()
+//!         }
+//!     }
+//!
+//! Every extractor gives `Result[T, Rejection]`. A `Rejection` says what was wrong with the
+//! request and is turned into a problem+json answer (`problem`) by `.problem()` or `.response()`:
+//!
+//! - 400, malformed: the body is not JSON, a percent escape is bad, a text is not UTF-8, the body
+//!   or query is empty when it must not be, the body could not be read;
+//! - 415, the Content-Type is not the one the extractor reads (`application/json` or `+json` for
+//!   `json`, `application/x-www-form-urlencoded` for `form`; none at all is 415 too);
+//! - 413, the body is over the extractor's limit (`DEFAULT_MAX`, 1 MiB, or the `_with` variant's);
+//! - 422, well formed but invalid: a missing or unknown field, a value of the wrong type or out
+//!   of range, and every `@[check(...)]` violation, each as one entry of the `errors` extension
+//!   member with the field's place (`{"in": "body", "pointer": "#/lines/0/qty", ...}` for JSON
+//!   and forms, `{"in": "query", "name": "limit", ...}` for the query, `"in": "path"`).
+//!
+//! The decoding is eider-json's (`json`), and for the query, a form and the path a reader of
+//! text of this module's with the same data model, so the same type, attributes (`rename_all`,
+//! `name`, `default`, `check`, ...) and errors work in all four. Reading is strict as it is in
+//! eider-json: a member no field takes is an error (`@[serial(unknown = "ignore")]` on the type
+//! allows them); the path extractor is the exception, since a route's parameters are the route's
+//! business and a type may take just some of them. In the query and in forms a value is text,
+//! read as the field's type: integers and floats by their decimal text, `true` and `false` for a
+//! bool, an RFC 3339 text for a time; an empty value is an absent `Option` (and an empty string).
+//! A key repeated (`?tag=a&tag=b`) is a `List` field's elements (a `List` field takes one value
+//! too: `?tag=a`), and for any other field it is an error. Keys are flat: a record or a map
+//! field is not read from a query.
+//!
+//! A handler that reads the body as a stream (`http.Plan.stream`) can still use `json` and
+//! `form`: the body is read from the stream up to the limit, so a body over it is 413 without
+//! being buffered whole.
+
+import core.sys
+import std.bytes
+import std.serial
+import std.stream
+import std.strings
+import std.time
+import std.utf8
+import http
+import http.problem
+import json as jsn
+
+/// The longest body `json` and `form` read unless a `_with` variant says otherwise: 1 MiB.
+pub const DEFAULT_MAX: usize = 1048576
+
+/// The most keys a query string or a form may have.
+pub const MAX_KEYS: usize = 1000
+
+/// Why a request could not be read as the type asked for (see the module comment for the
+/// statuses).
+pub type Rejection =
+    | Malformed(detail: List[u8])
+    | UnsupportedMedia(got: List[u8], want: List[u8])
+    | TooLarge(limit: usize)
+    | Failed(status: i32, detail: List[u8])
+    | Invalid(source: List[u8], errors: List[serial.Error])
+
+impl Rejection {
+    /// The HTTP status: 400, 415, 413, 422 (or the status of a `Failed`: 408, 400).
+    fn status(self) -> i32 {
+        match self {
+            Malformed(_) => 400
+            UnsupportedMedia(_, _) => 415
+            TooLarge(_) => 413
+            Failed(st, _) => st
+            Invalid(_, _) => 422
+        }
+    }
+
+    /// The rejection as an `ApiError` (what `middleware.errors` and typed handlers return).
+    /// `Invalid` has one field error for each thing wrong.
+    fn problem(self) -> problem.ApiError {
+        match self {
+            Malformed(d) => problem.with_detail(400, d)
+            UnsupportedMedia(got, want) => {
+                let mut d = if got.len() == 0 { sys.lit("the request has no Content-Type; this route reads ") } else { sys.lit("the Content-Type is not supported; this route reads ") }
+                bytes.append(inout d, want)
+                problem.with_detail(415, d)
+            }
+            TooLarge(limit) => {
+                let mut d = sys.lit("the body is over the limit of ")
+                bytes.append(inout d, bytes.from_u64(limit as u64))
+                bytes.append(inout d, sys.lit(" bytes"))
+                problem.with_detail(413, d)
+            }
+            Failed(st, d) => problem.with_detail(st, d)
+            Invalid(source, errs) => {
+                let mut p = problem.new(422, "the request is not valid")
+                let body = bytes.eq(source, sys.lit("body")) || bytes.eq(source, sys.lit("form"))
+                for e in errs {
+                    for x in serial.errors(e) {
+                        let at = place(x)
+                        if body {
+                            p.errors.push(problem.FieldError(sys.lit("body"), pointer(at), x.msg))
+                        } else {
+                            p.errors.push(problem.FieldError(source, at, x.msg))
+                        }
+                    }
+                }
+                p
+            }
+        }
+    }
+
+    /// The problem+json response.
+    fn response(self) -> http.Response { self.problem().response() }
+}
+
+/// The decoder path of a failure: for a missing or unknown field, the field's own path (the
+/// decoder reports the record's).
+fn place(x: serial.Error) -> List[u8] {
+    for pre in List["missing field `", "unknown field `"] {
+        let p = sys.lit(pre)
+        if x.msg.len() > p.len() + 1 && bytes.eq(bytes.slice(x.msg, 0, p.len()), p) {
+            return serial.path_field(x.path, bytes.slice(x.msg, p.len(), x.msg.len() - 1))
+        }
+    }
+    x.path.copy()
+}
+
+/// A decoder path (`lines[0].sku`) as a JSON pointer (`#/lines/0/sku`).
+fn pointer(path: List[u8]) -> List[u8] {
+    let mut toks: List[List[u8]] = List.new()
+    let mut cur: List[u8] = List.new()
+    let mut open = false
+    for c in path {
+        if c == 46 || c == 91 {
+            if open || cur.len() > 0 { toks.push(cur) }
+            cur = List.new()
+            open = true
+        } else if c != 93 {
+            cur.push(c)
+        }
+    }
+    if open || cur.len() > 0 { toks.push(cur) }
+    problem.pointer(toks)
+}
+
+// ---- reading the body
+
+/// The body of `req` as bytes, at most `max`: from `Request.body`, or read from `Request.stream`
+/// when the route streams. 413 over the limit (a streamed body is cut off as soon as it is over,
+/// not read whole), 400 for a body that cannot be read (malformed chunking, a client that
+/// went away), 408 when the client is too slow.
+pub fn read_body(req: http.Request, max: usize) -> Result[List[u8], Rejection] uses io, clock {
+    match req.stream {
+        Some(b) => {
+            let mut body = b.copy()
+            let mut out: List[u8] = List.new()
+            while true {
+                match body.read_by(16384, req.deadline) {
+                    Ok(chunk) => {
+                        if chunk.len() == 0 { break }
+                        if out.len() + chunk.len() > max { return Err(TooLarge(max)) }
+                        for c in chunk { out.push(c) }
+                    }
+                    Err(e) => {
+                        let msg = e.message.bytes()
+                        if has(msg, "too large") { return Err(TooLarge(max)) }
+                        if e.kind == stream.TimedOut { return Err(Failed(408, sys.lit("timed out waiting for the request body"))) }
+                        return Err(Failed(400, bytes.concat(sys.lit("the body could not be read: "), msg)))
+                    }
+                }
+            }
+            Ok(out)
+        }
+        None => {
+            if req.body.len() > max { return Err(TooLarge(max)) }
+            Ok(req.body.copy())
+        }
+    }
+}
+
+fn media_ok_json(ct: List[u8]) -> bool {
+    if bytes.eq(ct, sys.lit("application/json")) { return true }
+    ct.len() > 5 && bytes.eq(bytes.slice(ct, ct.len() - 5, ct.len()), sys.lit("+json"))
+}
+
+// ---- JSON
+
+/// The JSON body of `req` as a `T`: `Content-Type` `application/json` (or `application/x.+json`),
+/// at most `DEFAULT_MAX` bytes. See the module comment for the rejections.
+pub fn json[T: serial.Deserialize](req: http.Request) -> Result[T, Rejection] uses io, clock {
+    json_with(req, DEFAULT_MAX)
+}
+
+/// `json` with a body limit of `max` bytes.
+pub fn json_with[T: serial.Deserialize](req: http.Request, max: usize) -> Result[T, Rejection] uses io, clock {
+    if !media_ok_json(req.content_type()) { return Err(UnsupportedMedia(req.content_type(), sys.lit("application/json"))) }
+    let body = read_body(req, max)?
+    json_bytes(body)
+}
+
+/// A JSON text as a `T`, within eider-json's limits for untrusted input: 400 when it is not JSON
+/// (or is empty), 422 when it does not fit `T`.
+pub fn json_bytes[T: serial.Deserialize](body: List[u8]) -> Result[T, Rejection] {
+    if body.len() == 0 { return Err(Malformed(sys.lit("the request body is empty; a JSON value is required"))) }
+    let doc = match jsn.parse_with(body, jsn.limits()) {
+        Ok(d) => d
+        Err(e) => { return Err(Malformed(bytes.concat(sys.lit("the body is not valid JSON: "), jsn.error_text(e)))) }
+    }
+    match T.deserialize(jsn.deserializer(doc, doc.root)) {
+        Ok(x) => Ok(x)
+        Err(e) => Err(Invalid(sys.lit("body"), List[e]))
+    }
+}
+
+/// `x` as a JSON response with this status (`application/json`). A value that cannot be written
+/// (a `with` adapter that fails) is a 500 problem, not a panic.
+pub fn respond_json[T: serial.Serialize](status: i32, x: T) -> http.Response {
+    match jsn.to_bytes(x) {
+        Ok(b) => http.json_response(status, b)
+        Err(e) => problem.with_detail(500, bytes.concat(sys.lit("the answer cannot be encoded: "), serial.error_text(e))).response()
+    }
+}
+
+// ---- text: the query, forms and the path
+
+/// A reader of flat text members for std/serial: `names[i]` has the texts `groups[i]` (more than
+/// one when the key repeats). `idx` -1 is the map itself, `elem` -1 the whole group of member `idx`,
+/// else one text of it. `forced` names the members a list is wanted from (see `decode_text`).
+type Text = { names: List[List[u8]], groups: List[List[List[u8]]], forced: List[List[u8]], idx: i64, elem: i64, path: List[u8] }
+
+fn one(t: Text) -> Result[List[u8], serial.Error] {
+    if t.idx < 0 { return Err(serial.error_at(t.path.copy(), sys.lit("expected a value, found a map"))) }
+    let g = t.groups[t.idx as usize].copy()
+    if t.elem >= 0 { return Ok(g[t.elem as usize].copy()) }
+    if g.len() != 1 { return Err(serial.error_at(t.path.copy(), sys.lit("expected one value, found a key given more than once"))) }
+    Ok(g[0].copy())
+}
+
+fn parsed(t: Text, what: str) -> Result[String, serial.Error] {
+    let b = one(t)?
+    match String.from_bytes(b) {
+        Ok(s) => Ok(s)
+        Err(_) => Err(serial.error_at(t.path.copy(), sys.lit("the text has a NUL character")))
+    }
+}
+
+fn numeral(s: List[u8], float: bool) -> bool {
+    if s.len() == 0 { return false }
+    for c in s {
+        let digit = c >= 48 && c <= 57
+        if digit || c == 45 { continue }
+        if float && (c == 46 || c == 101 || c == 69 || c == 43) { continue }
+        return false
+    }
+    true
+}
+
+impl serial.Deserializer for Text {
+    fn format(self) -> str { "form" }
+    fn path(self) -> List[u8] { self.path.copy() }
+    fn kind(self) -> serial.Kind {
+        if self.idx < 0 { return serial.KMap }
+        let g = self.groups[self.idx as usize].copy()
+        if self.elem >= 0 { return serial.KStr }
+        if g.len() > 1 || self.forced.contains(self.names[self.idx as usize].copy()) { return serial.KList }
+        if g[0].len() == 0 { return serial.KNull }
+        serial.KStr
+    }
+    fn read_bool(self) -> Result[bool, serial.Error] {
+        let t = one(self)?
+        if bytes.eq(t, sys.lit("true")) { return Ok(true) }
+        if bytes.eq(t, sys.lit("false")) { return Ok(false) }
+        Err(serial.error_at(self.path.copy(), sys.lit("expected a boolean (true or false)")))
+    }
+    fn read_i64(self) -> Result[i64, serial.Error] {
+        let t = one(self)?
+        if !numeral(t, false) { return Err(serial.error_at(self.path.copy(), sys.lit("expected an integer"))) }
+        match strings.parse_i64(parsed(self, "an integer")?) {
+            Ok(v) => Ok(v)
+            Err(_) => Err(serial.error_at(self.path.copy(), sys.lit("the number is out of range")))
+        }
+    }
+    fn read_u64(self) -> Result[u64, serial.Error] {
+        let t = one(self)?
+        if !numeral(t, false) || t[0] == 45 {
+            if t.len() > 0 && t[0] == 45 && numeral(t, false) { return Err(serial.error_at(self.path.copy(), sys.lit("the number is out of range"))) }
+            return Err(serial.error_at(self.path.copy(), sys.lit("expected an integer")))
+        }
+        match strings.parse_u64(parsed(self, "an integer")?) {
+            Ok(v) => Ok(v)
+            Err(_) => Err(serial.error_at(self.path.copy(), sys.lit("the number is out of range")))
+        }
+    }
+    fn read_f64(self) -> Result[f64, serial.Error] {
+        let t = one(self)?
+        if !numeral(t, true) { return Err(serial.error_at(self.path.copy(), sys.lit("expected a number"))) }
+        match strings.parse_f64(parsed(self, "a number")?) {
+            Ok(v) => Ok(v)
+            Err(_) => Err(serial.error_at(self.path.copy(), sys.lit("expected a number")))
+        }
+    }
+    fn read_string(self) -> Result[List[u8], serial.Error] { one(self) }
+    fn read_bytes(self) -> Result[List[u8], serial.Error] { one(self) }
+    fn read_time(self) -> Result[time.DateTime, serial.Error] {
+        match time.parse_rfc3339(one(self)?) {
+            Ok(v) => Ok(v)
+            Err(_) => Err(serial.error_at(self.path.copy(), sys.lit("expected an RFC 3339 time")))
+        }
+    }
+    fn len(self) -> usize {
+        if self.idx < 0 { return self.names.len() }
+        if self.elem >= 0 { return 0 }
+        self.groups[self.idx as usize].len()
+    }
+    fn at(self, i: usize) -> Result[Text, serial.Error] {
+        if self.idx < 0 || self.elem >= 0 || i >= self.groups[self.idx as usize].len() {
+            return Err(serial.error_at(self.path.copy(), sys.lit("no such element")))
+        }
+        Ok(Text(self.names.copy(), self.groups.copy(), self.forced.copy(), self.idx, i as i64, serial.path_index(self.path, i)))
+    }
+    fn get(self, key: List[u8]) -> Option[Text] {
+        if self.idx >= 0 { return None }
+        for i in 0..self.names.len() {
+            if bytes.eq(self.names[i], key) {
+                return Some(Text(self.names.copy(), self.groups.copy(), self.forced.copy(), i as i64, -1, serial.path_field(self.path, key)))
+            }
+        }
+        None
+    }
+    fn key_at(self, i: usize) -> List[u8] {
+        if self.idx < 0 && i < self.names.len() { return self.names[i].copy() }
+        List.new()
+    }
+    fn value_at(self, i: usize) -> Text {
+        Text(self.names.copy(), self.groups.copy(), self.forced.copy(), i as i64, -1, serial.path_field(self.path, self.names[i]))
+    }
+}
+
+fn has(s: List[u8], p: str) -> bool { bytes.find(s, sys.lit(p), 0).is_some() }
+
+fn starts(s: List[u8], p: str) -> bool {
+    let q = sys.lit(p)
+    s.len() >= q.len() && bytes.eq(bytes.slice(s, 0, q.len()), q)
+}
+
+/// A `T` from the members `names`/`groups`. A single text is ambiguous (a string, or a list of
+/// one), and the reader cannot know the field's type before it is asked, so a field that turns
+/// out to want a list ("expected a list") is read again as one. `lenient`: a member no field
+/// takes is dropped, not an error.
+fn decode_text[T: serial.Deserialize](names: List[List[u8]], groups: List[List[List[u8]]], lenient: bool) -> Result[T, serial.Error] {
+    let mut ns = names.copy()
+    let mut gs = groups.copy()
+    let mut forced: List[List[u8]] = List.new()
+    let mut rounds: usize = 0
+    while true {
+        let r: Result[T, serial.Error] = T.deserialize(Text(ns.copy(), gs.copy(), forced.copy(), -1, -1, List.new()))
+        match r {
+            Ok(x) => { return Ok(x) }
+            Err(e) => {
+                rounds += 1
+                if rounds > names.len() * 2 + 2 { return Err(e) }
+                if starts(e.msg, "expected a list") && e.path.len() > 0 && !forced.contains(e.path.copy()) {
+                    forced.push(e.path.copy())
+                    continue
+                }
+                if lenient && e.path.len() == 0 && starts(e.msg, "unknown field `") {
+                    let p = sys.lit("unknown field `")
+                    let k = bytes.slice(e.msg, p.len(), e.msg.len() - 1)
+                    let mut n2: List[List[u8]] = List.new()
+                    let mut g2: List[List[List[u8]]] = List.new()
+                    for i in 0..ns.len() {
+                        if !bytes.eq(ns[i], k) {
+                            n2.push(ns[i].copy())
+                            g2.push(gs[i].copy())
+                        }
+                    }
+                    ns = n2
+                    gs = g2
+                    continue
+                }
+                return Err(e)
+            }
+        }
+    }
+    Err(serial.error("unreachable"))
+}
+
+/// The `key=value` pairs of urlencoded text, decoded (`+` is a space, `%XX`), grouped by key in
+/// the order first seen. 400 for a bad escape, text that is not UTF-8, or more than `MAX_KEYS`
+/// pairs.
+pub fn pairs(text: List[u8]) -> Result[(List[List[u8]], List[List[List[u8]]]), Rejection] {
+    let mut names: List[List[u8]] = List.new()
+    let mut groups: List[List[List[u8]]] = List.new()
+    let mut n: usize = 0
+    for kv in bytes.split(text, 38) {
+        if kv.len() == 0 { continue }
+        n += 1
+        if n > MAX_KEYS { return Err(Malformed(sys.lit("too many parameters"))) }
+        let mut k = kv.copy()
+        let mut v: List[u8] = List.new()
+        match bytes.find_byte(kv, 61, 0) {
+            Some(i) => {
+                k = bytes.slice(kv, 0, i)
+                v = bytes.slice(kv, i + 1, kv.len())
+            }
+            None => {}
+        }
+        let dk = match http.pct_decode(k, true) {
+            Some(x) => x
+            None => { return Err(Malformed(sys.lit("a parameter name has a malformed percent escape"))) }
+        }
+        let dv = match http.pct_decode(v, true) {
+            Some(x) => x
+            None => { return Err(Malformed(sys.lit("a parameter value has a malformed percent escape"))) }
+        }
+        if !utf8.valid(dk) || !utf8.valid(dv) { return Err(Malformed(sys.lit("a parameter is not valid UTF-8"))) }
+        let mut at: i64 = -1
+        for i in 0..names.len() {
+            if bytes.eq(names[i], dk) { at = i as i64 }
+        }
+        if at >= 0 {
+            groups[at as usize].push(dv)
+        } else {
+            names.push(dk)
+            let mut g: List[List[u8]] = List.new()
+            g.push(dv)
+            groups.push(g)
+        }
+    }
+    Ok((names, groups))
+}
+
+fn from_text[T: serial.Deserialize](text: List[u8], source: str, lenient: bool) -> Result[T, Rejection] {
+    let (names, groups) = pairs(text)?
+    let got: Result[T, serial.Error] = decode_text(names, groups, lenient)
+    match got {
+        Ok(x) => Ok(x)
+        Err(e) => Err(Invalid(sys.lit(source), List[e]))
+    }
+}
+
+/// The query string of `req` as a `T` (see the module comment). An absent query is an empty one:
+/// a `T` of only `Option` and `default` fields reads from it.
+pub fn query[T: serial.Deserialize](req: http.Request) -> Result[T, Rejection] {
+    from_text(req.query, "query", false)
+}
+
+/// The urlencoded form in the body of `req` (`Content-Type: application/x-www-form-urlencoded`,
+/// at most `DEFAULT_MAX` bytes) as a `T`, read like a query string.
+pub fn form[T: serial.Deserialize](req: http.Request) -> Result[T, Rejection] uses io, clock {
+    form_with(req, DEFAULT_MAX)
+}
+
+/// `form` with a body limit of `max` bytes.
+pub fn form_with[T: serial.Deserialize](req: http.Request, max: usize) -> Result[T, Rejection] uses io, clock {
+    if !bytes.eq(req.content_type(), sys.lit("application/x-www-form-urlencoded")) {
+        return Err(UnsupportedMedia(req.content_type(), sys.lit("application/x-www-form-urlencoded")))
+    }
+    let body = read_body(req, max)?
+    from_text(body, "form", false)
+}
+
+/// The path parameters the router matched (`req.params`: `/users/:id`) as a `T`. Parameters the
+/// type has no field for are ignored. A parameter that does not read as its field's type is 422
+/// (the route matched, the value is not valid).
+pub fn path[T: serial.Deserialize](req: http.Request) -> Result[T, Rejection] {
+    let mut names: List[List[u8]] = List.new()
+    let mut groups: List[List[List[u8]]] = List.new()
+    for p in req.params {
+        names.push(p.name.copy())
+        let mut g: List[List[u8]] = List.new()
+        g.push(p.value.copy())
+        groups.push(g)
+    }
+    let got: Result[T, serial.Error] = decode_text(names, groups, true)
+    match got {
+        Ok(x) => Ok(x)
+        Err(e) => Err(Invalid(sys.lit("path"), List[e]))
+    }
+}

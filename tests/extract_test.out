@@ -1,0 +1,123 @@
+-- json
+201
+{"customerName":"Ada","lines":[{"sku":"x1","qty":2}],"note":null}
+201
+{"customerName":"Ada","lines":[],"note":null}
+-- json: malformed is 400
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"the body is not valid JSON: unexpected end of input, expected a value at line 1, column 17 (byte 16)"}
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"the body is not valid JSON: invalid literal (expected true, false or null) at line 1, column 2 (byte 1)"}
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"the request body is empty; a JSON value is required"}
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"the body is not valid JSON: a key repeated in an object at line 1, column 35 (byte 34)"}
+-- json: content type is 415
+415
+{"type":"about:blank","title":"Unsupported Media Type","status":415,"detail":"the Content-Type is not supported; this route reads application/json"}
+415
+{"type":"about:blank","title":"Unsupported Media Type","status":415,"detail":"the request has no Content-Type; this route reads application/json"}
+201
+{"customerName":"Ada","lines":[],"note":null}
+201
+{"customerName":"Ada","lines":[],"note":null}
+-- json: invalid is 422, with the field's place
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"body","pointer":"#/customerName","detail":"missing field `customerName`"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"body","pointer":"#/admin","detail":"unknown field `admin`"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"body","pointer":"#/customerName","detail":"expected a string, found an integer"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"body","pointer":"#/lines/1/qty","detail":"must be at least 1"},{"in":"body","pointer":"#/lines/2/qty","detail":"must be at most 99"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"body","pointer":"#/lines/0/qty","detail":"expected an i32, the number is out of range"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"body","pointer":"#","detail":"expected a map, found a list"}]}
+-- json: the limit is 413
+200
+{"sku":"a","qty":1}
+413
+{"type":"about:blank","title":"Content Too Large","status":413,"detail":"the body is over the limit of 20 bytes"}
+-- json: a streamed body
+ok streamed
+rejected 413
+rejected 400
+-- query
+200
+limit=10 offset=- tags=0 q=- active=- ratio=- sort=-
+200
+limit=10 offset=20 tags=3[a][b][c] q=café au lait active=yes ratio=half sort=desc
+200
+limit=10 offset=- tags=1[only] q=- active=- ratio=- sort=-
+200
+limit=10 offset=- tags=0 q=- active=no ratio=- sort=-
+200
+limit=10 offset=- tags=1[/x] q=a&b=c active=- ratio=- sort=-
+-- query: invalid is 422
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"limit","detail":"missing field `limit`"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"limit","detail":"expected an integer"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"limit","detail":"must be at least 1"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"active","detail":"expected a boolean (true or false)"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"limit","detail":"expected a u32, the number is out of range"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"limit","detail":"expected a u32, the number is out of range"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"limit","detail":"expected one value, found a key given more than once"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"sort","detail":"unknown variant `Sideways`"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"nope","detail":"unknown field `nope`"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"offset","detail":"the number is out of range"}]}
+-- query: malformed is 400
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"a parameter value has a malformed percent escape"}
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"a parameter is not valid UTF-8"}
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"a parameter name has a malformed percent escape"}
+-- query: unknown members
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"a","detail":"missing field `a`"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"query","name":"utm","detail":"unknown field `utm`"}]}
+200
+{"a":1}
+-- form
+200
+hello ada l
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"body","pointer":"#/password","detail":"must have at least 3 characters"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"body","pointer":"#/remember","detail":"missing field `remember`"}]}
+400
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"a parameter value has a malformed percent escape"}
+415
+{"type":"about:blank","title":"Unsupported Media Type","status":415,"detail":"the Content-Type is not supported; this route reads application/x-www-form-urlencoded"}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"body","pointer":"#/remember","detail":"expected a boolean (true or false)"}]}
+-- path
+200
+{"id":42}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"path","name":"id","detail":"expected an integer"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"path","name":"id","detail":"the number is out of range"}]}
+422
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"the request is not valid","errors":[{"in":"path","name":"id","detail":"the number is out of range"}]}
+-- rejection to problem
+400
+400
+413
+415
+408
+200
+{"id":7}
+202
+"Desc"

@@ -1,0 +1,258 @@
+// http/extract: every extractor, every rejection, `@[check]` failures as 422 with the field's
+// place, and the extractors behind a router through http/testing.
+
+import core.sys
+import std.bytes
+import std.io
+import std.serial
+import std.stream
+import std.sync
+import std.time
+import http
+import http.extract
+import http.router
+import http.testing
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+@[derive(Serialize, Deserialize)]
+type Line = { sku: String, @[check(min = 1, max = 99)] qty: i32 }
+
+@[derive(Serialize, Deserialize), serial(rename_all = "camelCase")]
+type Order = {
+    customer_name: String,
+    lines: List[Line],
+    note: Option[String],
+}
+
+@[derive(Serialize, Deserialize)]
+type Sort = | Asc | Desc
+
+@[derive(Serialize, Deserialize)]
+type Page = {
+    @[check(min = 1, max = 100)] limit: u32,
+    offset: Option[u64],
+    @[serial(default)] tag: List[String],
+    q: Option[String],
+    active: Option[bool],
+    ratio: Option[f64],
+    sort: Option[Sort],
+}
+
+@[derive(Serialize, Deserialize)]
+type Login = { user: String, @[check(min_len = 3)] password: String, remember: bool }
+
+@[derive(Serialize, Deserialize)]
+type UserRef = { id: u64 }
+
+@[derive(Serialize, Deserialize)]
+type Loose = { a: i32 }
+
+@[derive(Serialize, Deserialize), serial(unknown = "ignore")]
+type Tolerant = { a: i32 }
+
+fn say(r: http.Response) uses io {
+    print(r.status)
+    print(testing.text(r))
+}
+
+fn app() -> http.Handler uses io, clock {
+    let mut rt = router.new()
+    rt.post("/orders", |q: http.Request| -> http.Response {
+        match extract.json[Order](q) {
+            Ok(o) => extract.respond_json(201, o)
+            Err(e) => e.response()
+        }
+    })
+    rt.post("/small", |q: http.Request| -> http.Response {
+        let got: Result[Line, extract.Rejection] = extract.json_with(q, 20)
+        match got {
+            Ok(o) => extract.respond_json(200, o)
+            Err(e) => e.response()
+        }
+    })
+    rt.get("/items", |q: http.Request| -> http.Response {
+        match extract.query[Page](q) {
+            Ok(p) => {
+                let mut t = String.from("limit=")
+                t.append(String.from_int(p.limit as i64))
+                t.push_str(" offset=")
+                match p.offset {
+                    Some(v) => t.append(String.from_int(v as i64))
+                    None => t.push_str("-")
+                }
+                t.push_str(" tags=")
+                t.append(String.from_int(p.tag.len() as i64))
+                for x in p.tag { t.push_str("["); t.append(x); t.push_str("]") }
+                t.push_str(" q=")
+                match p.q {
+                    Some(v) => t.append(v)
+                    None => t.push_str("-")
+                }
+                t.push_str(" active=")
+                match p.active {
+                    Some(v) => t.push_str(if v { "yes" } else { "no" })
+                    None => t.push_str("-")
+                }
+                t.push_str(" ratio=")
+                match p.ratio {
+                    Some(v) => t.push_str(if v > 0.4 && v < 0.6 { "half" } else { "other" })
+                    None => t.push_str("-")
+                }
+                t.push_str(" sort=")
+                match p.sort {
+                    Some(Asc) => t.push_str("asc")
+                    Some(Desc) => t.push_str("desc")
+                    None => t.push_str("-")
+                }
+                http.respond(200, "text/plain", t.bytes())
+            }
+            Err(e) => e.response()
+        }
+    })
+    rt.post("/login", |q: http.Request| -> http.Response {
+        match extract.form[Login](q) {
+            Ok(l) => http.respond(200, "text/plain", bytes.concat(lit("hello "), l.user.bytes()))
+            Err(e) => e.response()
+        }
+    })
+    rt.get("/orgs/:org/users/:id", |q: http.Request| -> http.Response {
+        match extract.path[UserRef](q) {
+            Ok(u) => extract.respond_json(200, u)
+            Err(e) => e.response()
+        }
+    })
+    rt.get("/loose", |q: http.Request| -> http.Response {
+        match extract.query[Loose](q) {
+            Ok(u) => extract.respond_json(200, u)
+            Err(e) => e.response()
+        }
+    })
+    rt.get("/tolerant", |q: http.Request| -> http.Response {
+        match extract.query[Tolerant](q) {
+            Ok(u) => extract.respond_json(200, u)
+            Err(e) => e.response()
+        }
+    })
+    router.handler(rt)
+}
+
+fn main() uses io, clock {
+    let c = testing.client(app())
+    let json = "application/json"
+
+    print("-- json")
+    say(c.post_json("/orders", r#"{"customerName":"Ada","lines":[{"sku":"x1","qty":2}],"note":null}"#))
+    say(c.post_json("/orders", r#"{"customerName":"Ada","lines":[]}"#))
+    print("-- json: malformed is 400")
+    say(c.post_json("/orders", r#"{"customerName":"#))
+    say(c.post_json("/orders", "not json"))
+    say(c.post("/orders", json, lit("")))
+    say(c.post_json("/orders", r#"{"customerName":"a","customerName":"b","lines":[]}"#))
+    print("-- json: content type is 415")
+    say(c.post("/orders", "text/plain", lit("{{}}")))
+    say(c.send("POST", "/orders", List.new(), lit("{{}}")))
+    say(c.post("/orders", "application/vnd.api+json; charset=utf-8", lit(r#"{"customerName":"Ada","lines":[]}"#)))
+    say(c.post("/orders", "APPLICATION/JSON", lit(r#"{"customerName":"Ada","lines":[]}"#)))
+    print("-- json: invalid is 422, with the field's place")
+    say(c.post_json("/orders", r#"{"lines":[]}"#))
+    say(c.post_json("/orders", r#"{"customerName":"Ada","lines":[],"admin":true}"#))
+    say(c.post_json("/orders", r#"{"customerName":7,"lines":[]}"#))
+    say(c.post_json("/orders", r#"{"customerName":"Ada","lines":[{"sku":"a","qty":1},{"sku":"b","qty":0},{"sku":"c","qty":100}]}"#))
+    say(c.post_json("/orders", r#"{"customerName":"Ada","lines":[{"sku":"a","qty":99999999999}]}"#))
+    say(c.post_json("/orders", r#"[1,2]"#))
+    print("-- json: the limit is 413")
+    say(c.post_json("/small", r#"{"sku":"a","qty":1}"#))
+    say(c.post_json("/small", r#"{"sku":"abcdefghijklmnop","qty":1}"#))
+
+    print("-- json: a streamed body")
+    let big = lit(r#"{"sku":"streamed","qty":5}"#)
+    let r1 = streamed(big, 7, 1000)
+    print(r1)
+    print(streamed(big, 7, 10))
+    print(streamed(lit(r#"{"sku":"s""#), 3, 1000))
+
+    print("-- query")
+    say(c.get("/items?limit=10"))
+    say(c.get("/items?limit=10&offset=20&tag=a&tag=b&tag=c&q=caf%C3%A9+au+lait&active=true&ratio=0.5&sort=Desc"))
+    say(c.get("/items?limit=10&tag=only"))
+    say(c.get("/items?limit=10&q=&offset=&active=false"))
+    say(c.get("/items?limit=10&q=a%26b%3Dc&tag=%2Fx"))
+    print("-- query: invalid is 422")
+    say(c.get("/items"))
+    say(c.get("/items?limit=abc"))
+    say(c.get("/items?limit=0"))
+    say(c.get("/items?limit=101&ratio=x&active=maybe"))
+    say(c.get("/items?limit=-5"))
+    say(c.get("/items?limit=99999999999"))
+    say(c.get("/items?limit=10&limit=20"))
+    say(c.get("/items?limit=10&sort=Sideways"))
+    say(c.get("/items?limit=10&nope=1"))
+    say(c.get("/items?limit=1&offset=-1"))
+    print("-- query: malformed is 400")
+    say(c.get("/items?limit=10&q=%zz"))
+    say(c.get("/items?limit=10&q=%ff"))
+    say(c.get("/items?%=1"))
+    print("-- query: unknown members")
+    say(c.get("/loose"))
+    say(c.get("/loose?a=1&utm=x"))
+    say(c.get("/tolerant?a=1&utm=x"))
+
+    print("-- form")
+    let fct = "application/x-www-form-urlencoded"
+    say(c.post("/login", fct, lit("user=ada+l&password=s3cret&remember=true")))
+    say(c.post("/login", fct, lit("user=ada&password=ab&remember=false")))
+    say(c.post("/login", fct, lit("user=ada&password=abcd")))
+    say(c.post("/login", fct, lit("user=%zz&password=abcd&remember=true")))
+    say(c.post("/login", json, lit(r#"{"user":"a"}"#)))
+    say(c.post("/login", fct, lit("user=a&password=abcd&remember=1")))
+
+    print("-- path")
+    say(c.get("/orgs/acme/users/42"))
+    say(c.get("/orgs/acme/users/forty"))
+    say(c.get("/orgs/acme/users/-1"))
+    say(c.get("/orgs/acme/users/99999999999999999999"))
+
+    print("-- rejection to problem")
+    let e = extract.Malformed(lit("nope"))
+    print(e.status())
+    print(e.problem().status)
+    print(extract.TooLarge(5).status())
+    print(extract.UnsupportedMedia(lit("x"), lit("y")).status())
+    print(extract.Failed(408, lit("slow")).status())
+    say(extract.respond_json(200, UserRef(7)))
+    say(extract.respond_json(202, Sort.Desc))
+}
+
+/// A request whose body arrives in pieces of `piece` bytes (`Request.stream`), read with a limit.
+fn streamed(body: List[u8], piece: usize, max: usize) -> String uses io, clock {
+    let pos = sync.lock(0 as usize)
+    let data = body.copy()
+    let pull: http.Pull = |n: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
+        pos.modify(|inout p: usize| -> Result[List[u8], stream.Error] {
+            let mut out: List[u8] = List.new()
+            let take = if n < piece { n } else { piece }
+            while out.len() < take && p < data.len() {
+                out.push(data[p])
+                p += 1
+            }
+            Ok(out)
+        })
+    }
+    let mut q = http.request("POST", lit("/x"))
+    q.headers.push(http.Header(lit("Content-Type"), lit("application/json")))
+    q.stream = Some(http.Body(pull))
+    let got: Result[Line, extract.Rejection] = extract.json_with(q, max)
+    match got {
+        Ok(l) => {
+            let mut t = String.from("ok ")
+            t.append(String.from_bytes(l.sku.bytes()).unwrap())
+            t
+        }
+        Err(r) => {
+            let mut t = String.from("rejected ")
+            t.append(String.from_int(r.status() as i64))
+            t
+        }
+    }
+}
