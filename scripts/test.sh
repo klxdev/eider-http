@@ -73,6 +73,14 @@ else
   echo "FAIL jwt interop: build"; cat "$B/log"; fail=1
 fi
 rm -rf "$B"
+# http/unixsock and http/proxyproto against curl and python3 (tests/unixsock_interop.sh; `skip` for what is not installed)
+B=$(mktemp -d)
+if ei build tests/unixsock_interop_server.ei -o "$B/usrv" > "$B/log" 2>&1; then
+  sh tests/unixsock_interop.sh "$B" || fail=1
+else
+  echo "FAIL unixsock interop: build"; cat "$B/log"; fail=1
+fi
+rm -rf "$B"
 if [ -n "$TSAN" ]; then
   T=$(mktemp -d)
   trap 'rm -rf "$T"' EXIT

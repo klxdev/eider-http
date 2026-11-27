@@ -1,0 +1,767 @@
+//! http/proxyproto: the HAProxy PROXY protocol, versions 1 (text) and 2 (binary), at the start of an
+//! accepted connection: the real client address behind an L4 load balancer, and a writer for tests,
+//! clients and proxies that must send one.
+//!
+//!     let trust = proxy.trust_none().allow("10.0.0.0/8").unwrap()      // the load balancers
+//!     let mut cfg = server.config()
+//!     cfg.proxy_protocol = Some(proxyproto.options(trust))               // every connection needs a header
+//!
+//! What it does (docs/ops.md has the long form):
+//!
+//! - `decode` reads a header from the start of a buffer: `Found(header, bytes used)`, `NeedMore`, `Absent`
+//!   (the bytes cannot be either signature) or `Invalid(why)`. It is pure and bounded: a v1 line is at most
+//!   107 bytes with its CRLF (108 bytes are ever looked at), a v2 header at most `max_v2` bytes in all
+//!   (536 by default, the size every receiver must accept). v1: `PROXY TCP4|TCP6 src dst sport dport` with
+//!   single spaces, addresses that are exactly the right family, ports without leading zeros up to 65535,
+//!   or `PROXY UNKNOWN ...` (the rest of the line is ignored, as the specification says). v2: the 12-byte
+//!   signature, version 2, command LOCAL (the real endpoints are used, the block is skipped) or PROXY,
+//!   family UNSPEC, INET, INET6 or UNIX over STREAM or DGRAM (anything else is invalid), the address block, and TLVs
+//!   that must tile the rest exactly: ALPN, authority, unique id (at most 128 bytes), SSL (with its version, CN,
+//!   cipher, signature and key algorithm sub-TLVs), NOOP, CRC32c (checked when it is there: a header whose
+//!   checksum is wrong is invalid) and every other type, kept in `tlvs` and skipped. A TLV that overruns is
+//!   invalid, never read past.
+//! - `accept_conn` runs it on an accepted socket (what `server.Config.proxy_protocol` does) without ever
+//!   reading beyond the header (it peeks, then takes exactly the header's bytes, so the TLS handshake or the
+//!   first request follows untouched). **Nothing is trusted silently**: the address the header gives is used
+//!   only when the connection's own address is in the allow-list (`options(trust)`; a `proxy.Trust`, so
+//!   CIDR ranges and `allow_unix()`). With the default mode `Required` every connection must open with a header
+//!   from a trusted address, and anything else (no header, a bad one, an untrusted sender) is dropped. In
+//!   mode `Optional` a trusted sender may or may not send one; a header from an untrusted address is dropped
+//!   (`Refuse`, the default) or skipped and not believed (`Ignore`: the connection goes on with its own
+//!   address). A header that starts like one (the signature matched) but does not parse is always dropped:
+//!   it is never passed on as HTTP.
+//! - A header with a real address replaces `Request.peer` (as "ip:port": an IPv4-mapped IPv6 address is the
+//!   IPv4 one, as in http/proxy, so rate limiting keys one spelling; a unix source is "unix:path"), and the
+//!   handler's request context gets `proxy_peer` (the connection's own address), `proxy_dst`, `proxy_version`
+//!   ("1" or "2"), and from a v2 header `proxy_alpn`, `proxy_authority`, `proxy_unique_id`, `proxy_ssl`
+//!   ("1" when the client used TLS), `proxy_ssl_version`, `proxy_ssl_cn`, `proxy_ssl_cipher` and
+//!   `proxy_ssl_verify` (0: verified). LOCAL and UNSPEC leave `peer` alone (and set `proxy_version` only).
+//! - The writer: `encode_v1`, `encode_v2` (TLVs, CRC32c optional), `local` and `header`; `connect` dials with
+//!   a header written first (http/client). The header goes out on the connection that is opened, not on a
+//!   reconnect.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.net
+import std.time
+import http
+import http.proxy
+import http.sock
+import http.client
+
+/// The longest v1 line, with its CRLF.
+pub const V1_MAX: usize = 107
+
+/// The default cap on a v2 header (16 bytes of prefix, the address block and the TLVs): what the
+/// specification says every receiver must accept.
+pub const V2_MAX: usize = 536
+
+/// The v2 transport values.
+pub const UNSPEC: i32 = 0
+pub const STREAM: i32 = 1
+pub const DGRAM: i32 = 2
+
+pub const TLV_ALPN: u8 = 1
+pub const TLV_AUTHORITY: u8 = 2
+pub const TLV_CRC32C: u8 = 3
+pub const TLV_NOOP: u8 = 4
+pub const TLV_UNIQUE_ID: u8 = 5
+pub const TLV_SSL: u8 = 32
+pub const TLV_SSL_VERSION: u8 = 33
+pub const TLV_SSL_CN: u8 = 34
+pub const TLV_SSL_CIPHER: u8 = 35
+pub const TLV_SSL_SIG_ALG: u8 = 36
+pub const TLV_SSL_KEY_ALG: u8 = 37
+pub const TLV_NETNS: u8 = 48
+
+/// One type-length-value of a v2 header.
+pub type Tlv = { kind: u8, value: List[u8] }
+
+/// The SSL TLV (type 0x20): `client` flags (1: the client used TLS, 2: with a certificate on this
+/// connection, 4: with a certificate in this session), `verify` (0: the certificate verified) and the
+/// sub-TLVs it carried (empty when absent).
+pub type Ssl = { client: u8, verify: u32, version: List[u8], cn: List[u8], cipher: List[u8], sig_alg: List[u8], key_alg: List[u8] }
+
+/// A parsed (or to be written) header. `version` is 1 or 2; `local`: a v2 LOCAL command (the connection's own
+/// endpoints apply); `family` is net.IPV4, net.IPV6, net.UNIX, or 0 for UNKNOWN/UNSPEC (no address: `src` and
+/// `dst` are empty); `transport` is STREAM, DGRAM or UNSPEC; `tlvs` are all the TLVs in order, and `alpn`,
+/// `authority`, `unique_id` and `ssl` are the first of those types, parsed. `crc` is true when a CRC32c TLV was
+/// present and verified.
+pub type Header = { version: i32, local: bool, family: i32, transport: i32, src: net.Addr, dst: net.Addr, tlvs: List[Tlv], alpn: List[u8], authority: List[u8], unique_id: List[u8], ssl: Option[Ssl], crc: bool }
+
+/// What `decode` found at the start of a buffer.
+pub type Decoded = | Found(h: Header, used: usize) | NeedMore | Absent | Invalid(why: String)
+
+fn none_addr() -> net.Addr { net.Addr(0, 0, List.new(), 0, List.new()) }
+
+/// A PROXY header for a TCP connection from `src` to `dst` (the same family: IPv4, IPv6 or unix).
+pub fn header(src: net.Addr, dst: net.Addr) -> Header {
+    Header(2, false, src.family, STREAM, src, dst, List.new(), List.new(), List.new(), List.new(), None, false)
+}
+
+/// A v2 LOCAL header (a health check of the proxy itself: no client).
+pub fn local() -> Header {
+    Header(2, true, 0, UNSPEC, none_addr(), none_addr(), List.new(), List.new(), List.new(), List.new(), None, false)
+}
+
+impl Header {
+    /// With the TLV `kind` and `value` added (any type, e.g. 0xE0 to 0xEF for an application's own).
+    fn with_tlv(self, kind: u8, value: List[u8]) -> Header {
+        let mut h = self.copy()
+        h.tlvs.push(Tlv(kind, value))
+        h
+    }
+
+    /// With the ALPN TLV.
+    fn with_alpn(self, alpn: List[u8]) -> Header {
+        let mut h = self.with_tlv(TLV_ALPN, alpn.copy())
+        h.alpn = alpn
+        h
+    }
+
+    /// With the authority (SNI) TLV.
+    fn with_authority(self, name: List[u8]) -> Header {
+        let mut h = self.with_tlv(TLV_AUTHORITY, name.copy())
+        h.authority = name
+        h
+    }
+
+    /// With the unique id TLV (at most 128 bytes).
+    fn with_unique_id(self, id: List[u8]) -> Header {
+        let mut h = self.with_tlv(TLV_UNIQUE_ID, id.copy())
+        h.unique_id = id
+        h
+    }
+
+    /// With the SSL TLV and its sub-TLVs (the empty ones are left out).
+    fn with_ssl(self, s: Ssl) -> Header {
+        let mut v: List[u8] = List.new()
+        v.push(s.client)
+        put_u32(inout v, s.verify)
+        put_tlv(inout v, TLV_SSL_VERSION, s.version)
+        put_tlv(inout v, TLV_SSL_CN, s.cn)
+        put_tlv(inout v, TLV_SSL_CIPHER, s.cipher)
+        put_tlv(inout v, TLV_SSL_SIG_ALG, s.sig_alg)
+        put_tlv(inout v, TLV_SSL_KEY_ALG, s.key_alg)
+        let mut h = self.with_tlv(TLV_SSL, v)
+        h.ssl = Some(s)
+        h
+    }
+
+    /// As datagrams (DGRAM) instead of a stream.
+    fn datagram(self) -> Header {
+        let mut h = self.copy()
+        h.transport = DGRAM
+        h
+    }
+
+    /// Whether the header names a client (a PROXY command with an address).
+    fn has_addr(self) -> bool { !self.local && self.family != 0 }
+}
+
+// ---- bytes
+
+fn put_u16(inout out: List[u8], v: usize) {
+    out.push(((v / 256) % 256) as u8)
+    out.push((v % 256) as u8)
+}
+
+fn put_u32(inout out: List[u8], v: u32) {
+    let mut s = v.copy()
+    let mut parts: List[u8] = List.new()
+    for i in 0..4 {
+        parts.push((s & 255) as u8)
+        s = s >> 8
+    }
+    out.push(parts[3])
+    out.push(parts[2])
+    out.push(parts[1])
+    out.push(parts[0])
+}
+
+fn put_tlv(inout out: List[u8], kind: u8, value: List[u8]) {
+    if value.len() == 0 { return }
+    out.push(kind)
+    put_u16(inout out, value.len())
+    bytes.append(inout out, value)
+}
+
+fn u16_at(b: List[u8], i: usize) -> usize { (b[i] as usize) * 256 + (b[i + 1] as usize) }
+
+fn u32_at(b: List[u8], i: usize) -> u32 {
+    let mut v: u32 = 0
+    for k in 0..4 {
+        v = (v << 8) | (b[i + (k as usize)] as u32)
+    }
+    v
+}
+
+/// The CRC32c (Castagnoli) of `data`: the checksum of the CRC32c TLV is this over the whole header with
+/// the checksum field zero. crc32c("123456789") is 0xE3069283.
+pub fn crc32c(data: List[u8]) -> u32 {
+    let mut table: List[u32] = List.new()
+    for n in 0..256 {
+        let mut c: u32 = n as u32
+        for k in 0..8 {
+            if (c & 1) != 0 { c = (c >> 1) ^ 2197175160 } else { c = c >> 1 }
+        }
+        table.push(c)
+    }
+    let mut crc: u32 = 4294967295
+    for b in data {
+        let ix = ((crc ^ (b as u32)) & 255) as usize
+        crc = (crc >> 8) ^ table[ix]
+    }
+    crc ^ 4294967295
+}
+
+fn sig_v2() -> List[u8] {
+    let mut s: List[u8] = List.new()
+    for b in [13, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10] { s.push(b as u8) }
+    s
+}
+
+fn sig_v1() -> List[u8] { sys.lit("PROXY ") }
+
+/// 0: `buf` and `sig` differ in a byte both have; 1: `buf` is shorter and a prefix of `sig`; 2: `buf` starts with `sig`.
+fn sig_state(buf: List[u8], sig: List[u8]) -> i32 {
+    let n = if buf.len() < sig.len() { buf.len() } else { sig.len() }
+    for i in 0..n {
+        if buf[i] != sig[i] { return 0 }
+    }
+    if buf.len() < sig.len() { return 1 }
+    2
+}
+
+fn invalid(why: str) -> Decoded { Invalid(String.from(why)) }
+
+// ---- decoding
+
+/// Reads a header from the start of `buf` (see the module comment). `max_v2` caps a v2 header's total size
+/// (`V2_MAX`), `verify_crc` checks a CRC32c TLV when there is one.
+pub fn decode(buf: List[u8], max_v2: usize, verify_crc: bool) -> Decoded {
+    if buf.len() == 0 { return NeedMore }
+    let a = sig_state(buf, sig_v2())
+    let b = sig_state(buf, sig_v1())
+    if a == 0 && b == 0 { return Absent }
+    if a == 2 { return decode_v2(buf, max_v2, verify_crc) }
+    if b == 2 { return decode_v1(buf) }
+    NeedMore
+}
+
+fn is_dec(c: u8) -> bool { c >= 48 && c <= 57 }
+
+fn port_of(s: List[u8]) -> Option[i32] {
+    if s.len() == 0 || s.len() > 5 { return None }
+    if s.len() > 1 && s[0] == 48 { return None }
+    let mut v: i32 = 0
+    for c in s {
+        if !is_dec(c) { return None }
+        v = v * 10 + ((c - 48) as i32)
+    }
+    if v > 65535 { return None }
+    Some(v)
+}
+
+/// An IPv6 address as 16 bytes (IPv4-mapped text is 4 bytes from http/proxy: written out again).
+fn expand6(ip: List[u8]) -> List[u8] {
+    if ip.len() == 16 { return ip }
+    let mut out: List[u8] = List.new()
+    for i in 0..10 { out.push(0) }
+    out.push(255)
+    out.push(255)
+    bytes.append(inout out, ip)
+    out
+}
+
+fn v1_ip(s: List[u8], six: bool) -> Option[List[u8]] {
+    let colon = bytes.find_byte(s, 58, 0).is_some()
+    if colon != six { return None }
+    match proxy.parse_ip(s) {
+        Some(ip) => {
+            if six { return Some(expand6(ip)) }
+            if ip.len() != 4 { return None }
+            Some(ip)
+        }
+        None => None
+    }
+}
+
+fn decode_v1(buf: List[u8]) -> Decoded {
+    let end = match bytes.find(buf, sys.lit("\r\n"), 0) {
+        Some(at) => at
+        None => {
+            // no CRLF yet: more may come only while the line could still fit in 107 bytes with it
+            if buf.len() >= V1_MAX + 1 { return invalid("proxy protocol v1: the line is longer than 107 bytes") }
+            // a stray CR or LF is not a line end
+            for c in buf {
+                if c != 13 && (c < 32 || c > 126) { return invalid("proxy protocol v1: a control byte in the line") }
+            }
+            return NeedMore
+        }
+    }
+    let total = end + 2
+    if total > V1_MAX { return invalid("proxy protocol v1: the line is longer than 107 bytes") }
+    for i in 0..end {
+        let c = buf[i]
+        if c < 32 || c > 126 { return invalid("proxy protocol v1: a control byte in the line") }
+    }
+    let line = bytes.slice(buf, 6, end)
+    let parts = bytes.split(line, 32)
+    if parts.len() == 0 { return invalid("proxy protocol v1: no protocol") }
+    let proto = parts[0].copy()
+    if bytes.eq(proto, sys.lit("UNKNOWN")) {
+        // everything after it, up to the CRLF, is ignored
+        let h = Header(1, false, 0, UNSPEC, none_addr(), none_addr(), List.new(), List.new(), List.new(), List.new(), None, false)
+        return Found(h, total)
+    }
+    let six = bytes.eq(proto, sys.lit("TCP6"))
+    if !six && !bytes.eq(proto, sys.lit("TCP4")) { return invalid("proxy protocol v1: the protocol is not TCP4, TCP6 or UNKNOWN") }
+    if parts.len() != 5 { return invalid("proxy protocol v1: expected two addresses and two ports, single-spaced") }
+    let src = match v1_ip(parts[1].copy(), six) {
+        Some(ip) => ip
+        None => { return invalid("proxy protocol v1: bad source address") }
+    }
+    let dst = match v1_ip(parts[2].copy(), six) {
+        Some(ip) => ip
+        None => { return invalid("proxy protocol v1: bad destination address") }
+    }
+    let sp = match port_of(parts[3].copy()) {
+        Some(p) => p
+        None => { return invalid("proxy protocol v1: bad source port") }
+    }
+    let dp = match port_of(parts[4].copy()) {
+        Some(p) => p
+        None => { return invalid("proxy protocol v1: bad destination port") }
+    }
+    let fam = if six { net.IPV6 } else { net.IPV4 }
+    let h = Header(1, false, fam, STREAM, net.Addr(fam, sp, src, 0, List.new()), net.Addr(fam, dp, dst, 0, List.new()), List.new(), List.new(), List.new(), List.new(), None, false)
+    Found(h, total)
+}
+
+fn unix_addr(b: List[u8], at: usize) -> net.Addr {
+    let mut n: usize = 108
+    while n > 0 && b[at + n - 1] == 0 { n -= 1 }
+    net.Addr(net.UNIX, 0, List.new(), 0, bytes.slice(b, at, at + n))
+}
+
+fn decode_v2(buf: List[u8], max_v2: usize, verify_crc: bool) -> Decoded {
+    if buf.len() < 13 { return NeedMore }
+    if (buf[12] / 16) != 2 { return invalid("proxy protocol v2: the version is not 2") }
+    let cmd = buf[12] % 16
+    if cmd > 1 { return invalid("proxy protocol v2: unknown command") }
+    if buf.len() < 14 { return NeedMore }
+    let fam = (buf[13] / 16) as i32
+    let tr = (buf[13] % 16) as i32
+    if fam > 3 { return invalid("proxy protocol v2: unknown address family") }
+    if tr > 2 { return invalid("proxy protocol v2: unknown transport protocol") }
+    if buf.len() < 16 { return NeedMore }
+    let len = u16_at(buf, 14)
+    let total = 16 + len
+    if total > max_v2 { return invalid("proxy protocol v2: the header is longer than the limit") }
+    if buf.len() < total { return NeedMore }
+    if cmd == 0 {
+        // LOCAL: the block (whatever it holds) is skipped, the real endpoints apply
+        let h = local()
+        return Found(h, total)
+    }
+    if fam == 0 {
+        // UNSPEC: the address block is ignored
+        let h = Header(2, false, 0, tr, none_addr(), none_addr(), List.new(), List.new(), List.new(), List.new(), None, false)
+        return Found(h, total)
+    }
+    if tr == 0 { return invalid("proxy protocol v2: an address family with an unspecified transport") }
+    let alen: usize = if fam == 1 { 12 } else { if fam == 2 { 36 } else { 216 } }
+    if len < alen { return invalid("proxy protocol v2: the address block is cut short") }
+    let mut src = none_addr()
+    let mut dst = none_addr()
+    if fam == 1 {
+        src = net.Addr(net.IPV4, u16_at(buf, 16 + 8) as i32, bytes.slice(buf, 16, 20), 0, List.new())
+        dst = net.Addr(net.IPV4, u16_at(buf, 16 + 10) as i32, bytes.slice(buf, 20, 24), 0, List.new())
+    }
+    if fam == 2 {
+        src = net.Addr(net.IPV6, u16_at(buf, 16 + 32) as i32, bytes.slice(buf, 16, 32), 0, List.new())
+        dst = net.Addr(net.IPV6, u16_at(buf, 16 + 34) as i32, bytes.slice(buf, 32, 48), 0, List.new())
+    }
+    if fam == 3 {
+        src = unix_addr(buf, 16)
+        dst = unix_addr(buf, 16 + 108)
+    }
+    let mut h = Header(2, false, src.family, tr, src, dst, List.new(), List.new(), List.new(), List.new(), None, false)
+    // the TLVs tile the rest exactly
+    let base = 16 + alen
+    let mut pos = base.copy()
+    let mut crc_at: Option[usize] = None
+    while pos < total {
+        if pos + 3 > total { return invalid("proxy protocol v2: a TLV is cut short") }
+        let kind = buf[pos]
+        let vl = u16_at(buf, pos + 1)
+        if pos + 3 + vl > total { return invalid("proxy protocol v2: a TLV runs past the header") }
+        let value = bytes.slice(buf, pos + 3, pos + 3 + vl)
+        h.tlvs.push(Tlv(kind, value.copy()))
+        if kind == TLV_ALPN && h.alpn.len() == 0 { h.alpn = value.copy() }
+        if kind == TLV_AUTHORITY && h.authority.len() == 0 { h.authority = value.copy() }
+        if kind == TLV_UNIQUE_ID {
+            if vl > 128 { return invalid("proxy protocol v2: the unique id is longer than 128 bytes") }
+            if h.unique_id.len() == 0 { h.unique_id = value.copy() }
+        }
+        if kind == TLV_CRC32C {
+            if vl != 4 { return invalid("proxy protocol v2: the CRC32c TLV is not 4 bytes") }
+            if crc_at.is_none() { crc_at = Some(pos + 3) }
+        }
+        if kind == TLV_SSL && h.ssl.is_none() {
+            match parse_ssl(value) {
+                Some(s) => { h.ssl = Some(s) }
+                None => { return invalid("proxy protocol v2: a malformed SSL TLV") }
+            }
+        }
+        pos += 3 + vl
+    }
+    match crc_at {
+        Some(at) => {
+            if verify_crc {
+                let want = u32_at(buf, at)
+                let mut whole = bytes.slice(buf, 0, total)
+                for k in 0..4 { whole[at + (k as usize)] = 0 }
+                if crc32c(whole) != want { return invalid("proxy protocol v2: the CRC32c does not match") }
+                h.crc = true
+            }
+        }
+        None => {}
+    }
+    Found(h, total)
+}
+
+fn parse_ssl(v: List[u8]) -> Option[Ssl] {
+    if v.len() < 5 { return None }
+    let mut s = Ssl(v[0], u32_at(v, 1), List.new(), List.new(), List.new(), List.new(), List.new())
+    let mut pos: usize = 5
+    while pos < v.len() {
+        if pos + 3 > v.len() { return None }
+        let kind = v[pos]
+        let vl = u16_at(v, pos + 1)
+        if pos + 3 + vl > v.len() { return None }
+        let val = bytes.slice(v, pos + 3, pos + 3 + vl)
+        if kind == TLV_SSL_VERSION { s.version = val }
+        else if kind == TLV_SSL_CN { s.cn = val }
+        else if kind == TLV_SSL_CIPHER { s.cipher = val }
+        else if kind == TLV_SSL_SIG_ALG { s.sig_alg = val }
+        else if kind == TLV_SSL_KEY_ALG { s.key_alg = val }
+        pos += 3 + vl
+    }
+    Some(s)
+}
+
+// ---- writing
+
+fn ip_text_of(a: net.Addr) -> List[u8] { proxy.ip_text(a.ip) }
+
+/// A v1 header line for a TCP connection from `src` to `dst` (both IPv4 or both IPv6). Err for anything
+/// else (use `encode_v2` for a unix socket, or `v1_unknown`).
+pub fn encode_v1(src: net.Addr, dst: net.Addr) -> Result[List[u8], String] {
+    if src.family != dst.family { return Err(String.from("proxy protocol v1: the addresses are of different families")) }
+    if src.family != net.IPV4 && src.family != net.IPV6 { return Err(String.from("proxy protocol v1 carries IPv4 and IPv6 only")) }
+    let want: usize = if src.family == net.IPV4 { 4 } else { 16 }
+    if src.ip.len() != want || dst.ip.len() != want { return Err(String.from("proxy protocol v1: bad address length")) }
+    if src.port < 0 || src.port > 65535 || dst.port < 0 || dst.port > 65535 { return Err(String.from("proxy protocol v1: bad port")) }
+    let mut out = sys.lit("PROXY ")
+    bytes.append(inout out, sys.lit(if src.family == net.IPV4 { "TCP4 " } else { "TCP6 " }))
+    bytes.append(inout out, v1_text(src.ip))
+    out.push(32)
+    bytes.append(inout out, v1_text(dst.ip))
+    out.push(32)
+    bytes.append(inout out, bytes.from_u64(src.port as u64))
+    out.push(32)
+    bytes.append(inout out, bytes.from_u64(dst.port as u64))
+    bytes.append(inout out, sys.lit("\r\n"))
+    Ok(out)
+}
+
+/// An address as v1 text: dotted decimal, or IPv6 in full (8 hex groups, no brackets).
+fn v1_text(ip: List[u8]) -> List[u8] {
+    if ip.len() == 4 { return proxy.ip_text(ip) }
+    let t = proxy.ip_text(ip)
+    // ip_text writes "[..]": drop the brackets
+    bytes.slice(t, 1, t.len() - 1)
+}
+
+/// `PROXY UNKNOWN`: a v1 header that says nothing about the client.
+pub fn v1_unknown() -> List[u8] { sys.lit("PROXY UNKNOWN\r\n") }
+
+fn addr_block(h: Header) -> Result[List[u8], String] {
+    let mut out: List[u8] = List.new()
+    if h.local || h.family == 0 { return Ok(out) }
+    if h.src.family != h.family || h.dst.family != h.family { return Err(String.from("proxy protocol v2: the addresses are not of the header's family")) }
+    if h.family == net.IPV4 || h.family == net.IPV6 {
+        let want: usize = if h.family == net.IPV4 { 4 } else { 16 }
+        if h.src.ip.len() != want || h.dst.ip.len() != want { return Err(String.from("proxy protocol v2: bad address length")) }
+        if h.src.port < 0 || h.src.port > 65535 || h.dst.port < 0 || h.dst.port > 65535 { return Err(String.from("proxy protocol v2: bad port")) }
+        bytes.append(inout out, h.src.ip)
+        bytes.append(inout out, h.dst.ip)
+        put_u16(inout out, h.src.port as usize)
+        put_u16(inout out, h.dst.port as usize)
+        return Ok(out)
+    }
+    if h.family == net.UNIX {
+        if h.src.path.len() > 108 || h.dst.path.len() > 108 { return Err(String.from("proxy protocol v2: a unix path is longer than 108 bytes")) }
+        for p in [h.src.path, h.dst.path] {
+            bytes.append(inout out, p)
+            for i in 0..(108 - p.len()) { out.push(0) }
+        }
+        return Ok(out)
+    }
+    Err(String.from("proxy protocol v2: unknown address family"))
+}
+
+/// The v2 bytes of `h`. `with_crc` adds a CRC32c TLV (computed over the whole header). Err when the addresses do not
+/// fit the family, a TLV is over 65535 bytes, the unique id is over 128 bytes, or the whole is over 65551 bytes.
+pub fn encode_v2(h: Header, with_crc: bool) -> Result[List[u8], String] {
+    let block = addr_block(h)?
+    let mut body = block.copy()
+    for t in h.tlvs {
+        if t.value.len() > 65535 { return Err(String.from("proxy protocol v2: a TLV is longer than 65535 bytes")) }
+        if t.kind == TLV_UNIQUE_ID && t.value.len() > 128 { return Err(String.from("proxy protocol v2: the unique id is longer than 128 bytes")) }
+        body.push(t.kind)
+        put_u16(inout body, t.value.len())
+        bytes.append(inout body, t.value)
+    }
+    let crc_at = body.len() + 3
+    if with_crc {
+        body.push(TLV_CRC32C)
+        put_u16(inout body, 4)
+        for i in 0..4 { body.push(0) }
+    }
+    if body.len() > 65535 { return Err(String.from("proxy protocol v2: the header is too long")) }
+    let mut out = sig_v2()
+    let cmd: u8 = if h.local { 0 } else { 1 }
+    out.push(32 + cmd)
+    let fam: u8 = if h.local || h.family == 0 { 0 } else { if h.family == net.IPV4 { 1 } else { if h.family == net.IPV6 { 2 } else { 3 } } }
+    let tr: u8 = if h.local || h.family == 0 { 0 } else { h.transport as u8 }
+    out.push(fam * 16 + tr)
+    put_u16(inout out, body.len())
+    let at = out.len() + crc_at
+    bytes.append(inout out, body)
+    if with_crc {
+        let sum = crc32c(out)
+        let mut tail: List[u8] = List.new()
+        put_u32(inout tail, sum)
+        for k in 0..4 { out[at + (k as usize)] = tail[k as usize] }
+    }
+    Ok(out)
+}
+
+/// Dials `a` and writes `hdr` (from `encode_v1` or `encode_v2`) before anything else: a client for a
+/// server or a proxy that expects the PROXY protocol. The header is sent on this connection only, not on a
+/// reconnect after the server closed it.
+pub fn connect(a: net.Addr, hdr: List[u8], dl: time.Deadline) -> Result[client.Conn, String] uses net, io, clock {
+    let c = client.connect(a, dl)?
+    if !sock.send_by(c.fd, hdr, dl) {
+        fd.close(c.fd)
+        return Err(String.from("proxy protocol: could not send the header"))
+    }
+    Ok(c)
+}
+
+// ---- the server's side
+
+/// Whether a connection must open with a header (`Required`) or may (`Optional`).
+pub type Mode = | Required | Optional
+
+/// What to do with a header from an address that is not trusted: drop the connection, or skip the header
+/// and carry on with the connection's own address.
+pub type Untrusted = | Refuse | Ignore
+
+/// The PROXY protocol on a listener. `trust`: the addresses whose headers are believed (nothing is, until you
+/// allow some); `mode`, `untrusted`: see the module comment; `max_v2`: the cap on a v2 header's total size;
+/// `verify_crc`: check a CRC32c TLV; `timeout`: how long the header may take to arrive (a connection that
+/// sends nothing for this long is dropped under `Required`, and goes on under `Optional`, where a client that
+/// speaks first has nothing to wait for).
+pub type Options = { trust: proxy.Trust, mode: Mode, untrusted: Untrusted, max_v2: usize, verify_crc: bool, timeout: time.Duration }
+
+/// Every connection must open with a header, from a trusted address; a header from anywhere else drops the
+/// connection; at most 536 bytes of v2, CRC32c checked, 5 s for it to arrive.
+pub fn options(trust: proxy.Trust) -> Options {
+    Options(trust, Required, Refuse, V2_MAX, true, time.seconds(5))
+}
+
+impl Options {
+    /// A header is not required from trusted addresses (a direct client works too).
+    fn optional(self) -> Options {
+        let mut o = self.copy()
+        o.mode = Optional
+        o
+    }
+
+    /// A header from an untrusted address is skipped and not believed, instead of dropping the connection
+    /// (only in mode `Optional`: `Required` drops an untrusted address in any case).
+    fn ignore_untrusted(self) -> Options {
+        let mut o = self.copy()
+        o.untrusted = Ignore
+        o
+    }
+
+    /// Accepts v2 headers up to `n` bytes in all (at least 16 and at most 65551).
+    fn with_max_v2(self, n: usize) -> Options {
+        let mut o = self.copy()
+        o.max_v2 = if n < 16 { 16 } else { if n > 65551 { 65551 } else { n } }
+        o
+    }
+
+    /// Does not check CRC32c TLVs.
+    fn without_crc_check(self) -> Options {
+        let mut o = self.copy()
+        o.verify_crc = false
+        o
+    }
+
+    /// The time the header may take to arrive.
+    fn with_timeout(self, d: time.Duration) -> Options {
+        let mut o = self.copy()
+        o.timeout = d
+        o
+    }
+}
+
+/// What to do with an accepted connection: `Pass(peer, ctx)` serve it with `peer` as the client's address
+/// ("ip:port" text) and `ctx` added to every request's context; `Drop(why)` close it.
+pub type Verdict = | Pass(peer: List[u8], ctx: List[http.Header]) | Drop(why: String)
+
+/// Whether the connection address `peer` (as `Request.peer` holds it: "ip:port", or "unix:...") is in the allow-list.
+pub fn is_trusted(t: proxy.Trust, peer: List[u8]) -> bool {
+    match proxy.peer_ip(peer) {
+        Some(ip) => t.trusts(ip)
+        None => t.unix && bytes.starts_with(peer, sys.lit("unix:"))
+    }
+}
+
+/// The client's address as `Request.peer` holds it: "ip:port" (an IPv4-mapped IPv6 address as IPv4), or "unix:path".
+pub fn peer_text(a: net.Addr) -> List[u8] {
+    if a.family == net.UNIX { return net.text(a) }
+    let mut ip = a.ip.copy()
+    if ip.len() == 16 {
+        let mut mapped = ip[10] == 255 && ip[11] == 255
+        for i in 0..10 {
+            if ip[i as usize] != 0 { mapped = false }
+        }
+        if mapped { ip = bytes.slice(ip, 12, 16) }
+    }
+    proxy.addr_text(ip, a.port)
+}
+
+fn ctx_entry(name: str, value: List[u8]) -> http.Header { http.Header(sys.lit(name), value) }
+
+/// The client address and the request context a trusted header gives: `(peer, ctx)`; `real` is the connection's own
+/// address. A header with no address (UNKNOWN, LOCAL, UNSPEC) leaves `real`.
+pub fn view(h: Header, real: List[u8]) -> (List[u8], List[http.Header]) {
+    let mut ctx: List[http.Header] = List.new()
+    ctx.push(ctx_entry("proxy_version", bytes.from_u64(h.version as u64)))
+    if !h.has_addr() { return (real, ctx) }
+    ctx.push(ctx_entry("proxy_peer", real.copy()))
+    ctx.push(ctx_entry("proxy_dst", peer_text(h.dst)))
+    if h.alpn.len() > 0 { ctx.push(ctx_entry("proxy_alpn", h.alpn.copy())) }
+    if h.authority.len() > 0 { ctx.push(ctx_entry("proxy_authority", h.authority.copy())) }
+    if h.unique_id.len() > 0 { ctx.push(ctx_entry("proxy_unique_id", h.unique_id.copy())) }
+    match h.ssl {
+        Some(s) => {
+            ctx.push(ctx_entry("proxy_ssl", bytes.from_u64(if (s.client & 1) != 0 { 1 } else { 0 })))
+            ctx.push(ctx_entry("proxy_ssl_verify", bytes.from_u64(s.verify as u64)))
+            if s.version.len() > 0 { ctx.push(ctx_entry("proxy_ssl_version", s.version.copy())) }
+            if s.cn.len() > 0 { ctx.push(ctx_entry("proxy_ssl_cn", s.cn.copy())) }
+            if s.cipher.len() > 0 { ctx.push(ctx_entry("proxy_ssl_cipher", s.cipher.copy())) }
+        }
+        None => {}
+    }
+    (peer_text(h.src), ctx)
+}
+
+/// `h` with `ctx` added to every request's context.
+pub fn with_ctx(h: http.Handler, ctx: List[http.Header]) -> http.Handler {
+    |req: http.Request| -> http.Response {
+        let mut q = req.copy()
+        for e in ctx { q.ctx.push(http.Header(e.name.copy(), e.value.copy())) }
+        h(q)
+    }
+}
+
+/// How reading the header ended.
+type Read = | Got(h: Header) | Plain | Bad(why: String)
+
+/// Reads the header from the start of the connection `c` without taking a byte that is not the header's.
+fn read_header(c: i32, o: Options) -> Read uses net, io, clock {
+    let dl = time.after(o.timeout)
+    let want: i64 = if o.max_v2 > 108 { o.max_v2 as i64 } else { 108 }
+    let mut last: usize = 0
+    while true {
+        match fd.wait_ready(c, fd.READY_READ, dl) {
+            Ok(true) => {}
+            Ok(false) => {
+                if last == 0 { return Plain }
+                return Bad(String.from("proxy protocol: the header did not arrive in time"))
+            }
+            Err(e) => { return Bad(e) }
+        }
+        let buf = match net.peek(c, want) {
+            Ok(b) => b
+            Err(e) => { return Bad(e) }
+        }
+        if buf.len() == 0 { return Bad(String.from("proxy protocol: the connection closed before a header")) }
+        match decode(buf, o.max_v2, o.verify_crc) {
+            Found(h, used) => {
+                // take exactly the header's bytes
+                let mut left = used.copy()
+                while left > 0 {
+                    match net.try_recv(c, left as i64) {
+                        Ok(Some(b)) => {
+                            if b.len() == 0 { return Bad(String.from("proxy protocol: the connection closed")) }
+                            left -= b.len()
+                        }
+                        Ok(None) => {}
+                        Err(e) => { return Bad(e) }
+                    }
+                }
+                return Got(h)
+            }
+            Absent => { return Plain }
+            Invalid(why) => { return Bad(why) }
+            NeedMore => {
+                // the socket stays readable while its bytes are unread: a pause lets more arrive
+                if buf.len() == last { time.sleep_ms(1) }
+                last = buf.len()
+                if dl.expired() { return Bad(String.from("proxy protocol: the header did not arrive in time")) }
+            }
+        }
+    }
+    Bad(String.from("unreachable"))
+}
+
+/// Decides an accepted connection `c` whose own address is `peer` (the rules in the module comment). It reads at
+/// most the header from `c` (which is non-blocking), never a byte after it.
+pub fn accept_conn(c: i32, peer: List[u8], o: Options) -> Verdict uses net, io, clock {
+    let trusted = is_trusted(o.trust, peer)
+    match o.mode {
+        Required => {
+            if !trusted { return Drop(String.from("proxy protocol: the connection is not from a trusted address")) }
+        }
+        Optional => {}
+    }
+    match read_header(c, o) {
+        Got(h) => {
+            if !trusted {
+                match o.untrusted {
+                    Refuse => { return Drop(String.from("proxy protocol: a header from an untrusted address")) }
+                    Ignore => { return Pass(peer, List.new()) }
+                }
+            }
+            let (p, ctx) = view(h, peer)
+            Pass(p, ctx)
+        }
+        Plain => {
+            match o.mode {
+                Required => Drop(String.from("proxy protocol: the connection did not open with a header"))
+                Optional => Pass(peer, List.new())
+            }
+        }
+        Bad(why) => Drop(why)
+    }
+}

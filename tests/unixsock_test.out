@@ -1,0 +1,58 @@
+-- serve and fetch
+addr is the path: yes
+the file is a socket
+200 OK
+200 [{"Id":"abc","Names":["/web"]}]
+200 peer=unix: host=localhost proxy_peer=-
+200 hello over a unix socket
+300000 bytes back intact: yes
+-- keep-alive on one connection
+request 1: OK
+request 2: OK
+request 3: OK
+still open: yes
+200 peer=unix: host=localhost proxy_peer=-
+200 peer=unix: host=docker.example proxy_peer=-
+-- a dead path
+a directory is not a socket: error
+no socket there: cannot connect
+requests handled: 10
+removed: yes
+the file is missing
+removing again: no
+-- a stale socket file
+left behind: socket
+keep_stale refuses: the socket file exists
+stale file replaced
+200 OK
+-- a live server is not displaced
+refused: address in use
+200 OK
+requests handled: 2
+removed: yes
+-- what is not a socket is never removed
+a regular file: refused, not a socket
+remove() leaves it: left
+content kept: precious
+a directory: refused, not a socket
+empty path: unix socket: an empty path (use abstract_addr for an abstract socket)
+too long: unix socket: the path is longer than 107 bytes
+-- permissions
+mode 0600: 384
+addr is the final path: yes
+entries left in the directory (subdir and the socket, no temporary directory): 2
+200 OK
+mode 0666: 438
+-- an abstract socket
+200 peer=unix: host=localhost proxy_peer=-
+a second listener on the name: refused
+-- h2c over a unix socket
+status 200: peer=unix: host=localhost proxy_peer=-
+echo: h2 body
+200 OK
+-- the PROXY protocol on a unix listener
+200 peer=198.51.100.9:4444 host=localhost proxy_peer=unix:
+without a header: dropped
+requests handled: 1
+a unix peer is not trusted unless allow_unix: dropped
+cleaned up: yes
