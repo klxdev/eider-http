@@ -1,0 +1,393 @@
+// WebSocket over HTTP/2 (RFC 8441): an Eider ws client and server through h2 over a socket pair. The server
+// advertises SETTINGS_ENABLE_CONNECT_PROTOCOL when h2.Options.connect_protocol is set and takes an extended
+// CONNECT (`:method CONNECT`, `:protocol websocket`) on a stream: ws.accept answers 200 (no 101, no
+// Sec-WebSocket-Accept) and runs the same frame codec over the stream's DATA. Also: the negatives (no
+// setting, a malformed extended CONNECT, another protocol), permessage-deflate over h2, several
+// WebSockets on one connection, and a close from either side.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.net
+import std.stream
+import std.task
+import std.time
+import http
+import http.h2
+import http.h2frame
+import http.hpack
+import http.transport
+import http.ws
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn cat(a: str, b: String) -> String {
+    let mut t = String.from(a)
+    t.append(b)
+    t
+}
+
+fn cs(a: String, b: String) -> String {
+    let mut t = a.copy()
+    t.append(b)
+    t
+}
+
+fn txt(b: List[u8]) -> String { sys.to_string(b) }
+
+fn hd(n: str, v: str) -> http.Header { http.Header(lit(n), lit(v)) }
+
+fn repeated(s: str, n: usize) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let one = lit(s)
+    for i in 0..n { bytes.append(inout out, one) }
+    out
+}
+
+fn echo(c: ws.Conn) uses clock {
+    while true {
+        match c.recv() {
+            Ok(ws.Text(t)) => { let z = c.send_text(t) }
+            Ok(ws.Binary(b)) => { let z = c.send_binary(b) }
+            Ok(ws.Closed(code, why)) => { return }
+            Err(e) => { return }
+        }
+    }
+}
+
+fn app() -> http.Handler uses io, clock {
+    |q: http.Request| -> http.Response {
+                if http.eq_s(q.target, "/chat") {
+            let opts = ws.options().protocol("chat.v1").limits(65536, 8192).idle_timeout(time.seconds(5))
+            return ws.accept(q, opts, |c: ws.Conn| -> () { echo(c) })
+        }
+        if http.eq_s(q.target, "/z") {
+            return ws.accept(q, ws.options().limits(65536, 8192).idle_timeout(time.seconds(5)).with_deflate(), |c: ws.Conn| -> () { echo(c) })
+        }
+        if http.eq_s(q.target, "/hello") {
+            let mut r = http.response(200)
+            r.body = lit("hello over h2")
+            return r
+        }
+        if http.eq_s(q.target, "/greet") {
+            // the server speaks first, then closes
+            return ws.accept(q, ws.options().idle_timeout(time.seconds(5)), |c: ws.Conn| -> () {
+                let z = c.send_text(String.from("welcome"))
+                let z2 = c.close(1000, "bye")
+                let m = c.recv()
+            })
+        }
+        http.error_response(404)
+    }
+}
+
+fn pair_wires() -> (h2.Wire, h2.Wire, i32) uses net, io, clock {
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    (h2.wire_of_transport(transport.plain(p.r)), h2.wire_of_transport(transport.plain(p.w)), p.r)
+}
+
+fn start(opt: h2.Options) -> (h2.Client, Task[i32]) uses net, io, clock, threads {
+    let (cw, sw, cfd) = pair_wires()
+    let h = h2.handler(app(), lit("test-peer"), List.new())
+    let t = spawn(|| -> i32 {
+        match h2.serve(sw, opt, h) {
+            Ok(z) => {}
+            Err(e) => { print(cat("server ended: ", e.why)) }
+        }
+        0
+    })
+    let c = h2.connect(cw, opt).unwrap()
+    (c, t)
+}
+
+fn dopts(deflate: bool) -> ws.DialOptions {
+    let mut o = ws.dial_options()
+    o.deflate = deflate
+    o.min = 0
+    o
+}
+
+fn msg_text(r: Result[ws.Message, String]) -> String {
+    match r {
+        Ok(ws.Text(t)) => cat("text ", t)
+        Ok(ws.Binary(b)) => cat("binary ", b.len().to_string())
+        Ok(ws.Closed(code, why)) => {
+            let mut s = cat("closed ", code.to_string())
+            s.push_str(" ")
+            s.append(why)
+            s
+        }
+        Err(e) => cat("error: ", e)
+    }
+}
+
+fn frame_text(r: Result[ws.Frame, String]) -> String {
+    match r {
+        Ok(f) => {
+            if f.opcode == ws.CLOSE && f.payload.len() >= 2 { return cat("close ", ((f.payload[0] as i64) * 256 + (f.payload[1] as i64)).to_string()) }
+            let mut s = cat("opcode ", f.opcode.to_string())
+            s.push_str(" ")
+            s.append(txt(f.payload))
+            s
+        }
+        Err(e) => cat("error: ", e)
+    }
+}
+
+fn main() uses io, net, clock, threads {
+    let dl = time.after(time.seconds(30))
+    let mut opt = h2.options()
+    opt.connect_protocol = true
+    let (hc, srv) = start(opt)
+
+    print("-- the server advertises SETTINGS_ENABLE_CONNECT_PROTOCOL")
+    print(hc.conn.wait_connect_protocol(dl))
+
+    print("-- an ordinary request on the same connection")
+    let mut req = http.request("GET", lit("/hello"))
+    let resp = hc.fetch(req, dl).unwrap()
+    print(cat("status ", resp.status.to_string()))
+    io.outln(resp.body)
+
+    print("-- an echo conversation over one stream")
+    let mut protos: List[List[u8]] = List.new()
+    protos.push(lit("chat.v2"))
+    protos.push(lit("chat.v1"))
+    let mut c = ws.dial_h2(hc, "/chat", protos, dopts(false), dl).unwrap()
+    io.outln(c.protocol)
+    c.send_text(String.from("héllo"), dl).unwrap()
+    print(frame_text(c.recv_frame(dl)))
+    c.send_binary(lit("bin"), dl).unwrap()
+    print(frame_text(c.recv_frame(dl)))
+    c.send_text_split(lit("frag"), lit("mented"), dl).unwrap()
+    print(frame_text(c.recv_frame(dl)))
+    c.ping(lit("p"), dl).unwrap()
+    print(frame_text(c.recv_frame(dl)))
+    // a message that does not fit one h2 frame or the initial windows in one go
+    let mut big: List[u8] = List.new()
+    for i in 0..(8000 as usize) { big.push(((i * 11) % 251) as u8) }
+    c.send_binary(big, dl).unwrap()
+    print(msg_text(c.recv_message(dl)))
+    c.close(1000, "done", dl).unwrap()
+    print(msg_text(c.recv_message(dl)))
+    c.drop_connection()
+
+    print("-- three WebSockets at once on one h2 connection")
+    let mut tasks: List[Task[i32]] = List.new()
+    for i in 0..3 {
+        let hh = hc
+        tasks.push(spawn(|| -> i32 {
+            let mut cc = ws.dial_h2(hh, "/chat", List.new(), dopts(false), time.after(time.seconds(20))).unwrap()
+            let mut bad = 0
+            for j in 0..20 {
+                let mut m = repeated("stream ", 3)
+                m.extend(bytes.from_i64(i as i64))
+                m.push(32)
+                m.extend(bytes.from_i64(j as i64))
+                cc.send_text(String.from_bytes(m).unwrap(), time.after(time.seconds(20))).unwrap()
+                match cc.recv_message(time.after(time.seconds(20))) {
+                    Ok(ws.Text(t)) => {
+                        let mut want = repeated("stream ", 3)
+                        want.extend(bytes.from_i64(i as i64))
+                        want.push(32)
+                        want.extend(bytes.from_i64(j as i64))
+                        if !bytes.eq(t.bytes(), want) { bad += 1 }
+                    }
+                    other => { bad += 1 }
+                }
+            }
+            cc.drop_connection()
+            bad
+        }))
+    }
+    let mut failures = 0
+    for t in tasks { failures += t.join() }
+    print(cat("failures: ", failures.to_string()))
+
+    print("-- permessage-deflate over h2")
+    let mut z = ws.dial_h2(hc, "/z", List.new(), dopts(true), dl).unwrap()
+    io.outln(z.extensions)
+    let long = String.from_bytes(repeated("hello hello hello ", 100)).unwrap()
+    z.send_text(long.copy(), dl).unwrap()
+    let zf = z.recv_frame(dl).unwrap()
+    print(cat("rsv1=", cs(zf.rsv1.to_string(), cat(" smaller=", (zf.payload.len() < long.len()).to_string()))))
+    z.send_text(long.copy(), dl).unwrap()
+    let zf2 = z.recv_frame(dl).unwrap()
+    print(cat("second smaller (window kept)=", (zf2.payload.len() < zf.payload.len()).to_string()))
+    let mut bomb: List[u8] = List.new()
+    for i in 0..(3000000 as usize) { bomb.push(48) }
+    z.send_binary(bomb, dl).unwrap()
+    print(cat("a message over max_message when inflated: ", frame_text(z.recv_frame(dl))))
+    z.drop_connection()
+
+    print("-- the server sends first and closes")
+    let mut g = ws.dial_h2(hc, "/greet", List.new(), dopts(false), dl).unwrap()
+    print(msg_text(g.recv_message(dl)))
+    print(msg_text(g.recv_message(dl)))
+    g.drop_connection()
+
+    print("-- refusals: an unknown path, another :protocol")
+    match ws.dial_h2(hc, "/nowhere", List.new(), dopts(false), dl) {
+        Ok(x) => print("opened?")
+        Err(e) => print(cat("dial_h2: ", e))
+    }
+    let mut hs: List[http.Header] = List.new()
+    hs.push(hd(":method", "CONNECT"))
+    hs.push(hd(":protocol", "other"))
+    hs.push(hd(":scheme", "http"))
+    hs.push(hd(":path", "/chat"))
+    hs.push(hd(":authority", "test"))
+    let st = hc.open(hs, false, dl).unwrap()
+    let head = st.headers(dl).unwrap()
+    for f in head {
+        if f.name.len() > 0 && f.name[0] == 58 { print(cs(txt(f.name), cat(" ", txt(f.value)))) }
+    }
+    st.release()
+
+    print("-- the 200 has no Sec-WebSocket-Accept or Upgrade")
+    let mut hs2: List[http.Header] = List.new()
+    hs2.push(hd(":method", "CONNECT"))
+    hs2.push(hd(":protocol", "websocket"))
+    hs2.push(hd(":scheme", "http"))
+    hs2.push(hd(":path", "/chat"))
+    hs2.push(hd(":authority", "test"))
+    hs2.push(hd("sec-websocket-version", "13"))
+    hs2.push(hd("sec-websocket-protocol", "chat.v1"))
+    let st2 = hc.open(hs2, false, dl).unwrap()
+    let head2 = st2.headers(dl).unwrap()
+    for f in head2 { print(cs(txt(f.name), cat(": ", txt(f.value)))) }
+    st2.release()
+    // a wrong version is 426, as over HTTP/1.1
+    let mut hs3: List[http.Header] = List.new()
+    hs3.push(hd(":method", "CONNECT"))
+    hs3.push(hd(":protocol", "websocket"))
+    hs3.push(hd(":scheme", "http"))
+    hs3.push(hd(":path", "/chat"))
+    hs3.push(hd(":authority", "test"))
+    hs3.push(hd("sec-websocket-version", "8"))
+    let st3 = hc.open(hs3, false, dl).unwrap()
+    for f in st3.headers(dl).unwrap() {
+        if f.name.len() > 0 && (f.name[0] == 58 || http.eq_s(f.name, "sec-websocket-version")) { print(cs(txt(f.name), cat(": ", txt(f.value)))) }
+    }
+    st3.release()
+
+    hc.shutdown()
+    time.sleep_ms(100)
+    hc.close()
+    let z0 = srv.join()
+
+    print("-- a server that has not enabled it")
+    let (hc2, srv2) = start(h2.options())
+    print(hc2.conn.wait_connect_protocol(dl))
+    match ws.dial_h2(hc2, "/chat", List.new(), dopts(false), dl) {
+        Ok(x) => print("opened?")
+        Err(e) => print(cat("dial_h2: ", e))
+    }
+    hc2.shutdown()
+    time.sleep_ms(100)
+    hc2.close()
+    let z1 = srv2.join()
+
+    raw_part()
+    print("done")
+}
+
+// ---- a hand-made client, to send what ws.dial_h2 and h2.Client refuse to
+
+fn raw_request(enabled: bool, hs: List[http.Header]) uses net, io, clock, threads {
+    let p = net.pair(net.STREAM).unwrap()
+    let z1 = fd.set_nonblocking(p.r, true)
+    let z2 = fd.set_nonblocking(p.w, true)
+    let sw = h2.wire_of_transport(transport.plain(p.w))
+    let mut opt = h2.options()
+    opt.connect_protocol = enabled
+    let h = h2.handler(app(), lit("test-peer"), List.new())
+    let t = spawn(|| -> i32 {
+        let z = h2.serve(sw, opt, h)
+        0
+    })
+    let mut enc = hpack.encoder(4096)
+    let mut blk: List[u8] = List.new()
+    enc.encode(hs, inout blk)
+    let mut wire = h2frame.preface()
+    wire.extend(h2frame.settings(List.new()))
+    wire.extend(h2frame.settings_ack())
+    wire.extend(h2frame.headers(1, blk, false, 16384))
+    net.send_all(p.r, wire).unwrap()
+    let mut dec = h2frame.decoder(16384)
+    let dl = time.after(time.seconds(10))
+    let mut done = false
+    let mut advertised = false
+    while !done {
+        match dec.next() {
+            h2frame.Got(f) => {
+                if f.kind == h2frame.SETTINGS && (f.flags & h2frame.ACK) == 0 {
+                    for e in h2frame.parse_settings(f.payload) {
+                        if e.id == h2frame.ENABLE_CONNECT_PROTOCOL { advertised = e.value == 1 }
+                    }
+                }
+                if f.kind == h2frame.RST_STREAM {
+                    print(cat("RST_STREAM ", h2frame.code_name(h2frame.u32_of(f.payload, 0))))
+                    done = true
+                }
+                if f.kind == h2frame.HEADERS {
+                    print("HEADERS (the request was accepted)")
+                    done = true
+                }
+                if f.kind == h2frame.GOAWAY {
+                    print("GOAWAY")
+                    done = true
+                }
+            }
+            h2frame.NeedMore => {
+                match fd.read_by(p.r, 65536, dl) {
+                    Ok(Some(b)) => {
+                        if b.len() == 0 { done = true } else { dec.feed(b) }
+                    }
+                    other => { done = true }
+                }
+            }
+            h2frame.Fail(code, why) => { done = true }
+        }
+    }
+    print(cat("setting advertised: ", advertised.to_string()))
+    let z3 = net.shutdown(p.r, net.SHUT_WRITE)
+    let z4 = t.join()
+}
+
+fn ext_connect(path: str, with_path: bool) -> List[http.Header] {
+    let mut hs: List[http.Header] = List.new()
+    hs.push(hd(":method", "CONNECT"))
+    hs.push(hd(":protocol", "websocket"))
+    hs.push(hd(":scheme", "http"))
+    if with_path { hs.push(hd(":path", path)) }
+    hs.push(hd(":authority", "test"))
+    hs.push(hd("sec-websocket-version", "13"))
+    hs
+}
+
+fn raw_part() uses net, io, clock, threads {
+    print("-- raw: :protocol when the server did not advertise the setting")
+    raw_request(false, ext_connect("/chat", true))
+    print("-- raw: extended CONNECT when it did")
+    raw_request(true, ext_connect("/chat", true))
+    print("-- raw: extended CONNECT without :path")
+    raw_request(true, ext_connect("/chat", false))
+    print("-- raw: :protocol on a GET")
+    let mut hs: List[http.Header] = List.new()
+    hs.push(hd(":method", "GET"))
+    hs.push(hd(":protocol", "websocket"))
+    hs.push(hd(":scheme", "http"))
+    hs.push(hd(":path", "/hello"))
+    hs.push(hd(":authority", "test"))
+    raw_request(true, hs)
+    print("-- raw: a plain CONNECT (no :protocol) is still the tunnel form: no :path, no :scheme")
+    let mut hs2: List[http.Header] = List.new()
+    hs2.push(hd(":method", "CONNECT"))
+    hs2.push(hd(":path", "/chat"))
+    hs2.push(hd(":authority", "test"))
+    raw_request(true, hs2)
+}

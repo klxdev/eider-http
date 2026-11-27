@@ -172,13 +172,16 @@ pub type Options = {
     idle: time.Duration,
     /// RST_STREAMs from the peer tolerated per 10 seconds
     max_resets: u32,
+    /// a server: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441) and accept extended CONNECT
+    /// (`:protocol`; `handler` gives the request to the handler without waiting for a body: WebSocket, `ws.accept`)
+    connect_protocol: bool,
 }
 
 /// 100 concurrent streams, 1 MiB stream windows and a 4 MiB connection window, 16 KiB frames, 64 KiB
 /// of headers, the default 4 KiB HPACK table, 1 MiB request bodies in `handler`, 10 s for SETTINGS and
-/// for every write, no idle limit, 400 resets per 10 s.
+/// for every write, no idle limit, 400 resets per 10 s, no extended CONNECT.
 pub fn options() -> Options {
-    Options(100, 1048576, 4194304, 16384, 65536, 4096, 1048576, time.seconds(10), time.seconds(10), time.zero(), 400)
+    Options(100, 1048576, 4194304, 16384, 65536, 4096, 1048576, time.seconds(10), time.seconds(10), time.zero(), 400, false)
 }
 
 // ---- the state of a connection and its streams ----
@@ -242,10 +245,12 @@ type Core = {
     got_settings: bool,
     settings_acked: bool,
     last_frame_ms: i64,
+    /// the peer's SETTINGS_ENABLE_CONNECT_PROTOCOL: 0 not known (no SETTINGS yet), 1 on, 2 off
+    peer_connect: i32,
 }
 
 fn new_core(client: bool, opt: Options) -> Core {
-    Core(Map.new(), 65535, 65535, 0, 65535, 16384, 100, if client { 1 } else { 2 }, 0, 0, -1, 0, false, false, String.from(""), 0, List.new(), List.new(), List.new(), false, List.new(), 0, 0, false, false, 0)
+    Core(Map.new(), 65535, 65535, 0, 65535, 16384, 100, if client { 1 } else { 2 }, 0, 0, -1, 0, false, false, String.from(""), 0, List.new(), List.new(), List.new(), false, List.new(), 0, 0, false, false, 0, 0)
 }
 
 /// A connection (a handle: copies share it).
@@ -854,10 +859,18 @@ fn check_fields(hs: List[http.Header], kind: i32) -> Result[(), String] {
             Some(v) => v
             None => { return Err(String.from("a request without :method")) }
         }
-        if http.eq_s(m, "CONNECT") {
+        if http.eq_s(m, "CONNECT") && http.find_s(hs, ":protocol").is_some() {
+            // extended CONNECT (RFC 8441): a full request line plus :protocol
+            if http.find_s(hs, ":authority").is_none() || http.find_s(hs, ":scheme").is_none() { return Err(String.from("extended CONNECT without :scheme or :authority")) }
+            match http.find_s(hs, ":path") {
+                Some(p) => { if p.len() == 0 { return Err(String.from("an empty :path")) } }
+                None => { return Err(String.from("extended CONNECT without :path")) }
+            }
+        } else if http.eq_s(m, "CONNECT") {
             if http.find_s(hs, ":authority").is_none() { return Err(String.from("CONNECT without :authority")) }
             if http.find_s(hs, ":path").is_some() || http.find_s(hs, ":scheme").is_some() { return Err(String.from("CONNECT with :path or :scheme")) }
         } else {
+            if http.find_s(hs, ":protocol").is_some() { return Err(String.from(":protocol on a request that is not CONNECT")) }
             if http.find_s(hs, ":scheme").is_none() { return Err(String.from("a request without :scheme")) }
             match http.find_s(hs, ":path") {
                 Some(p) => { if p.len() == 0 { return Err(String.from("an empty :path")) } }
@@ -963,6 +976,7 @@ fn on_settings(c: Conn, f: h2frame.Frame) -> Result[(), Error] uses io, clock {
     }
     let entries = h2frame.parse_settings(f.payload)
     let bad = c.core.modify(|inout k: Core| -> Option[Error] {
+        k.peer_connect = 2
         for e in entries {
             if e.id == h2frame.INITIAL_WINDOW_SIZE {
                 if e.value > 2147483647 { return Some(fatal(h2frame.FLOW_CONTROL_ERROR, "SETTINGS_INITIAL_WINDOW_SIZE is over 2^31-1")) }
@@ -987,6 +1001,9 @@ fn on_settings(c: Conn, f: h2frame.Frame) -> Result[(), Error] uses io, clock {
             } else if e.id == h2frame.MAX_CONCURRENT_STREAMS {
                 k.peer_streams = e.value as i64
                 wake(k.owait)
+            } else if e.id == h2frame.ENABLE_CONNECT_PROTOCOL {
+                if e.value > 1 { return Some(fatal(h2frame.PROTOCOL_ERROR, "SETTINGS_ENABLE_CONNECT_PROTOCOL is not 0 or 1")) }
+                k.peer_connect = if e.value == 1 { 1 } else { 2 }
             }
         }
         wake(k.wwait)
@@ -1292,6 +1309,8 @@ fn process_block(c: Conn, inout rd: Rd, id: u32, block: List[u8], end: bool, h: 
                 }
             }
             if !bad && end && clen > 0 { bad = true }
+            // :protocol needs the setting we advertised (RFC 8441 section 4)
+            if !bad && !c.opt.connect_protocol && http.find_s(fields, ":protocol").is_some() { bad = true }
             let code: u32 = if dec.too_large { h2frame.ENHANCE_YOUR_CALM } else { h2frame.PROTOCOL_ERROR }
             let win = c.opt.stream_window as i64
             let max = c.opt.max_streams as i64
@@ -1520,6 +1539,7 @@ fn first_frames(opt: Options, client: bool) -> List[List[u8]] {
     s.push(h2frame.Setting(h2frame.INITIAL_WINDOW_SIZE, opt.stream_window))
     if opt.max_frame != 16384 { s.push(h2frame.Setting(h2frame.MAX_FRAME_SIZE, opt.max_frame as u32)) }
     s.push(h2frame.Setting(h2frame.MAX_HEADER_LIST_SIZE, opt.max_header_list as u32))
+    if !client && opt.connect_protocol { s.push(h2frame.Setting(h2frame.ENABLE_CONNECT_PROTOCOL, 1)) }
     let mut out: List[List[u8]] = List.new()
     if client { out.push(h2frame.preface()) }
     out.push(h2frame.settings(s))
@@ -1707,6 +1727,10 @@ impl Conn {
             Ok(z) => {}
             Err(why) => { return Err(Error(ERR_INVALID, 0, why)) }
         }
+        if http.find_s(hs, ":protocol").is_some() {
+            let on = self.core.modify(|inout k: Core| -> bool { k.peer_connect == 1 })
+            if !on { return Err(err(ERR_STATE, 0, "the peer has not enabled extended CONNECT (SETTINGS_ENABLE_CONNECT_PROTOCOL)")) }
+        }
         let rpk = sync.parker()
         let wpk = sync.parker()
         let win = self.opt.stream_window as i64
@@ -1773,6 +1797,22 @@ impl Conn {
             }
         }
         Err(err(ERR_STATE, 0, "unreachable"))
+    }
+
+    /// Whether the peer allows extended CONNECT (RFC 8441: its SETTINGS_ENABLE_CONNECT_PROTOCOL), waiting
+    /// until `dl` for its SETTINGS; false when it does not or the connection is closed.
+    fn wait_connect_protocol(self, dl: time.Deadline) -> bool uses io, clock {
+        while true {
+            let st = self.core.modify(|inout k: Core| -> i32 {
+                if k.peer_connect != 0 { return k.peer_connect }
+                if k.closed { return 2 }
+                0
+            })
+            if st == 1 { return true }
+            if st == 2 || dl.expired() { return false }
+            time.sleep_ms(2)
+        }
+        false
     }
 
     /// A PING and its acknowledgement: the round trip, or a timeout.
@@ -1891,10 +1931,13 @@ pub fn handler(h: http.Handler, peer: List[u8], ctx: List[http.Header]) -> Strea
         let mut method: List[u8] = List.new()
         let mut target: List[u8] = List.new()
         let mut authority: List[u8] = List.new()
+        let mut protocol: List[u8] = List.new()
         let mut fields: List[http.Header] = List.new()
         for f in hs {
             if http.eq_s(f.name, ":method") {
                 method = f.value
+            } else if http.eq_s(f.name, ":protocol") {
+                protocol = f.value
             } else if http.eq_s(f.name, ":path") {
                 target = f.value
             } else if http.eq_s(f.name, ":authority") {
@@ -1907,7 +1950,9 @@ pub fn handler(h: http.Handler, peer: List[u8], ctx: List[http.Header]) -> Strea
         // the body, buffered
         let mut body: List[u8] = List.new()
         let mut too_big = false
-        while true {
+        // an extended CONNECT (RFC 8441) has no body to buffer: its DATA is the tunnel the handler's response takes over
+        let connect = protocol.len() > 0
+        while !connect {
             match s.read(65536, time.never()) {
                 Ok(b) => {
                     if b.len() == 0 { break }
@@ -1932,6 +1977,7 @@ pub fn handler(h: http.Handler, peer: List[u8], ctx: List[http.Header]) -> Strea
             req.keep_alive = true
             for c in ctx { req.ctx.push(c) }
             req.set_ctx("protocol", "h2".bytes())
+            if connect { req.set_ctx("h2_protocol", protocol) }
             match s.trailers() {
                 Some(t) => { for f in t { req.headers.push(f) } }
                 None => {}
@@ -1941,11 +1987,13 @@ pub fn handler(h: http.Handler, peer: List[u8], ctx: List[http.Header]) -> Strea
                 Err(why) => { resp = http.error_response(500) }
             }
         }
-        send_response(s, resp, http.eq_s(method, "HEAD"))
+        send_response(s, resp, http.eq_s(method, "HEAD"), connect)
     }
 }
 
-fn send_response(s: Stream, resp: http.Response, head_only: bool) uses io, clock {
+/// `connect`: the request was an extended CONNECT, so a raw `http.Stream` with status 200 runs on the
+/// stream's DATA (reads and writes); the response has no 101 (RFC 8441).
+fn send_response(s: Stream, resp: http.Response, head_only: bool, connect: bool) uses io, clock {
     let mut hs: List[http.Header] = List.new()
     let code = resp.status.to_string()
     hs.push(http.Header(":status".bytes(), code.bytes()))
@@ -1960,7 +2008,7 @@ fn send_response(s: Stream, resp: http.Response, head_only: bool) uses io, clock
     let none = bodyless_status(resp.status)
     match resp.stream {
         Some(stm) => {
-            if stm.raw {
+            if stm.raw && !(connect && resp.status == 200) {
                 let mut e: List[http.Header] = List.new()
                 e.push(http.Header(":status".bytes(), "501".bytes()))
                 let z = s.send_headers(e, true)
@@ -1979,8 +2027,16 @@ fn send_response(s: Stream, resp: http.Response, head_only: bool) uses io, clock
                     Err(e) => { Err(stream.error(stream.BrokenPipe, e.why)) }
                 }
             }
+            let raw = stm.raw
             let recv = |max: usize, dl: time.Deadline| -> Result[List[u8], stream.Error] {
-                Err(stream.error(stream.Unsupported, "a streamed response has nothing to read"))
+                if !raw { return Err(stream.error(stream.Unsupported, "a streamed response has nothing to read")) }
+                match s.read(max, dl) {
+                    Ok(b) => { Ok(b) }
+                    Err(e) => {
+                        if e.kind == ERR_TIMEOUT { return Err(stream.error(stream.TimedOut, "timed out")) }
+                        Err(stream.error_text(stream.BrokenPipe, e.why))
+                    }
+                }
             }
             let stopping = || -> bool { s.conn.failure().is_some() }
             let dx = http.Duplex(recv, send, stopping)

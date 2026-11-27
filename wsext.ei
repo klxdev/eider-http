@@ -1,0 +1,251 @@
+//! http/wsext: the permessage-deflate extension (RFC 7692) for http/ws: the `Sec-WebSocket-Extensions`
+//! negotiation, and the codec that compresses and decompresses one message.
+//!
+//! Negotiation (`negotiate_server`, `parse_response`): offers are parsed with their parameters
+//! (`server_no_context_takeover`, `client_no_context_takeover`, `server_max_window_bits`,
+//! `client_max_window_bits`, each at most once, with no value for the first two and a value of 8 to
+//! 15 for the others). A server takes the first offer it can honour and declines (does not echo) one
+//! with an unknown or invalid parameter or one asking for `server_max_window_bits` under 15, because
+//! the deflate encoder of eider-compression always uses a 32 KiB window; an offer of
+//! `client_max_window_bits` is no problem (our decoder takes any window up to 32 KiB) and is echoed
+//! when it came with a value.
+//!
+//! The codec: a message is compressed as raw DEFLATE with a sync flush, the final `00 00 ff ff` is
+//! removed (`Tx.deflate`); a received message gets it appended again and is inflated (`Rx.inflate`) into
+//! at most `max` bytes (the inflater stops before it produces more: a decompression bomb is an error
+//! (`TooLarge`) and the connection closes with 1009). With context takeover the 32 KiB window stays
+//! between messages; without it each message starts fresh. A message with a BFINAL block is accepted
+//! (the window carries over to the next message by way of a preset dictionary). Control frames are never
+//! compressed (http/ws does not offer them to the codec).
+
+import core.sys
+import std.bytes
+import compression
+import compression.deflate
+import http
+
+/// The parameters in force for one connection, from the negotiation.
+/// `server_no_takeover`/`client_no_takeover`: that side's compressor starts every message anew;
+/// `client_bits`: the `client_max_window_bits` the server echoes (0: none).
+pub type Params = { server_no_takeover: bool, client_no_takeover: bool, client_bits: i32 }
+
+/// One extension offer, parsed: `pmd` is true for permessage-deflate; `valid` false when a parameter is
+/// unknown, repeated, or has a wrong value (`why` says); `client_bits_offered`: the offer had
+/// `client_max_window_bits`, with `client_bits` its value (0: no value).
+pub type Offer = {
+    pmd: bool,
+    valid: bool,
+    why: String,
+    server_no_takeover: bool,
+    client_no_takeover: bool,
+    server_bits: i32,
+    client_bits_offered: bool,
+    client_bits: i32,
+}
+
+fn offer_none() -> Offer { Offer(false, true, String.from(""), false, false, 0, false, 0) }
+
+fn bits_value(v: List[u8]) -> i32 {
+    if v.len() == 0 || v.len() > 2 { return 0 }
+    let mut n: i32 = 0
+    for ch in v {
+        if ch < 48 || ch > 57 { return 0 }
+        n = n * 10 + ((ch - 48) as i32)
+    }
+    if n < 8 || n > 15 { return 0 }
+    n
+}
+
+fn unquote(v: List[u8]) -> List[u8] {
+    if v.len() >= 2 && v[0] == 34 && v[v.len() - 1] == 34 { return bytes.slice(v, 1, v.len() - 1) }
+    v
+}
+
+/// Parses one element of a `Sec-WebSocket-Extensions` value ("permessage-deflate; client_max_window_bits=12").
+pub fn parse_offer(item: List[u8]) -> Offer {
+    let parts = bytes.split(item, 59)
+    let name = http.lower(http.trim_ows(parts[0]))
+    if !bytes.eq(name, sys.lit("permessage-deflate")) { return offer_none() }
+    let mut o = Offer(true, true, String.from(""), false, false, 0, false, 0)
+    let mut seen_sn = false
+    let mut seen_cn = false
+    let mut seen_sb = false
+    let mut seen_cb = false
+    for i in (1 as usize)..parts.len() {
+        let p = http.trim_ows(parts[i])
+        if p.len() == 0 { continue }
+        let mut key = p.copy()
+        let mut val: List[u8] = List.new()
+        let mut has_val = false
+        match bytes.find_byte(p, 61, 0) {
+            Some(k) => {
+                key = http.trim_ows(bytes.slice(p, 0, k))
+                val = unquote(http.trim_ows(bytes.slice(p, k + 1, p.len())))
+                has_val = true
+            }
+            None => {}
+        }
+        key = http.lower(key)
+        if bytes.eq(key, sys.lit("server_no_context_takeover")) {
+            if seen_sn || has_val { o.valid = false }
+            seen_sn = true
+            o.server_no_takeover = true
+        } else if bytes.eq(key, sys.lit("client_no_context_takeover")) {
+            if seen_cn || has_val { o.valid = false }
+            seen_cn = true
+            o.client_no_takeover = true
+        } else if bytes.eq(key, sys.lit("server_max_window_bits")) {
+            if seen_sb || !has_val || bits_value(val) == 0 { o.valid = false }
+            seen_sb = true
+            o.server_bits = bits_value(val)
+        } else if bytes.eq(key, sys.lit("client_max_window_bits")) {
+            if seen_cb { o.valid = false }
+            if has_val && bits_value(val) == 0 { o.valid = false }
+            seen_cb = true
+            o.client_bits_offered = true
+            if has_val { o.client_bits = bits_value(val) }
+        } else {
+            o.valid = false
+        }
+    }
+    if !o.valid { o.why = String.from("a bad permessage-deflate parameter") }
+    o
+}
+
+/// The values of every `Sec-WebSocket-Extensions` header of `hs`, split at commas.
+pub fn extension_items(hs: List[http.Header]) -> List[List[u8]] {
+    let mut out: List[List[u8]] = List.new()
+    for h in hs {
+        if http.eq_s(http.lower(h.name), "sec-websocket-extensions") {
+            for it in http.list_items(h.value) { out.push(it) }
+        }
+    }
+    out
+}
+
+/// What a server answers.
+pub type Accepted = { params: Params, header: List[u8] }
+
+/// The server's side of the negotiation: the first permessage-deflate offer in `items` (see
+/// `extension_items`) that is valid and asks for nothing we cannot do. `force_no_takeover` makes the
+/// server ask for no context takeover in both directions (the client must then comply). None: no
+/// extension (the response has no `Sec-WebSocket-Extensions`).
+pub fn negotiate_server(items: List[List[u8]], force_no_takeover: bool) -> Option[Accepted] {
+    for it in items {
+        let o = parse_offer(it)
+        if !o.pmd || !o.valid { continue }
+        if o.server_bits != 0 && o.server_bits < 15 { continue }
+        let sn = o.server_no_takeover || force_no_takeover
+        let cn = o.client_no_takeover || force_no_takeover
+        let mut h = sys.lit("permessage-deflate")
+        if sn { bytes.append(inout h, sys.lit("; server_no_context_takeover")) }
+        if cn { bytes.append(inout h, sys.lit("; client_no_context_takeover")) }
+        let mut cb: i32 = 0
+        if o.client_bits_offered && o.client_bits != 0 {
+            cb = o.client_bits
+            bytes.append(inout h, sys.lit("; client_max_window_bits="))
+            bytes.append(inout h, bytes.from_i64(cb as i64))
+        }
+        return Some(Accepted(Params(sn, cn, cb), h))
+    }
+    None
+}
+
+/// The offer a client sends: plain permessage-deflate, with `client_no_context_takeover` and
+/// `server_no_context_takeover` when `no_takeover` asks for them.
+pub fn client_offer(no_takeover: bool) -> List[u8] {
+    let mut h = sys.lit("permessage-deflate")
+    if no_takeover { bytes.append(inout h, sys.lit("; client_no_context_takeover; server_no_context_takeover")) }
+    h
+}
+
+/// A client's reading of the server's `Sec-WebSocket-Extensions` answer (`items` from `extension_items`):
+/// None when it has no extensions, `Err` when it names an extension we did not offer or parameters we
+/// cannot honour (`client_max_window_bits`, which `client_offer` does not offer: our encoder's window is
+/// fixed), else the Params.
+pub fn parse_response(items: List[List[u8]]) -> Result[Option[Params], String] {
+    if items.len() == 0 { return Ok(None) }
+    if items.len() > 1 { return Err(String.from("the server accepted more than one extension")) }
+    let o = parse_offer(items[0])
+    if !o.pmd { return Err(String.from("the server chose an extension that was not offered")) }
+    if !o.valid { return Err(String.from("the server's permessage-deflate parameters are invalid")) }
+    if o.client_bits_offered { return Err(String.from("the server sent client_max_window_bits, which was not offered")) }
+    Ok(Some(Params(o.server_no_takeover, o.client_no_takeover, 0)))
+}
+
+// ---- the codec
+
+/// The receiving half: an inflater, `reset` for no context takeover, `max` the decompressed size cap
+/// per message.
+pub type Rx = { inf: deflate.Inflater, reset: bool, max: usize }
+
+/// The sending half: a deflater, its `level`, `reset` for no context takeover, and `min`, the shortest
+/// message worth compressing.
+pub type Tx = { def: deflate.Deflater, level: i32, reset: bool, min: usize }
+
+fn per_message(max: usize, base: u64) -> compression.Limits { compression.Limits(base + (max as u64), 0, 0, 0, 65536) }
+
+/// A receiving half for messages of at most `max` bytes.
+pub fn rx(reset: bool, max: usize) -> Rx { Rx(deflate.inflater(per_message(max, 0)), reset, max) }
+
+/// A sending half at `level` (-1: the default).
+pub fn tx(level: i32, reset: bool, min: usize) -> Tx { Tx(deflate.deflater(level), level, reset, min) }
+
+impl Rx {
+    /// The message that `data` (a compressed message with its final `00 00 ff ff` removed) holds, which
+    /// may not be longer than `max` bytes. `TooLarge` when it would be; the other errors are invalid data.
+    fn inflate(inout self, data: List[u8]) -> Result[List[u8], compression.Error] {
+        if self.reset {
+            self.inf.reset(per_message(self.max, 0))
+        } else {
+            self.inf.lim = per_message(self.max, self.inf.produced())
+        }
+        let mut inp = data.copy()
+        inp.push(0)
+        inp.push(0)
+        inp.push(255)
+        inp.push(255)
+        let mut out: List[u8] = List.new()
+        self.inf.feed(inp, inout out)?
+        if self.inf.done() {
+            // the sender ended its stream with a BFINAL block: the next message goes on from this window
+            let h = self.inf.hist.copy()
+            let mut fresh = deflate.inflater(per_message(self.max, 0))
+            fresh.set_dictionary(h)
+            self.inf = fresh
+        }
+        Ok(out)
+    }
+}
+
+impl Tx {
+    /// Whether a message of `n` bytes is compressed.
+    fn wants(self, n: usize) -> bool { n > 0 && n >= self.min }
+
+    /// `data` compressed (raw DEFLATE, sync-flushed, the trailing `00 00 ff ff` removed).
+    fn deflate(inout self, data: List[u8]) -> Result[List[u8], compression.Error] {
+        if self.reset { self.def = deflate.deflater(self.level) }
+        let mut out: List[u8] = List.new()
+        self.def.write(data, inout out)?
+        self.def.flush(inout out)?
+        Ok(bytes.slice(out, 0, out.len() - 4))
+    }
+}
+
+/// `Rx.inflate` on the half held in `slot` (a List of zero or one: how a connection keeps an optional
+/// half it mutates in place): None when there is none.
+pub fn rx_inflate(inout slot: List[Rx], data: List[u8]) -> Option[Result[List[u8], compression.Error]] {
+    if slot.len() == 0 { return None }
+    Some(slot[0].inflate(data))
+}
+
+/// `Tx.deflate` on the half in `slot`, when there is one and it wants a message of `data.len()` bytes:
+/// Some(compressed); None: send the message as it is.
+pub fn tx_deflate(inout slot: List[Tx], data: List[u8]) -> Option[List[u8]] {
+    if slot.len() == 0 { return None }
+    if !slot[0].wants(data.len()) { return None }
+    match slot[0].deflate(data) {
+        Ok(c) => Some(c)
+        Err(e) => None
+    }
+}

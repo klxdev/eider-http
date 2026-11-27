@@ -22,7 +22,7 @@
 //!     })
 //!
 //! What the connection enforces, with the close code it answers: client frames must be masked,
-//! reserved bits and extensions are not supported (1002); a control frame is at most 125 bytes
+//! reserved bits are not allowed except RSV1 when permessage-deflate was negotiated (1002); a control frame is at most 125 bytes
 //! and not fragmented (1002); a frame longer than `max_frame` or a message (fragments joined)
 //! longer than `max_message` is 1009; text must be UTF-8 (1007); an unknown opcode or a
 //! continuation without a start is 1002. A ping is answered with a pong by `recv`, a close is
@@ -32,7 +32,11 @@
 //!
 //! The codec is separate (`encode_frame`, `Decoder`), and so is SHA-1 (`sha1`), which the
 //! handshake needs and no std module has; it is the plain algorithm, tested against its published
-//! vectors. Not here: permessage-deflate and other extensions, TLS (use a proxy).
+//! vectors. Extensions: only permessage-deflate (RFC 7692), off unless `Options.with_deflate()` /
+//! `DialOptions.deflate` ask for it (http/wsext, docs/ws-extensions.md); the size of what a compressed
+//! message inflates to is capped by `max_message` (1009). Over HTTP/2 (RFC 8441): `accept` also takes an
+//! extended CONNECT (`h2.Options.connect_protocol`) and answers 200, and `dial_h2` opens one from an
+//! `h2.Client`. Not here: other extensions, TLS (use a proxy, or `http/secure`).
 //!
 //! Client: `dial(addr, target, deadline)` performs the handshake over a client.Conn and returns a
 //! `Client` that masks what it sends; `send_text`, `send_binary`, `recv`, `close`. `dial_conn(c, ...)` does
@@ -53,6 +57,10 @@ import std.utf8
 import http
 import http.client
 import http.transport
+import http.h2 as h2x
+import http.h2frame
+import http.wsext
+import compression
 
 // ---- SHA-1 (FIPS 180-4), in u64 arithmetic masked to 32 bits
 
@@ -147,14 +155,21 @@ pub const CLOSE: u8 = 8
 pub const PING: u8 = 9
 pub const PONG: u8 = 10
 
-/// A frame on the wire: `payload` is unmasked.
-pub type Frame = { fin: bool, opcode: u8, payload: List[u8] }
+/// A frame on the wire: `payload` is unmasked; `rsv1` is the RSV1 bit (permessage-deflate: the first
+/// frame of a compressed message), only ever set when the decoder was made with `decoder_ext`.
+pub type Frame = { fin: bool, opcode: u8, payload: List[u8], rsv1: bool }
 
 /// A frame as bytes. `mask` is a 4-byte key (clients must mask; servers must not): empty for none.
 pub fn encode_frame(fin: bool, opcode: u8, payload: List[u8], mask: List[u8]) -> List[u8] {
+    encode_frame_ext(fin, false, opcode, payload, mask)
+}
+
+/// `encode_frame` with the RSV1 bit `rsv1` (permessage-deflate marks a compressed message's first frame).
+pub fn encode_frame_ext(fin: bool, rsv1: bool, opcode: u8, payload: List[u8], mask: List[u8]) -> List[u8] {
     let mut out: List[u8] = List.new()
     let fin_bit: u8 = if fin { 128 } else { 0 }
-    out.push(fin_bit | opcode)
+    let rsv_bit: u8 = if rsv1 { 64 } else { 0 }
+    out.push(fin_bit | rsv_bit | opcode)
     let m: u8 = if mask.len() == 4 { 128 } else { 0 }
     let n = payload.len()
     if n < 126 {
@@ -184,9 +199,13 @@ pub fn encode_frame(fin: bool, opcode: u8, payload: List[u8], mask: List[u8]) ->
 pub type Step = | NeedMore | Got(f: Frame) | Fail(code: i32, why: String)
 
 /// An incremental frame decoder. `server` true: the peer is a client, so frames must be masked.
-pub type Decoder = { buf: List[u8], pos: usize, server: bool, max_frame: usize }
+/// `rsv1_ok`: RSV1 may be set (on the first frame of a data message): permessage-deflate was negotiated.
+pub type Decoder = { buf: List[u8], pos: usize, server: bool, max_frame: usize, rsv1_ok: bool }
 
-pub fn decoder(server: bool, max_frame: usize) -> Decoder { Decoder(List.new(), 0, server, max_frame) }
+pub fn decoder(server: bool, max_frame: usize) -> Decoder { Decoder(List.new(), 0, server, max_frame, false) }
+
+/// A decoder that accepts RSV1 on a data message's first frame (permessage-deflate is in force).
+pub fn decoder_ext(server: bool, max_frame: usize) -> Decoder { Decoder(List.new(), 0, server, max_frame, true) }
 
 fn fail(code: i32, why: str) -> Step { Fail(code, String.from(why)) }
 
@@ -205,8 +224,11 @@ impl Decoder {
         if have < 2 { return NeedMore }
         let b0 = b[p]
         let b1 = b[p + 1]
-        if (b0 & 112) != 0 { return fail(1002, "reserved bits are set (no extensions are negotiated)") }
+        if (b0 & 48) != 0 { return fail(1002, "reserved bits are set (no extensions are negotiated)") }
+        let rsv1 = (b0 & 64) != 0
+        if rsv1 && !self.rsv1_ok { return fail(1002, "reserved bits are set (no extensions are negotiated)") }
         let opcode = b0 & 15
+        if rsv1 && (opcode >= 8 || opcode == CONTINUATION) { return fail(1002, "RSV1 on a control or continuation frame") }
         let fin = (b0 & 128) != 0
         let masked = (b1 & 128) != 0
         let mut len: u64 = (b1 & 127) as u64
@@ -245,7 +267,7 @@ impl Decoder {
             self.buf = bytes.slice(self.buf, self.pos, self.buf.len())
             self.pos = 0
         }
-        Got(Frame(fin, opcode, payload))
+        Got(Frame(fin, opcode, payload, rsv1))
     }
 }
 
@@ -276,17 +298,25 @@ fn close_payload(code: i32, reason: List[u8]) -> List[u8] {
 /// - `protocols`: subprotocols the server speaks, in preference order (the first one the client
 ///   offers is chosen; none offered or none in common: no subprotocol);
 /// - `max_frame`, `max_message`: byte limits (1009 beyond);
-/// - `idle`: how long `recv` waits for a frame before closing with 1001.
+/// - `idle`: how long `recv` waits for a frame before closing with 1001;
+/// - `deflate`: offer permessage-deflate (RFC 7692; off by default, see `with_deflate` and docs/ws-extensions.md);
+///   `deflate_level` (-1: default 6), `deflate_min` (messages shorter than this go uncompressed) and
+///   `deflate_takeover` (false: both sides start every message with an empty window) tune it;
+///   `max_message` then also caps what a compressed message may inflate to.
 pub type Options = {
     origins: List[List[u8]],
     protocols: List[List[u8]],
     max_frame: usize,
     max_message: usize,
     idle: time.Duration,
+    deflate: bool,
+    deflate_level: i32,
+    deflate_min: usize,
+    deflate_takeover: bool,
 }
 
-/// Any origin, no subprotocols, 1 MiB frames, 4 MiB messages, 60 s idle.
-pub fn options() -> Options { Options(List.new(), List.new(), 1048576, 4194304, time.seconds(60)) }
+/// Any origin, no subprotocols, 1 MiB frames, 4 MiB messages, 60 s idle, no extensions.
+pub fn options() -> Options { Options(List.new(), List.new(), 1048576, 4194304, time.seconds(60), false, -1, 32, true) }
 
 impl Options {
     fn allow_origin(self, o: str) -> Options {
@@ -313,6 +343,26 @@ impl Options {
         c.idle = d
         c
     }
+
+    /// Offers permessage-deflate (RFC 7692), compressing messages of 32 bytes or more at the default level
+    /// with context takeover; a client that does not ask for it gets plain frames as before.
+    fn with_deflate(self) -> Options {
+        let mut c = self.copy()
+        c.deflate = true
+        c
+    }
+
+    /// permessage-deflate with `level` (0 to 9, -1 default), messages shorter than `min` bytes sent as they
+    /// are, and `takeover` false to have both sides compress every message with an empty window
+    /// (`server_no_context_takeover` and `client_no_context_takeover`: less memory, a worse ratio).
+    fn deflate_with(self, level: i32, min: usize, takeover: bool) -> Options {
+        let mut c = self.copy()
+        c.deflate = true
+        c.deflate_level = level
+        c.deflate_min = min
+        c.deflate_takeover = takeover
+        c
+    }
 }
 
 /// A message `recv` returns.
@@ -323,17 +373,31 @@ pub type Message = | Text(s: String) | Binary(b: List[u8]) | Closed(code: i32, r
 /// from several threads; only one thread should call `recv`.
 pub type Conn = {
     d: http.Duplex,
-    wlock: sync.Lock[bool],
+    wlock: sync.Lock[List[wsext.Tx]],
     rs: sync.Lock[RState],
     opts: Options,
     protocol: List[u8],
+    extensions: List[u8],
 }
 
-/// What `recv` keeps between calls.
-type RState = { dec: Decoder, closed: bool, sent_close: bool }
+/// What `recv` keeps between calls (`rx`: the decompressor, a List of zero or one).
+type RState = { dec: Decoder, closed: bool, sent_close: bool, rx: List[wsext.Rx] }
 
-fn make_conn(d: http.Duplex, opts: Options, server: bool, protocol: List[u8]) -> Conn {
-    Conn(d, sync.lock(true), sync.lock(RState(decoder(server, opts.max_frame), false, false)), opts, protocol)
+fn make_conn(d: http.Duplex, opts: Options, server: bool, protocol: List[u8], pmd: Option[wsext.Accepted]) -> Conn {
+    let mut tx: List[wsext.Tx] = List.new()
+    let mut rx: List[wsext.Rx] = List.new()
+    let mut dec = decoder(server, opts.max_frame)
+    let mut ext: List[u8] = List.new()
+    match pmd {
+        Some(a) => {
+            dec = decoder_ext(server, opts.max_frame)
+            tx.push(wsext.tx(opts.deflate_level, a.params.server_no_takeover, opts.deflate_min))
+            rx.push(wsext.rx(a.params.client_no_takeover, opts.max_message))
+            ext = a.header
+        }
+        None => {}
+    }
+    Conn(d, sync.lock(tx), sync.lock(RState(dec, false, false, rx)), opts, protocol, ext)
 }
 
 fn mask_key() -> List[u8] uses io {
@@ -347,16 +411,36 @@ impl Conn {
     /// The subprotocol the handshake chose (empty: none).
     fn subprotocol(self) -> List[u8] { self.protocol }
 
+    /// The `Sec-WebSocket-Extensions` the server answered with (empty: none negotiated).
+    fn extensions(self) -> List[u8] { self.extensions }
+
     fn frame(self, fin: bool, opcode: u8, payload: List[u8]) -> Result[(), stream.Error] {
         let key: List[u8] = List.new()
         let wire = encode_frame(fin, opcode, payload, key)
         let d = self.d
-        self.wlock.modify(|inout ok: bool| -> Result[(), stream.Error] { d.write(wire) })
+        self.wlock.modify(|inout tl: List[wsext.Tx]| -> Result[(), stream.Error] { d.write(wire) })
     }
 
-    fn send_text(self, s: String) -> Result[(), stream.Error] { self.frame(true, TEXT, s.bytes()) }
+    // a whole data message in one frame, compressed (RSV1) when permessage-deflate is in force and the message is long enough
+    fn message(self, opcode: u8, payload: List[u8]) -> Result[(), stream.Error] {
+        let d = self.d
+        self.wlock.modify(|inout tl: List[wsext.Tx]| -> Result[(), stream.Error] {
+            let mut rsv1 = false
+            let mut body = payload.copy()
+            match wsext.tx_deflate(inout tl, payload) {
+                Some(c) => {
+                    body = c
+                    rsv1 = true
+                }
+                None => {}
+            }
+            d.write(encode_frame_ext(true, rsv1, opcode, body, List.new()))
+        })
+    }
 
-    fn send_binary(self, b: List[u8]) -> Result[(), stream.Error] { self.frame(true, BINARY, b) }
+    fn send_text(self, s: String) -> Result[(), stream.Error] { self.message(TEXT, s.bytes()) }
+
+    fn send_binary(self, b: List[u8]) -> Result[(), stream.Error] { self.message(BINARY, b) }
 
     fn ping(self, data: List[u8]) -> Result[(), stream.Error] {
         if data.len() > 125 { return Err(stream.error(stream.InvalidInput, "a ping carries at most 125 bytes")) }
@@ -431,6 +515,7 @@ fn recv_in(c: Conn, inout st: RState) -> Result[Message, stream.Error] uses cloc
     if st.closed { return Err(stream.error(stream.BrokenPipe, "the connection is closed")) }
     let mut msg: List[u8] = List.new()
     let mut kind: u8 = 255
+    let mut comp = false
     while true {
         let f = next_frame(c, inout st)?
         if f.opcode == PING {
@@ -462,10 +547,23 @@ fn recv_in(c: Conn, inout st: RState) -> Result[Message, stream.Error] uses cloc
             } else {
                 if kind != 255 { return Err(fail_with(c, inout st, 1002, "a new message in the middle of a fragmented one")) }
                 kind = f.opcode
+                comp = f.rsv1
             }
-            if msg.len() + f.payload.len() > c.opts.max_message { return Err(fail_with(c, inout st, 1009, "a message over the limit")) }
+            // a compressed message may be a little longer than what it holds (stored blocks); what it inflates to is capped below
+            let slack: usize = if comp { c.opts.max_message / 1000 + 1024 } else { 0 }
+            if msg.len() + f.payload.len() > c.opts.max_message + slack { return Err(fail_with(c, inout st, 1009, "a message over the limit")) }
             bytes.append(inout msg, f.payload)
             if f.fin {
+                if comp {
+                    match wsext.rx_inflate(inout st.rx, msg) {
+                        Some(Ok(plain)) => { msg = plain }
+                        Some(Err(e)) => {
+                            if e.kind == compression.TooLarge || e.kind == compression.RatioExceeded { return Err(fail_with(c, inout st, 1009, "a message that inflates over the limit")) }
+                            return Err(fail_with(c, inout st, 1007, "a compressed message that is not valid DEFLATE"))
+                        }
+                        None => { return Err(fail_with(c, inout st, 1002, "RSV1 without permessage-deflate")) }
+                    }
+                }
                 if kind == TEXT {
                     if !utf8.valid(msg) { return Err(fail_with(c, inout st, 1007, "a text message that is not UTF-8")) }
                     return Ok(Text(String.from_bytes(msg).unwrap_or(String.from(""))))
@@ -484,25 +582,37 @@ fn bad(status: i32, why: str) -> http.Response {
 }
 
 /// Answers the upgrade request `req`: a failure response, or `101` with a stream that runs
-/// `run` on the connection (see the module comment).
+/// `run` on the connection (see the module comment). Over HTTP/2 (RFC 8441: the request is an extended
+/// CONNECT with `:protocol` websocket, which `h2.handler` hands over when `h2.Options.connect_protocol`
+/// is set) the answer is `200` and the stream is the h2 stream's DATA; nothing else differs.
 pub fn accept(req: http.Request, opts: Options, run: fn(Conn)) -> http.Response {
-    if !bytes.eq(req.method, sys.lit("GET")) {
-        let mut r = bad(405, "a WebSocket handshake is a GET")
-        r.set_header("Allow", sys.lit("GET"))
-        return r
-    }
-    if req.version != 11 { return bad(400, "a WebSocket handshake needs HTTP/1.1") }
-    if !http.has_token(req.headers, sys.lit("upgrade"), sys.lit("websocket")) { return bad(400, "no Upgrade: websocket") }
-    if !http.has_token(req.headers, sys.lit("connection"), sys.lit("upgrade")) { return bad(400, "no Connection: Upgrade") }
-    let key = match req.header("sec-websocket-key") {
-        Some(k) => k
-        None => { return bad(400, "no Sec-WebSocket-Key") }
-    }
-    match encoding.unbase64(key) {
-        Ok(raw) => {
-            if raw.len() != 16 { return bad(400, "Sec-WebSocket-Key is not 16 bytes of base64") }
+    let mut over_h2 = false
+    match req.get_ctx("h2_protocol") {
+        Some(pr) => {
+            if !bytes.eq(req.method, sys.lit("CONNECT")) || !bytes.eq(pr, sys.lit("websocket")) { return bad(501, "only :protocol websocket is served") }
+            over_h2 = true
         }
-        Err(e) => { return bad(400, "Sec-WebSocket-Key is not base64") }
+        None => {}
+    }
+    if !over_h2 {
+        if !bytes.eq(req.method, sys.lit("GET")) {
+            let mut r = bad(405, "a WebSocket handshake is a GET")
+            r.set_header("Allow", sys.lit("GET"))
+            return r
+        }
+        if req.version != 11 { return bad(400, "a WebSocket handshake needs HTTP/1.1") }
+        if !http.has_token(req.headers, sys.lit("upgrade"), sys.lit("websocket")) { return bad(400, "no Upgrade: websocket") }
+        if !http.has_token(req.headers, sys.lit("connection"), sys.lit("upgrade")) { return bad(400, "no Connection: Upgrade") }
+    }
+    let key = req.header("sec-websocket-key").unwrap_or(List.new())
+    if !over_h2 {
+        if req.header("sec-websocket-key").is_none() { return bad(400, "no Sec-WebSocket-Key") }
+        match encoding.unbase64(key) {
+            Ok(raw) => {
+                if raw.len() != 16 { return bad(400, "Sec-WebSocket-Key is not 16 bytes of base64") }
+            }
+            Err(e) => { return bad(400, "Sec-WebSocket-Key is not base64") }
+        }
     }
     if !bytes.eq(req.header("sec-websocket-version").unwrap_or(List.new()), sys.lit("13")) {
         let mut r = bad(426, "only WebSocket version 13")
@@ -527,30 +637,99 @@ pub fn accept(req: http.Request, opts: Options, run: fn(Conn)) -> http.Response 
         }
         None => {}
     }
-    let mut resp = http.response(101)
-    resp.set_header("Upgrade", sys.lit("websocket"))
-    resp.set_header("Connection", sys.lit("Upgrade"))
-    resp.set_header("Sec-WebSocket-Accept", accept_key(key))
+    let mut pmd: Option[wsext.Accepted] = None
+    if opts.deflate { pmd = wsext.negotiate_server(wsext.extension_items(req.headers), !opts.deflate_takeover) }
+    let mut resp = http.response(if over_h2 { 200 } else { 101 })
+    if !over_h2 {
+        resp.set_header("Upgrade", sys.lit("websocket"))
+        resp.set_header("Connection", sys.lit("Upgrade"))
+        resp.set_header("Sec-WebSocket-Accept", accept_key(key))
+    }
     if chosen.len() > 0 { resp.set_header("Sec-WebSocket-Protocol", chosen) }
+    match pmd {
+        Some(a) => { resp.set_header("Sec-WebSocket-Extensions", a.header) }
+        None => {}
+    }
     let proto = chosen.copy()
-    resp.stream = Some(http.Stream(|d: http.Duplex| -> () { run(make_conn(d, opts, true, proto)) }, true))
+    resp.stream = Some(http.Stream(|d: http.Duplex| -> () { run(make_conn(d, opts, true, proto, pmd)) }, true))
     resp
 }
 
 // ---- the client
 
-/// A client connection: it masks what it sends. Not thread-safe (one user at a time).
-pub type Client = { tr: transport.Transport, dec: Decoder, closed: bool, idle_ms: i64, protocol: List[u8] }
+/// A client connection: it masks what it sends. Not thread-safe (one user at a time). `h2s` is the extended
+/// CONNECT stream of a connection made by `dial_h2` (then `tr` is not used); `tx`/`rx` (zero or one each)
+/// are the permessage-deflate halves; `extensions` is what the server accepted.
+pub type Client = {
+    tr: transport.Transport,
+    dec: Decoder,
+    closed: bool,
+    idle_ms: i64,
+    protocol: List[u8],
+    h2s: Option[H2Io],
+    tx: List[wsext.Tx],
+    rx: List[wsext.Rx],
+    extensions: List[u8],
+    max_message: usize,
+}
+
+/// How a client over HTTP/2 reaches its extended CONNECT stream: send DATA, read DATA (`Ok(None)` at the
+/// deadline, `Some(empty)` at the end), reset and release the stream.
+pub type H2Io = {
+    send: fn(List[u8], time.Deadline) -> Result[(), String],
+    read: fn(time.Deadline) -> Result[Option[List[u8]], String],
+    drop: fn(),
+}
+
+/// What a client asks for beyond a plain handshake: `deflate` offers permessage-deflate (`no_takeover`
+/// adds `client_no_context_takeover; server_no_context_takeover`), `level` and `min` as in `Options`,
+/// `max_message` caps what `recv_message` returns (a bomb is an Err).
+pub type DialOptions = { deflate: bool, level: i32, min: usize, no_takeover: bool, max_message: usize }
+
+/// No extensions, messages up to 16 MiB.
+pub fn dial_options() -> DialOptions { DialOptions(false, -1, 32, false, 16777216) }
 
 /// Connects to `addr`, performs the handshake for `target` (with `protocols` offered) and returns
 /// the connection. Err: no connection, not a 101, or a wrong `Sec-WebSocket-Accept`.
 pub fn dial(addr: net.Addr, target: str, protocols: List[List[u8]], dl: time.Deadline) -> Result[Client, String] uses net, io, clock {
+    dial_with(addr, target, protocols, dial_options(), dl)
+}
+
+/// `dial` with `DialOptions` (permessage-deflate).
+pub fn dial_with(addr: net.Addr, target: str, protocols: List[List[u8]], o: DialOptions, dl: time.Deadline) -> Result[Client, String] uses net, io, clock {
     let c = client.connect(addr, dl)?
-    dial_conn(c, sys.lit(target), protocols, dl)
+    dial_conn_with(c, sys.lit(target), protocols, o, dl)
 }
 
 /// `dial` over `c`, a connection from `client.connect...` (plain or https, no request made yet).
 pub fn dial_conn(conn: client.Conn, target: List[u8], protocols: List[List[u8]], dl: time.Deadline) -> Result[Client, String] uses net, io, clock {
+    dial_conn_with(conn, target, protocols, dial_options(), dl)
+}
+
+// the client state once the server's answer is known: `ext` the Sec-WebSocket-Extensions items of the answer
+fn finish_client(tr: transport.Transport, h2s: Option[H2Io], rest: List[u8], protocol: List[u8], ext: List[List[u8]], o: DialOptions) -> Result[Client, String] {
+    let mut dec = decoder(false, 16777216)
+    let mut tx: List[wsext.Tx] = List.new()
+    let mut rx: List[wsext.Rx] = List.new()
+    let mut shown: List[u8] = List.new()
+    if !o.deflate && ext.len() > 0 { return Err(String.from("the server chose an extension that was not offered")) }
+    if o.deflate {
+        match wsext.parse_response(ext)? {
+            Some(p) => {
+                dec = decoder_ext(false, 16777216)
+                tx.push(wsext.tx(o.level, p.client_no_takeover, o.min))
+                rx.push(wsext.rx(p.server_no_takeover, o.max_message))
+                shown = ext[0].copy()
+            }
+            None => {}
+        }
+    }
+    dec.feed(rest)
+    Ok(Client(tr, dec, false, 20000, protocol, h2s, tx, rx, shown, o.max_message))
+}
+
+/// `dial_conn` with `DialOptions`.
+pub fn dial_conn_with(conn: client.Conn, target: List[u8], protocols: List[List[u8]], o: DialOptions, dl: time.Deadline) -> Result[Client, String] uses net, io, clock {
     let mut c = conn.copy()
     let raw = random.bytes(16)?
     let key = encoding.base64(raw).bytes()
@@ -560,6 +739,7 @@ pub fn dial_conn(conn: client.Conn, target: List[u8], protocols: List[List[u8]],
     req.set_header("Sec-WebSocket-Key", key)
     req.set_header("Sec-WebSocket-Version", sys.lit("13"))
     if protocols.len() > 0 { req.set_header("Sec-WebSocket-Protocol", bytes.join(protocols, sys.lit(", "))) }
+    if o.deflate { req.set_header("Sec-WebSocket-Extensions", wsext.client_offer(o.no_takeover)) }
     let resp = c.request(req, dl)?
     if resp.status != 101 {
         let mut m = String.from("the server answered ")
@@ -570,23 +750,120 @@ pub fn dial_conn(conn: client.Conn, target: List[u8], protocols: List[List[u8]],
         return Err(String.from("wrong Sec-WebSocket-Accept"))
     }
     // bytes the server sent after the 101 are in the client's parser
-    let mut dec = decoder(false, 16777216)
-    dec.feed(bytes.slice(c.parser.buf, c.parser.pos, c.parser.buf.len()))
-    Ok(Client(c.transport(), dec, false, 20000, resp.header("sec-websocket-protocol").unwrap_or(List.new())))
+    let rest = bytes.slice(c.parser.buf, c.parser.pos, c.parser.buf.len())
+    finish_client(c.transport(), None, rest, resp.header("sec-websocket-protocol").unwrap_or(List.new()), wsext.extension_items(resp.headers), o)
+}
+
+/// WebSocket over HTTP/2 (RFC 8441): opens an extended CONNECT stream on `hc` (an `h2x.Client`; the server must
+/// have `h2.Options.connect_protocol` set, which this waits for in its SETTINGS) for `target`, and returns a
+/// client whose frames travel in the stream's DATA. Err: the server does not allow extended CONNECT, the
+/// stream could not be opened, or the answer is not `200`. The h2 connection stays the caller's (`hc.close()`).
+pub fn dial_h2(hc: h2x.Client, target: str, protocols: List[List[u8]], o: DialOptions, dl: time.Deadline) -> Result[Client, String] uses io, clock {
+    if !hc.conn.wait_connect_protocol(dl) { return Err(String.from("the server does not allow extended CONNECT (RFC 8441)")) }
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header(sys.lit(":method"), sys.lit("CONNECT")))
+    hs.push(http.Header(sys.lit(":protocol"), sys.lit("websocket")))
+    hs.push(http.Header(sys.lit(":scheme"), hc.scheme.copy()))
+    hs.push(http.Header(sys.lit(":path"), sys.lit(target)))
+    hs.push(http.Header(sys.lit(":authority"), if hc.authority.len() > 0 { hc.authority.copy() } else { sys.lit("localhost") }))
+    hs.push(http.Header(sys.lit("sec-websocket-version"), sys.lit("13")))
+    if protocols.len() > 0 { hs.push(http.Header(sys.lit("sec-websocket-protocol"), bytes.join(protocols, sys.lit(", ")))) }
+    if o.deflate { hs.push(http.Header(sys.lit("sec-websocket-extensions"), wsext.client_offer(o.no_takeover))) }
+    let st = match hc.open(hs, false, dl) {
+        Ok(x) => x
+        Err(e) => { return Err(e.why) }
+    }
+    let head = match st.headers(dl) {
+        Ok(x) => x
+        Err(e) => {
+            st.release()
+            return Err(e.why)
+        }
+    }
+    let mut status: i64 = 0
+    for f in head {
+        if http.eq_s(f.name, ":status") { status = bytes.parse_u64(f.value).unwrap_or(0) as i64 }
+    }
+    if status != 200 {
+        st.release()
+        let mut m = String.from("the server answered ")
+        m.append(String.from_int(status))
+        return Err(m)
+    }
+    let mut ext: List[List[u8]] = List.new()
+    for f in head {
+        if http.eq_s(f.name, "sec-websocket-extensions") {
+            for it in http.list_items(f.value) { ext.push(it) }
+        }
+    }
+    let proto = http.find_s(head, "sec-websocket-protocol").unwrap_or(List.new())
+    let io = H2Io(
+        |data: List[u8], d: time.Deadline| -> Result[(), String] {
+            match st.send(data, false, d) {
+                Ok(z) => { Ok(()) }
+                Err(e) => { Err(e.why) }
+            }
+        },
+        |d: time.Deadline| -> Result[Option[List[u8]], String] {
+            match st.read(65536, d) {
+                Ok(b) => { Ok(Some(b)) }
+                Err(e) => {
+                    if e.kind == h2x.ERR_TIMEOUT { return Ok(None) }
+                    Err(e.why)
+                }
+            }
+        },
+        || -> () {
+            st.reset(h2frame.CANCEL)
+            st.release()
+        })
+    match finish_client(transport.plain(-1), Some(io), List.new(), proto, ext, o) {
+        Ok(c) => { Ok(c) }
+        Err(e) => {
+            st.release()
+            Err(e)
+        }
+    }
 }
 
 impl Client {
     fn send_frame(self, fin: bool, opcode: u8, payload: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock {
-        let wire = encode_frame(fin, opcode, payload, mask_key())
+        self.send_wire(encode_frame(fin, opcode, payload, mask_key()), dl)
+    }
+
+    fn send_wire(self, wire: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock {
+        match self.h2s {
+            Some(x) => {
+                let f = x.send
+                return f(wire, dl)
+            }
+            None => {}
+        }
         if !self.tr.send_by(wire, dl) { return Err(String.from("send failed")) }
         Ok(())
     }
 
-    fn send_text(self, s: String, dl: time.Deadline) -> Result[(), String] uses net, io, clock { self.send_frame(true, TEXT, s.bytes(), dl) }
+    // a whole data message in one frame, compressed (RSV1) when permessage-deflate is in force
+    fn send_message(inout self, opcode: u8, payload: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock {
+        let mut rsv1 = false
+        let mut body = payload.copy()
+        match wsext.tx_deflate(inout self.tx, payload) {
+            Some(c) => {
+                body = c
+                rsv1 = true
+            }
+            None => {}
+        }
+        self.send_wire(encode_frame_ext(true, rsv1, opcode, body, mask_key()), dl)
+    }
 
-    fn send_binary(self, b: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock { self.send_frame(true, BINARY, b, dl) }
+    /// A text message (one frame; compressed when permessage-deflate was negotiated).
+    fn send_text(inout self, s: String, dl: time.Deadline) -> Result[(), String] uses net, io, clock { self.send_message(TEXT, s.bytes(), dl) }
 
-    /// A text message in two fragments (for tests of fragmentation).
+    /// A binary message (one frame; compressed when permessage-deflate was negotiated).
+    fn send_binary(inout self, b: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock { self.send_message(BINARY, b, dl) }
+
+    /// A text message in two fragments (for tests of fragmentation; never compressed).
     fn send_text_split(self, a: List[u8], b: List[u8], dl: time.Deadline) -> Result[(), String] uses net, io, clock {
         self.send_frame(false, TEXT, a, dl)?
         self.send_frame(true, CONTINUATION, b, dl)
@@ -598,7 +875,20 @@ impl Client {
         self.send_frame(true, CLOSE, close_payload(code, sys.lit(reason)), dl)
     }
 
-    /// The next frame from the server before `dl`.
+    // some bytes from the server: None at the deadline, Some(empty) at the end
+    fn read_wire(self, dl: time.Deadline) -> Result[Option[List[u8]], String] uses net, io, clock {
+        match self.h2s {
+            Some(x) => {
+                let f = x.read
+                return f(dl)
+            }
+            None => {}
+        }
+        self.tr.read_by(65536, dl)
+    }
+
+    /// The next frame from the server before `dl`, as it is on the wire: a compressed message's frames
+    /// have `rsv1` set and their payload still compressed (`recv_message` decodes).
     fn recv_frame(inout self, dl: time.Deadline) -> Result[Frame, String] uses net, io, clock {
         while true {
             match self.dec.next() {
@@ -606,7 +896,7 @@ impl Client {
                 Fail(code, why) => { return Err(why) }
                 NeedMore => {}
             }
-            match self.tr.read_by(65536, dl) {
+            match self.read_wire(dl) {
                 Ok(Some(b)) => {
                     if b.len() == 0 { return Err(String.from("closed")) }
                     self.dec.feed(b)
@@ -618,8 +908,64 @@ impl Client {
         Err(String.from("unreachable"))
     }
 
-    /// Closes the socket.
-    fn drop_connection(self) uses io {
+    /// The next message before `dl`: text or binary (fragments joined, decompressed when RSV1 marks it; a
+    /// message over `max_message`, compressed or not, is an Err), or `Closed` when the server closed. A ping
+    /// is answered with a pong, a pong skipped.
+    fn recv_message(inout self, dl: time.Deadline) -> Result[Message, String] uses net, io, clock {
+        let mut msg: List[u8] = List.new()
+        let mut kind: u8 = 255
+        let mut comp = false
+        while true {
+            let f = self.recv_frame(dl)?
+            if f.opcode == PING {
+                self.send_frame(true, PONG, f.payload, dl)?
+            } else if f.opcode == PONG {
+            } else if f.opcode == CLOSE {
+                let mut code = 1005
+                let mut reason = String.from("")
+                if f.payload.len() >= 2 {
+                    code = (f.payload[0] as i32) * 256 + (f.payload[1] as i32)
+                    reason = String.from_bytes(bytes.slice(f.payload, 2, f.payload.len())).unwrap_or(String.from(""))
+                }
+                return Ok(Closed(code, reason))
+            } else {
+                if f.opcode == CONTINUATION {
+                    if kind == 255 { return Err(String.from("a continuation without a message")) }
+                } else {
+                    kind = f.opcode
+                    comp = f.rsv1
+                }
+                if msg.len() + f.payload.len() > self.max_message + self.max_message / 1000 + 1024 { return Err(String.from("a message over the limit")) }
+                bytes.append(inout msg, f.payload)
+                if f.fin {
+                    if comp {
+                        match wsext.rx_inflate(inout self.rx, msg) {
+                            Some(Ok(plain)) => { msg = plain }
+                            Some(Err(e)) => { return Err(e.message) }
+                            None => { return Err(String.from("RSV1 without permessage-deflate")) }
+                        }
+                    }
+                    if kind == TEXT {
+                        if !utf8.valid(msg) { return Err(String.from("a text message that is not UTF-8")) }
+                        return Ok(Text(String.from_bytes(msg).unwrap_or(String.from(""))))
+                    }
+                    return Ok(Binary(msg))
+                }
+            }
+        }
+        Err(String.from("unreachable"))
+    }
+
+    /// Closes the connection: the socket, or an h2 client's stream (the h2 connection is its owner's).
+    fn drop_connection(self) uses io, clock {
+        match self.h2s {
+            Some(x) => {
+                let f = x.drop
+                f()
+                return
+            }
+            None => {}
+        }
         self.tr.close_now()
     }
 }

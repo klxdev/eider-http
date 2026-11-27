@@ -1,0 +1,436 @@
+// http/ws permessage-deflate (RFC 7692): the Sec-WebSocket-Extensions negotiation, RFC 7692's own
+// examples (7.2.3), context takeover, the size cap on what a message inflates to (a bomb), the RSV1 rules,
+// and over loopback a server and a client that compress, with the failures that must close the connection.
+
+import core.sys
+import std.bytes
+import std.encoding
+import std.io
+import std.net
+import std.task
+import std.time
+import compression
+import http
+import http.router
+import http.server
+import http.client
+import http.ws
+import http.wsext
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn hex(b: List[u8]) -> String { encoding.hex(b) }
+
+fn unhex(s: str) -> List[u8] { encoding.unhex(lit(s)).unwrap() }
+
+fn cat(a: str, b: String) -> String {
+    let mut t = String.from(a)
+    t.append(b)
+    t
+}
+
+fn cs(a: String, b: String) -> String { let mut t = a.copy()
+    t.append(b)
+    t }
+
+fn txt(b: List[u8]) -> String { sys.to_string(b) }
+
+fn repeated(s: str, n: usize) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let one = lit(s)
+    for i in 0..n { bytes.append(inout out, one) }
+    out
+}
+
+fn negotiate(label: str, value: str, force: bool) uses io {
+    match wsext.negotiate_server(http.list_items(lit(value)), force) {
+        Some(a) => io.outln(cat(label, cat(": ", txt(a.header))).bytes())
+        None => io.outln(cat(label, String.from(": no extension")).bytes())
+    }
+}
+
+fn inflate_show(label: str, inout rx: List[wsext.Rx], hexdata: str) uses io {
+    match wsext.rx_inflate(inout rx, unhex(hexdata)) {
+        Some(Ok(b)) => io.outln(cat(label, cat(": ", txt(b))).bytes())
+        Some(Err(e)) => io.outln(cat(label, cat(" error: ", e.message)).bytes())
+        None => io.outln(lit("no rx"))
+    }
+}
+
+fn pure_part() uses io {
+    print("-- negotiation")
+    negotiate("plain", "permessage-deflate", false)
+    negotiate("client bits without a value", "permessage-deflate; client_max_window_bits", false)
+    negotiate("client bits with a value", "permessage-deflate; client_max_window_bits=10; server_no_context_takeover", false)
+    negotiate("second offer wins", "permessage-deflate; server_max_window_bits=10, permessage-deflate", false)
+    negotiate("server bits 15", "permessage-deflate; server_max_window_bits=15", false)
+    negotiate("unknown parameter", "permessage-deflate; bogus=1", false)
+    negotiate("value on a flag", "permessage-deflate; server_no_context_takeover=1", false)
+    negotiate("bits out of range", "permessage-deflate; client_max_window_bits=7", false)
+    negotiate("repeated parameter", "permessage-deflate; client_no_context_takeover; client_no_context_takeover", false)
+    negotiate("other extension first", "x-webkit-deflate-frame, permessage-deflate; client_no_context_takeover", false)
+    negotiate("only another extension", "x-webkit-deflate-frame", false)
+    negotiate("quoted value", "permessage-deflate; client_max_window_bits=\"11\"", false)
+    negotiate("upper case", "Permessage-Deflate; Client_No_Context_Takeover", false)
+    negotiate("forced", "permessage-deflate", true)
+    print(txt(wsext.client_offer(false)))
+    print(txt(wsext.client_offer(true)))
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header(lit("Sec-WebSocket-Extensions"), lit("a, b")))
+    hs.push(http.Header(lit("sec-websocket-extensions"), lit("c")))
+    print(txt(bytes.join(wsext.extension_items(hs), lit("|"))))
+    for v in ["permessage-deflate", "permessage-deflate; server_no_context_takeover; client_no_context_takeover", "x-other", "permessage-deflate; client_max_window_bits=12", "permessage-deflate; bogus"] {
+        match wsext.parse_response(http.list_items(lit(v))) {
+            Ok(Some(p)) => io.outln(cat("response ok: server_nct=", cs(p.server_no_takeover.to_string(), cat(" client_nct=", p.client_no_takeover.to_string()))).bytes())
+            Ok(None) => print("response: none")
+            Err(e) => io.outln(cat("response error: ", e).bytes())
+        }
+    }
+
+    print("-- RFC 7692 7.2.3: decoding")
+    let mut rx: List[wsext.Rx] = List.new()
+    rx.push(wsext.rx(false, 1000))
+    inflate_show("one block", inout rx, "f248cdc9c90700")
+    inflate_show("with a back reference (context takeover)", inout rx, "f200110000")
+    let mut rn: List[wsext.Rx] = List.new()
+    rn.push(wsext.rx(true, 1000))
+    inflate_show("no takeover, first", inout rn, "f248cdc9c90700")
+    inflate_show("no takeover, second", inout rn, "f248cdc9c90700")
+    let mut rs: List[wsext.Rx] = List.new()
+    rs.push(wsext.rx(false, 1000))
+    inflate_show("a stored block", inout rs, "000500faff48656c6c6f00")
+    let mut rf: List[wsext.Rx] = List.new()
+    rf.push(wsext.rx(false, 1000))
+    inflate_show("a BFINAL block", inout rf, "f348cdc9c9070000")
+    inflate_show("after a BFINAL block the window goes on", inout rf, "f200110000")
+
+    print("-- encoding")
+    let mut tx: List[wsext.Tx] = List.new()
+    tx.push(wsext.tx(-1, false, 0))
+    print(hex(wsext.tx_deflate(inout tx, lit("Hello")).unwrap()))
+    print(hex(wsext.tx_deflate(inout tx, lit("Hello")).unwrap()))
+    let mut tn: List[wsext.Tx] = List.new()
+    tn.push(wsext.tx(-1, true, 0))
+    print(hex(wsext.tx_deflate(inout tn, lit("Hello")).unwrap()))
+    print(hex(wsext.tx_deflate(inout tn, lit("Hello")).unwrap()))
+    let mut tm: List[wsext.Tx] = List.new()
+    tm.push(wsext.tx(-1, false, 32))
+    print(cat("short message compressed: ", wsext.tx_deflate(inout tm, lit("Hello")).is_some().to_string()))
+    print(cat("empty message compressed: ", wsext.tx_deflate(inout tx, List.new()).is_some().to_string()))
+    print("-- a round trip with takeover, 50 messages")
+    let mut a: List[wsext.Tx] = List.new()
+    a.push(wsext.tx(6, false, 0))
+    let mut b: List[wsext.Rx] = List.new()
+    b.push(wsext.rx(false, 100000))
+    let mut good = 0
+    let mut shrink = 0
+    for i in 0..50 {
+        let mut m = repeated("the quick brown fox ", (20 + i) as usize)
+        m.push((i + 65) as u8)
+        let c = wsext.tx_deflate(inout a, m).unwrap()
+        if c.len() < m.len() { shrink += 1 }
+        match wsext.rx_inflate(inout b, c) {
+            Some(Ok(back)) => { if bytes.eq(back, m) { good += 1 } }
+            _ => {}
+        }
+    }
+    print(cat("round trips: ", good.to_string()))
+    print(cat("compressed: ", shrink.to_string()))
+
+    print("-- the cap on what a message inflates to (a bomb)")
+    let zeros = repeated("0", 2000000)
+    let mut bt: List[wsext.Tx] = List.new()
+    bt.push(wsext.tx(6, false, 0))
+    let bomb = wsext.tx_deflate(inout bt, zeros).unwrap()
+    print(cat("bomb is smaller than 5000 bytes: ", (bomb.len() < 5000).to_string()))
+    let mut cap: List[wsext.Rx] = List.new()
+    cap.push(wsext.rx(false, 65536))
+    match wsext.rx_inflate(inout cap, bomb) {
+        Some(Ok(b2)) => print(cat("inflated: ", b2.len().to_string()))
+        Some(Err(e)) => print(cat("refused: ", e.message))
+        None => {}
+    }
+    // exactly at the cap passes, one over does not
+    let mut e1: List[wsext.Tx] = List.new()
+    e1.push(wsext.tx(6, false, 0))
+    let at = wsext.tx_deflate(inout e1, repeated("0", 65536)).unwrap()
+    let mut r1: List[wsext.Rx] = List.new()
+    r1.push(wsext.rx(false, 65536))
+    match wsext.rx_inflate(inout r1, at) {
+        Some(Ok(b2)) => print(cat("at the cap: ", b2.len().to_string()))
+        Some(Err(e)) => print(cat("at the cap, refused: ", e.message))
+        None => {}
+    }
+    let mut e2: List[wsext.Tx] = List.new()
+    e2.push(wsext.tx(6, false, 0))
+    let over = wsext.tx_deflate(inout e2, repeated("0", 65537)).unwrap()
+    let mut r2: List[wsext.Rx] = List.new()
+    r2.push(wsext.rx(false, 65536))
+    match wsext.rx_inflate(inout r2, over) {
+        Some(Ok(b2)) => print(cat("over the cap: ", b2.len().to_string()))
+        Some(Err(e)) => print(cat("over the cap, refused: ", e.message))
+        None => {}
+    }
+    // the cap is per message with takeover: ten messages of 60000 pass one after the other
+    let mut t3: List[wsext.Tx] = List.new()
+    t3.push(wsext.tx(6, false, 0))
+    let mut r3: List[wsext.Rx] = List.new()
+    r3.push(wsext.rx(false, 65536))
+    let mut ok3 = 0
+    for i in 0..10 {
+        let c = wsext.tx_deflate(inout t3, repeated("z", 60000)).unwrap()
+        match wsext.rx_inflate(inout r3, c) {
+            Some(Ok(b2)) => { if b2.len() == 60000 { ok3 += 1 } }
+            _ => {}
+        }
+    }
+    print(cat("messages under the cap in a row: ", ok3.to_string()))
+    // invalid data
+    let mut r4: List[wsext.Rx] = List.new()
+    r4.push(wsext.rx(false, 1000))
+    inflate_show("garbage", inout r4, "ffffffffffff")
+
+    print("-- RSV1 in the frame decoder")
+    let mut d0 = ws.decoder(false, 1000)
+    d0.feed(ws.encode_frame_ext(true, true, ws.TEXT, lit("x"), List.new()))
+    match d0.next() {
+        ws.Fail(code, why) => io.outln(cat("not negotiated: ", cs(code.to_string(), cat(" ", why))).bytes())
+        _ => print("accepted?")
+    }
+    let mut d1 = ws.decoder_ext(false, 1000)
+    d1.feed(ws.encode_frame_ext(true, true, ws.TEXT, lit("x"), List.new()))
+    match d1.next() {
+        ws.Got(f) => print(cat("negotiated, rsv1: ", f.rsv1.to_string()))
+        _ => print("refused?")
+    }
+    for which in [0, 1] {
+        let mut d2 = ws.decoder_ext(false, 1000)
+        if which == 0 { d2.feed(ws.encode_frame_ext(true, true, ws.PING, lit("x"), List.new())) }
+        if which == 1 { d2.feed(ws.encode_frame_ext(true, true, ws.CONTINUATION, lit("x"), List.new())) }
+        match d2.next() {
+            ws.Fail(code, why) => io.outln(cat(if which == 0 { "rsv1 on a ping: " } else { "rsv1 on a continuation: " }, cs(code.to_string(), cat(" ", why))).bytes())
+            _ => print("accepted?")
+        }
+    }
+    let mut d3 = ws.decoder_ext(false, 1000)
+    let mut rsv2: List[u8] = List.new()
+    rsv2.push(161)
+    rsv2.push(0)
+    d3.feed(rsv2)
+    match d3.next() {
+        ws.Fail(code, why) => io.outln(cat("rsv2: ", cs(code.to_string(), cat(" ", why))).bytes())
+        _ => print("accepted?")
+    }
+}
+
+
+fn echo(c: ws.Conn) uses clock {
+    while true {
+        match c.recv() {
+            Ok(ws.Text(t)) => { let z = c.send_text(t) }
+            Ok(ws.Binary(b)) => { let z = c.send_binary(b) }
+            Ok(ws.Closed(code, why)) => { return }
+            Err(e) => { return }
+        }
+    }
+}
+
+fn app() -> router.Router uses io, clock {
+    let mut r = router.new()
+    r.get("/z", |q: http.Request| -> http.Response {
+        ws.accept(q, ws.options().limits(65536, 8192).idle_timeout(time.seconds(5)).with_deflate(), |c: ws.Conn| -> () { echo(c) })
+    })
+    r.get("/znt", |q: http.Request| -> http.Response {
+        ws.accept(q, ws.options().limits(65536, 8192).idle_timeout(time.seconds(5)).deflate_with(9, 0, false), |c: ws.Conn| -> () { echo(c) })
+    })
+    r.get("/plain", |q: http.Request| -> http.Response {
+        ws.accept(q, ws.options().limits(65536, 8192).idle_timeout(time.seconds(5)), |c: ws.Conn| -> () { echo(c) })
+    })
+    r
+}
+
+fn dopts(no_takeover: bool) -> ws.DialOptions {
+    let mut o = ws.dial_options()
+    o.deflate = true
+    o.no_takeover = no_takeover
+    o.min = 0
+    o
+}
+
+fn msg_text(r: Result[ws.Message, String]) -> String {
+    match r {
+        Ok(ws.Text(t)) => cat("text ", t)
+        Ok(ws.Binary(b)) => cat("binary ", b.len().to_string())
+        Ok(ws.Closed(code, why)) => cat("closed ", code.to_string())
+        Err(e) => cat("error: ", e)
+    }
+}
+
+fn close_code(r: Result[ws.Frame, String]) -> String {
+    match r {
+        Ok(f) => {
+            if f.opcode == ws.CLOSE && f.payload.len() >= 2 { return cat("close ", ((f.payload[0] as i64) * 256 + (f.payload[1] as i64)).to_string()) }
+            cat("frame ", f.opcode.to_string())
+        }
+        Err(e) => cat("error: ", e)
+    }
+}
+
+fn masked(fin: bool, rsv1: bool, op: u8, payload: List[u8]) -> List[u8] {
+    let mut key: List[u8] = List.new()
+    for b in [9, 8, 7, 6] { key.push(b as u8) }
+    ws.encode_frame_ext(fin, rsv1, op, payload, key)
+}
+
+fn main() uses io, net, clock, threads {
+    pure_part()
+    let dl = time.after_ms(30000)
+    let mut cfg = server.config()
+    cfg.workers = 4
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let a = srv.addr()
+    let h = router.handler(app())
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+
+    print("-- a negotiated connection")
+    let mut c = ws.dial_with(a, "/z", List.new(), dopts(false), dl).unwrap()
+    io.outln(c.extensions)
+    let long = repeated("hello hello hello ", 100)
+    c.send_text(String.from_bytes(long).unwrap(), dl).unwrap()
+    let f1 = c.recv_frame(dl).unwrap()
+    print(cat("first echo: rsv1=", cs(f1.rsv1.to_string(), cat(" smaller=", (f1.payload.len() < long.len()).to_string()))))
+    c.send_text(String.from_bytes(long).unwrap(), dl).unwrap()
+    let f2 = c.recv_frame(dl).unwrap()
+    print(cat("second echo (the window is kept): smaller than the first=", (f2.payload.len() < f1.payload.len()).to_string()))
+    c.send_text(String.from("short"), dl).unwrap()
+    let f3 = c.recv_frame(dl).unwrap()
+    print(cat("a short message is not compressed: rsv1=", f3.rsv1.to_string()))
+    c.drop_connection()
+
+    let mut c1 = ws.dial_with(a, "/z", List.new(), dopts(false), dl).unwrap()
+    for i in 0..5 {
+        let mut m = repeated("message number ", 30)
+        m.push((48 + i) as u8)
+        c1.send_text(String.from_bytes(m).unwrap(), dl).unwrap()
+        match c1.recv_message(dl) {
+            Ok(ws.Text(t2)) => { print(cat("echoed ", cs(t2.len().to_string(), cat(" ", String.from_bytes(bytes.slice(t2.bytes(), t2.len() - 1, t2.len())).unwrap())))) }
+            other => print(msg_text(other))
+        }
+    }
+    let mut bin: List[u8] = List.new()
+    for i in 0..4000 { bin.push(((i * 7) % 251) as u8) }
+    c1.send_binary(bin, dl).unwrap()
+    print(msg_text(c1.recv_message(dl)))
+    c1.send_text(String.from("é and ü and ß, compressed: ").bytes().len().to_string(), dl).unwrap()
+    print(msg_text(c1.recv_message(dl)))
+    c1.send_text(String.from_bytes(repeated("héllo wörld ", 40)).unwrap(), dl).unwrap()
+    match c1.recv_message(dl) {
+        Ok(ws.Text(t2)) => print(cat("utf-8 intact: ", (t2.len() == 12 * 40 + 2 * 40).to_string()))
+        other => print(msg_text(other))
+    }
+    c1.drop_connection()
+
+    print("-- no context takeover (forced by the server)")
+    let mut c2 = ws.dial_with(a, "/znt", List.new(), dopts(false), dl).unwrap()
+    io.outln(c2.extensions)
+    c2.send_text(String.from_bytes(long).unwrap(), dl).unwrap()
+    let g1 = c2.recv_frame(dl).unwrap()
+    c2.send_text(String.from_bytes(long).unwrap(), dl).unwrap()
+    let g2 = c2.recv_frame(dl).unwrap()
+    print(cat("same size both times: ", (g1.payload.len() == g2.payload.len()).to_string()))
+    c2.drop_connection()
+    let mut c2b = ws.dial_with(a, "/znt", List.new(), dopts(false), dl).unwrap()
+    for i in 0..3 {
+        c2b.send_text(String.from_bytes(long).unwrap(), dl).unwrap()
+        print(cat("echo ", msg_text(c2b.recv_message(dl)).len().to_string()))
+    }
+    c2b.drop_connection()
+
+    print("-- no context takeover (asked by the client)")
+    let mut c3 = ws.dial_with(a, "/z", List.new(), dopts(true), dl).unwrap()
+    io.outln(c3.extensions)
+    c3.send_text(String.from_bytes(long).unwrap(), dl).unwrap()
+    let h1 = c3.recv_frame(dl).unwrap()
+    c3.send_text(String.from_bytes(long).unwrap(), dl).unwrap()
+    let h2f = c3.recv_frame(dl).unwrap()
+    print(cat("same size both times: ", (h1.payload.len() == h2f.payload.len()).to_string()))
+    c3.drop_connection()
+
+    print("-- the extension is off unless both sides want it")
+    let mut p1 = ws.dial_with(a, "/plain", List.new(), dopts(false), dl).unwrap()
+    print(cat("server without it: extensions=", String.from(if p1.extensions.len() == 0 { "none" } else { "some" })))
+    p1.send_text(String.from_bytes(long).unwrap(), dl).unwrap()
+    let pf = p1.recv_frame(dl).unwrap()
+    print(cat("plain frame: rsv1=", cs(pf.rsv1.to_string(), cat(" len=", pf.payload.len().to_string()))))
+    p1.drop_connection()
+    let mut p2 = ws.dial(a, "/z", List.new(), dl).unwrap()
+    print(cat("client without it: extensions=", String.from(if p2.extensions.len() == 0 { "none" } else { "some" })))
+    p2.send_text(String.from_bytes(long).unwrap(), dl).unwrap()
+    let pf2 = p2.recv_frame(dl).unwrap()
+    print(cat("plain frame: rsv1=", cs(pf2.rsv1.to_string(), cat(" len=", pf2.payload.len().to_string()))))
+    // RSV1 on a connection that did not negotiate it
+    net.send_all(p2.tr.fd, masked(true, true, ws.TEXT, lit("x"))).unwrap()
+    print(cat("RSV1 without the extension: ", close_code(p2.recv_frame(dl))))
+    p2.drop_connection()
+
+    print("-- limits and violations on a negotiated connection")
+    let mut v1 = ws.dial_with(a, "/z", List.new(), dopts(false), dl).unwrap()
+    let mut big: List[u8] = List.new()
+    for i in 0..(8192 as usize) { big.push(120) }
+    v1.send_binary(big, dl).unwrap()
+    print(cat("a message of max_message bytes: ", msg_text(v1.recv_message(dl))))
+    let mut big1: List[u8] = List.new()
+    for i in 0..(8193 as usize) { big1.push(120) }
+    v1.send_binary(big1, dl).unwrap()
+    print(cat("one byte over, compressed: ", msg_text(v1.recv_message(dl))))
+    v1.drop_connection()
+
+    let mut v2 = ws.dial_with(a, "/z", List.new(), dopts(false), dl).unwrap()
+    let mut tb: List[wsext.Tx] = List.new()
+    tb.push(wsext.tx(6, false, 0))
+    let bomb = wsext.tx_deflate(inout tb, repeated("0", 3000000)).unwrap()
+    print(cat("the bomb on the wire is under 4000 bytes: ", (bomb.len() < 4000).to_string()))
+    net.send_all(v2.tr.fd, masked(true, true, ws.BINARY, bomb)).unwrap()
+    print(cat("a bomb: ", close_code(v2.recv_frame(dl))))
+    v2.drop_connection()
+
+    let mut v3 = ws.dial_with(a, "/z", List.new(), dopts(false), dl).unwrap()
+    net.send_all(v3.tr.fd, masked(true, true, ws.TEXT, unhex("ffffffffffff"))).unwrap()
+    print(cat("invalid DEFLATE data: ", close_code(v3.recv_frame(dl))))
+    v3.drop_connection()
+
+    let mut v4 = ws.dial_with(a, "/z", List.new(), dopts(false), dl).unwrap()
+    net.send_all(v4.tr.fd, masked(true, true, ws.PING, lit("x"))).unwrap()
+    print(cat("a compressed ping: ", close_code(v4.recv_frame(dl))))
+    v4.drop_connection()
+
+    let mut v5 = ws.dial_with(a, "/z", List.new(), dopts(false), dl).unwrap()
+    net.send_all(v5.tr.fd, masked(false, false, ws.TEXT, lit("ab"))).unwrap()
+    net.send_all(v5.tr.fd, masked(true, true, ws.CONTINUATION, lit("cd"))).unwrap()
+    print(cat("RSV1 on a continuation: ", close_code(v5.recv_frame(dl))))
+    v5.drop_connection()
+
+    let mut v6 = ws.dial_with(a, "/z", List.new(), dopts(false), dl).unwrap()
+    net.send_all(v6.tr.fd, masked(true, true, ws.TEXT, unhex("f248cdc9c90700"))).unwrap()
+    print(cat("a compressed text frame from raw bytes: ", msg_text(v6.recv_message(dl))))
+    net.send_all(v6.tr.fd, masked(true, true, ws.TEXT, unhex("f200110000"))).unwrap()
+    print(cat("and the next one that refers back to it: ", msg_text(v6.recv_message(dl))))
+    v6.drop_connection()
+
+    print("-- a compressed invalid UTF-8 text message")
+    let mut v7 = ws.dial_with(a, "/z", List.new(), dopts(false), dl).unwrap()
+    let mut tu: List[wsext.Tx] = List.new()
+    tu.push(wsext.tx(6, false, 0))
+    let mut badu: List[u8] = List.new()
+    badu.push(255)
+    badu.push(254)
+    net.send_all(v7.tr.fd, masked(true, true, ws.TEXT, wsext.tx_deflate(inout tu, badu).unwrap())).unwrap()
+    print(close_code(v7.recv_frame(dl)))
+    v7.drop_connection()
+
+    tok.cancel()
+    let stats = th.join()
+    print(stats.requests > 0)
+}

@@ -1,0 +1,43 @@
+// The Eider WebSocket server for tests/ws_deflate_interop.sh, against python3's zlib as an independent DEFLATE
+// (a stdlib-only client of the permessage-deflate negotiation and frames). Prints `listening <port>`.
+//
+// Serves /z (an echo with permessage-deflate and context takeover) and /znt (the same, no context takeover).
+
+import core.sys
+import std.io
+import std.net
+import std.task
+import std.time
+import http
+import http.router
+import http.server
+import http.ws
+
+fn echo(c: ws.Conn) uses clock {
+    while true {
+        match c.recv() {
+            Ok(ws.Text(t)) => { let z = c.send_text(t) }
+            Ok(ws.Binary(b)) => { let z = c.send_binary(b) }
+            Ok(ws.Closed(code, why)) => { return }
+            Err(e) => { return }
+        }
+    }
+}
+
+fn main() uses io, net, clock, threads {
+    let mut r = router.new()
+    r.get("/z", |q: http.Request| -> http.Response {
+        ws.accept(q, ws.options().idle_timeout(time.seconds(10)).with_deflate(), |c: ws.Conn| -> () { echo(c) })
+    })
+    r.get("/znt", |q: http.Request| -> http.Response {
+        ws.accept(q, ws.options().idle_timeout(time.seconds(10)).deflate_with(6, 0, false), |c: ws.Conn| -> () { echo(c) })
+    })
+    let mut cfg = server.config()
+    cfg.workers = 2
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let mut up = String.from("listening ")
+    up.append(String.from_int(srv.addr().port as i64))
+    io.outln(up.bytes())
+    let tok = task.root()
+    let z = srv.serve(router.handler(r), tok)
+}
