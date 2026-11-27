@@ -209,10 +209,12 @@ type Strm = {
     out_head: bool,
     counted: bool,
     released: bool,
+    /// a client stream of a HEAD request: its response's content-length is not about any body (RFC 9110 section 9.3.2)
+    head_req: bool,
 }
 
 fn new_strm(id: u32, send_win: i64, recv_win: i64) -> Strm {
-    Strm(id, false, false, -1, false, send_win, recv_win, 0, List.new(), 0, None, None, -1, 0, List.new(), List.new(), false, true, false)
+    Strm(id, false, false, -1, false, send_win, recv_win, 0, List.new(), 0, None, None, -1, 0, List.new(), List.new(), false, true, false, false)
 }
 
 fn is_done(s: Strm) -> bool { s.reset >= 0 || (s.in_done && s.out_done) }
@@ -1257,7 +1259,7 @@ fn process_block(c: Conn, inout rd: Rd, id: u32, block: List[u8], end: bool, h: 
                         return -1
                     }
                     match content_length(fields) {
-                        Ok(n) => { s.clen = n }
+                        Ok(n) => { s.clen = if s.head_req || st == 204 || st == 304 { -1 } else { n } }
                         Err(why) => { return h2frame.PROTOCOL_ERROR as i64 }
                     }
                     s.head = Some(fields)
@@ -1771,6 +1773,7 @@ impl Conn {
                     k.next_id += 2
                     let mut s = new_strm(id, k.peer_win, win)
                     s.out_head = true
+                    s.head_req = http.eq_s(http.find_s(hs, ":method").unwrap_or(List.new()), "HEAD")
                     if end { s.out_done = true }
                     let sl = sync.lock(s)
                     k.streams.insert(id, sl)

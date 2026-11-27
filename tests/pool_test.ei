@@ -1,0 +1,615 @@
+// http/pool over plain HTTP against the Eider server on the loopback (ephemeral ports, every wait
+// bounded): keep-alive reuse (the server counts the connections it accepted), `Connection: close`,
+// the idle limits on both sides, a pooled connection the server closed (detected before use, and the
+// retry of an idempotent call whose pooled connection dies under it), many calls at once, redirects
+// (every status, chains, loops, limits, relative Location), credentials across origins, cookies
+// through the jar, a base URL, default headers, deadlines and gzip. tests/pool_tls_test.ei has https.
+
+import core.sys
+import std.bytes
+import std.fd
+import std.io
+import std.net
+import std.stream
+import std.sync
+import std.task
+import std.time
+import http
+import http.router
+import http.server
+import http.client
+import http.compress
+import http.pool
+import http.sock
+import http.cookiejar
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn num(n: i64) -> String { String.from_int(n) }
+
+type Rig = { srv: server.Server, tok: task.Token, th: Task[server.Stats], port: i32 }
+
+fn app(name: str, gate: sync.Lock[Map[List[u8], i64]]) -> http.Handler uses clock {
+    let mut r = router.new()
+    r.get("/hello", |q: http.Request| -> http.Response { http.text(200, "hello") })
+    r.get("/name", |q: http.Request| -> http.Response { http.text(200, name) })
+    r.get("/close", |q: http.Request| -> http.Response {
+        let mut x = http.text(200, "closing")
+        x.keep_alive = false
+        x
+    })
+    r.get("/barrier", |q: http.Request| -> http.Response {
+        let id = q.query_param("id").unwrap_or(lit("x"))
+        let n = bytes.parse_u64(q.query_param("n").unwrap_or(lit("1"))).unwrap_or(1) as i64
+        let first = gate.modify(|inout m: Map[List[u8], i64]| -> i64 {
+            let v = match m.get(id.copy()) {
+                Some(x) => x + 1
+                None => 1
+            }
+            m.insert(id.copy(), v)
+            v
+        })
+        let dl = time.after_ms(10000)
+        while true {
+            let now = gate.modify(|inout m: Map[List[u8], i64]| -> i64 { m.get(id.copy()).unwrap_or(0) })
+            if now >= n { break }
+            if dl.expired() { return http.text(504, "barrier timed out") }
+            time.sleep_ms(2)
+        }
+        http.text(200, "released")
+    })
+    r.get("/redir/:code", |q: http.Request| -> http.Response {
+        let code = bytes.parse_u64(q.param("code").unwrap_or(lit("302"))).unwrap_or(302) as i32
+        let mut x = http.response(code)
+        x.set_header("Location", q.query_param("to").unwrap_or(lit("/hello")))
+        x.body = lit("moved")
+        x
+    })
+    r.post("/redir/:code", |q: http.Request| -> http.Response {
+        let code = bytes.parse_u64(q.param("code").unwrap_or(lit("302"))).unwrap_or(302) as i32
+        let mut x = http.response(code)
+        x.set_header("Location", q.query_param("to").unwrap_or(lit("/who")))
+        x
+    })
+    r.get("/chain/:n", |q: http.Request| -> http.Response {
+        let n = bytes.parse_u64(q.param("n").unwrap_or(lit("0"))).unwrap_or(0) as i64
+        if n == 0 { return http.text(200, "end of chain") }
+        let mut x = http.response(302)
+        let mut to = lit("/chain/")
+        bytes.append(inout to, bytes.from_i64(n - 1))
+        x.set_header("Location", to)
+        x
+    })
+    r.get("/loop", |q: http.Request| -> http.Response {
+        let mut x = http.response(302)
+        x.set_header("Location", lit("/loop"))
+        x
+    })
+    r.get("/nolocation", |q: http.Request| -> http.Response { http.response(302) })
+    r.get("/dir/page", |q: http.Request| -> http.Response {
+        let mut x = http.response(302)
+        x.set_header("Location", lit("../other/./thing?a=1"))
+        x
+    })
+    r.get("/other/thing", |q: http.Request| -> http.Response {
+        http.respond(200, "text/plain", bytes.concat(lit("other thing ?"), q.query))
+    })
+    r.get("/who", |q: http.Request| -> http.Response { who(q) })
+    r.post("/who", |q: http.Request| -> http.Response { who(q) })
+    r.put("/redir/:code", |q: http.Request| -> http.Response {
+        let mut x = http.response(303)
+        x.set_header("Location", q.query_param("to").unwrap_or(lit("/who")))
+        x
+    })
+    r.put("/who", |q: http.Request| -> http.Response { who(q) })
+    r.get("/set", |q: http.Request| -> http.Response {
+        let mut x = http.text(200, "set")
+        for k in ["a", "b", "c"] {
+            match q.query_param(k) {
+                Some(v) => { x.set_header("Set-Cookie", v) }
+                None => {}
+            }
+        }
+        x
+    })
+    r.get("/set-then", |q: http.Request| -> http.Response {
+        let mut x = http.response(302)
+        x.set_header("Set-Cookie", lit("hop=1; Path=/"))
+        x.set_header("Location", q.query_param("to").unwrap_or(lit("/who")))
+        x
+    })
+    r.get("/slow", |q: http.Request| -> http.Response {
+        time.sleep_ms(1500)
+        http.text(200, "late")
+    })
+    r.get("/text", |q: http.Request| -> http.Response {
+        let mut b: List[u8] = List.new()
+        for i in 0..(4000 as i32) { b.push(97 + ((i % 7) as u8)) }
+        http.respond(200, "text/plain", b)
+    })
+    compress.responses(compress.options(), router.handler(r))
+}
+
+fn who(q: http.Request) -> http.Response {
+    let mut t = sys.to_string(q.method)
+    t.push_str(" path=")
+    t.append(sys.to_string(q.path))
+    t.push_str(" auth=[")
+    t.append(sys.to_string(q.header("authorization").unwrap_or(lit("-"))))
+    t.push_str("] cookie=[")
+    t.append(sys.to_string(q.header("cookie").unwrap_or(lit("-"))))
+    t.push_str("] x=[")
+    t.append(sys.to_string(q.header("x-default").unwrap_or(lit("-"))))
+    t.push_str("] ct=[")
+    t.append(sys.to_string(q.header("content-type").unwrap_or(lit("-"))))
+    t.push_str("] body=[")
+    t.append(sys.to_string(q.body))
+    t.push_str("]")
+    http.respond(200, "text/plain", t.bytes())
+}
+
+fn start(name: str, cfg: server.Config) -> Rig uses io, net, clock, threads {
+    let srv = server.listen(net.ipv4(127, 0, 0, 1, 0), cfg).unwrap()
+    let h = app(name, sync.lock(Map.new()))
+    let tok = task.root()
+    let t = tok
+    let th = spawn(|| -> server.Stats { srv.serve(h, t).unwrap() })
+    Rig(srv, tok, th, srv.port())
+}
+
+fn quiet() -> server.Config uses io, clock {
+    let mut cfg = server.config()
+    cfg.log = None
+    cfg
+}
+
+fn stop(r: Rig) -> server.Stats uses io {
+    r.tok.cancel()
+    r.th.join()
+}
+
+fn url(r: Rig, path: str) -> List[u8] {
+    let mut u = String.from("http://127.0.0.1:")
+    u.append(num(r.port as i64))
+    u.push_str(path)
+    u.bytes()
+}
+
+fn urls(r: Rig, path: String) -> List[u8] {
+    let mut u = String.from("http://127.0.0.1:")
+    u.append(num(r.port as i64))
+    u.append(path)
+    u.bytes()
+}
+
+/// The URL as text with the port of `r` replaced by PORT, so that the expected output has no port in it.
+fn masked(b: List[u8], rigs: List[Rig]) -> String {
+    let mut s = sys.to_string(b)
+    let mut i = 0
+    for r in rigs {
+        i += 1
+        let mut tag = String.from("PORT")
+        tag.append(num(i as i64))
+        let p = num(r.port as i64)
+        s = replace_all(s, p, tag)
+    }
+    s
+}
+
+fn replace_all(s: String, from: String, to: String) -> String {
+    let mut out = String.from("")
+    let b = s.bytes()
+    let f = from.bytes()
+    let mut i: usize = 0
+    while i < b.len() {
+        if i + f.len() <= b.len() && bytes.eq(bytes.slice(b, i, i + f.len()), f) {
+            out.append(to.copy())
+            i += f.len()
+        } else {
+            out.append(sys.to_string(bytes.slice(b, i, i + 1)))
+            i += 1
+        }
+    }
+    out
+}
+
+fn show(r: Result[http.Response, String]) uses io {
+    match r {
+        Ok(x) => {
+            let mut t = num(x.status as i64)
+            t.push_str(" ")
+            t.append(sys.to_string(x.body))
+            print(t)
+        }
+        Err(e) => {
+            let mut t = String.from("error: ")
+            t.append(e)
+            print(t)
+        }
+    }
+}
+
+fn show_final(r: Result[http.Response, String], rigs: List[Rig]) uses io {
+    match r {
+        Ok(x) => {
+            let mut t = num(x.status as i64)
+            t.push_str(" ")
+            t.append(sys.to_string(x.body))
+            t.push_str(" | url=")
+            t.append(masked(x.get_ctx("url").unwrap_or(lit("-")), rigs))
+            t.push_str(" redirects=")
+            t.append(sys.to_string(x.get_ctx("redirects").unwrap_or(lit("-"))))
+            print(t)
+        }
+        Err(e) => {
+            let mut t = String.from("error: ")
+            t.append(e)
+            print(t)
+        }
+    }
+}
+
+fn show_err_only(r: Result[http.Response, String], rigs: List[Rig]) uses io {
+    match r {
+        Ok(x) => print(num(x.status as i64))
+        Err(e) => print(masked(e.bytes(), rigs))
+    }
+}
+
+// ---- reuse
+
+fn reuse() uses io, net, clock, threads {
+    print("-- keep-alive reuse")
+    let a = start("A", quiet())
+    let c = pool.new()
+    for i in 0..5 { show(c.get(url(a, "/hello"))) }
+    let st = c.stats()
+    print(st.opened)
+    print(st.reused)
+    print(st.idle)
+    c.close()
+    print(c.stats().idle)
+    print(stop(a).connections)
+
+    print("-- Connection: close is not reused")
+    let b = start("B", quiet())
+    let c2 = pool.new()
+    for i in 0..3 { show(c2.get(url(b, "/close"))) }
+    print(c2.stats().opened)
+    print(c2.stats().reused)
+    print(c2.stats().idle)
+    // the server closing after n requests ends a connection the same way
+    let mut cfg = quiet()
+    cfg.max_requests = 2
+    let m = start("M", cfg)
+    let c3 = pool.new()
+    for i in 0..5 { show(c3.get(url(m, "/hello"))) }
+    print(c3.stats().opened)
+    print(stop(m).connections)
+    print(stop(b).connections)
+
+    print("-- the idle limits")
+    let d = start("D", quiet())
+    let c4 = pool.new().with_idle_timeout(time.millis(150))
+    show(c4.get(url(d, "/hello")))
+    time.sleep_ms(500)
+    show(c4.get(url(d, "/hello")))
+    print(c4.stats().opened)
+    print(c4.stats().reused)
+    let c5 = pool.new().with_max_idle_per_host(0)
+    show(c5.get(url(d, "/hello")))
+    show(c5.get(url(d, "/hello")))
+    print(c5.stats().opened)
+    print(c5.stats().idle)
+    c4.close()
+    c5.close()
+    print(stop(d).connections)
+
+    print("-- a pooled connection the server closed")
+    let mut cfg2 = quiet()
+    cfg2.idle_timeout = time.millis(200)
+    let e = start("E", cfg2)
+    let c6 = pool.new()
+    show(c6.get(url(e, "/hello")))
+    time.sleep_ms(800)
+    show(c6.get(url(e, "/hello")))
+    print(c6.stats().opened)
+    print(c6.stats().reused)
+    c6.close()
+    print(stop(e).connections)
+}
+
+// ---- a pooled connection that dies under the call
+
+fn dying() uses io, net, clock, threads {
+    print("-- a pooled connection that dies under the call: GET goes again, POST does not")
+    let ls = net.listener(net.ipv4(127, 0, 0, 1, 0), true).unwrap()
+    let port = net.local_addr(ls).unwrap().port
+    let th = spawn(|| -> i32 {
+        let ok = lit("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        // connection 1: answers the first request, closes on the second without a word
+        let c1 = stream.accept_by(ls, time.after_ms(20000)).unwrap()
+        let r1 = fd.read_by(c1.fd.fd, 4096, time.after_ms(10000))
+        let s1 = sock_send(c1.fd.fd, ok)
+        let r2 = fd.read_by(c1.fd.fd, 4096, time.after_ms(10000))
+        let z1 = fd.close(c1.fd.fd)
+        // connection 2: the retry of the GET, then the same for a POST
+        let c2 = stream.accept_by(ls, time.after_ms(20000)).unwrap()
+        let r3 = fd.read_by(c2.fd.fd, 4096, time.after_ms(10000))
+        let s2 = sock_send(c2.fd.fd, ok)
+        let r4 = fd.read_by(c2.fd.fd, 4096, time.after_ms(10000))
+        let z2 = fd.close(c2.fd.fd)
+        0
+    })
+    let c = pool.new()
+    let base = String.from("http://127.0.0.1:")
+    let mut u = base.copy()
+    u.append(num(port as i64))
+    let mut u1 = u.copy()
+    u1.push_str("/a")
+    let mut u2 = u.copy()
+    u2.push_str("/b")
+    show(c.get(u1.bytes()))
+    show(c.get(u2.bytes()))
+    print(c.stats().opened)
+    print(c.stats().reused)
+    // the connection 2 now dies on the POST (no retry for a method that may have run)
+    let mut u3 = u.copy()
+    u3.push_str("/c")
+    show_err_only(c.post(u3.bytes(), "text/plain", lit("x")), List[])
+    print(c.stats().opened)
+    let z = th.join()
+    c.close()
+}
+
+fn sock_send(f: i32, b: List[u8]) -> bool uses net, io, clock {
+    sock.send_by(f, b, time.after_ms(10000))
+}
+
+// ---- concurrency
+
+fn concurrency() uses io, net, clock, threads {
+    print("-- eight calls in flight at once need eight connections")
+    let a = start("A", quiet())
+    let c = pool.new()
+    let mut ts: List[Task[i32]] = List.new()
+    for i in 0..8 {
+        let cc = c
+        let u = url(a, "/barrier?n=8&id=w1")
+        ts.push(spawn(|| -> i32 {
+            match cc.get(u) {
+                Ok(r) => r.status
+                Err(e) => 0
+            }
+        }))
+    }
+    let mut oks = 0
+    for t in ts { if t.join() == 200 { oks += 1 } }
+    print(oks)
+    print(c.stats().opened)
+    print(c.stats().idle)
+    // the next wave of 8 sequential calls reuses one of them
+    for i in 0..8 { show(c.get(url(a, "/hello"))) }
+    print(c.stats().opened)
+    c.close()
+    print("-- the idle limit keeps two of them")
+    let c2 = pool.new().with_max_idle_per_host(2)
+    let mut ts2: List[Task[i32]] = List.new()
+    for i in 0..6 {
+        let cc = c2
+        let u = url(a, "/barrier?n=6&id=w2")
+        ts2.push(spawn(|| -> i32 {
+            match cc.get(u) {
+                Ok(r) => r.status
+                Err(e) => 0
+            }
+        }))
+    }
+    let mut oks2 = 0
+    for t in ts2 { if t.join() == 200 { oks2 += 1 } }
+    print(oks2)
+    print(c2.stats().opened)
+    print(c2.stats().idle)
+    c2.close()
+    print("-- many tasks, many calls: every answer is its own")
+    let c3 = pool.new()
+    let mut ts3: List[Task[i32]] = List.new()
+    for i in 0..10 {
+        let cc = c3
+        let k = i
+        let u = url(a, "/who")
+        ts3.push(spawn(|| -> i32 {
+            let mut bad = 0
+            for j in 0..10 {
+                let body = bytes.from_i64((k * 100 + j) as i64)
+                match cc.send(pool.call("POST", u).with_body("text/plain", body.copy())) {
+                    Ok(r) => {
+                        let want = bytes.concat(bytes.concat(lit("body=["), body), lit("]"))
+                        if bytes.find(r.body, want, 0).is_none() { bad += 1 }
+                    }
+                    Err(e) => { bad += 1 }
+                }
+            }
+            bad
+        }))
+    }
+    let mut bad = 0
+    for t in ts3 { bad += t.join() }
+    print(bad)
+    print(c3.stats().requests)
+    print(c3.stats().opened < 100)
+    c3.close()
+    let s = stop(a)
+    print(s.connections >= 8)
+}
+
+// ---- redirects
+
+fn redirects() uses io, net, clock, threads {
+    let a = start("A", quiet())
+    let rigs = List[a]
+    let c = pool.new()
+    print("-- every status")
+    show_final(c.get(url(a, "/redir/301?to=/hello")), rigs)
+    show_final(c.get(url(a, "/redir/302?to=/hello")), rigs)
+    show_final(c.get(url(a, "/redir/303?to=/hello")), rigs)
+    show_final(c.get(url(a, "/redir/307?to=/hello")), rigs)
+    show_final(c.get(url(a, "/redir/308?to=/hello")), rigs)
+    print("-- 300, 304 and a 302 with no Location are returned as they are")
+    show_final(c.get(url(a, "/redir/300?to=/hello")), rigs)
+    show_final(c.get(url(a, "/redir/304?to=/hello")), rigs)
+    show_final(c.get(url(a, "/nolocation")), rigs)
+    print("-- the method and the body")
+    for code in ["301", "302", "303", "307", "308"] {
+        let mut p = String.from("/redir/")
+        p.push_str(code)
+        p.push_str("?to=/who")
+        let r = c.send(pool.call("POST", urls(a, p)).with_body("text/plain", lit("payload")).with_header("X-Default", lit("kept")))
+        let mut t = String.from(code)
+        t.push_str(": ")
+        match r {
+            Ok(x) => { t.append(sys.to_string(x.body)) }
+            Err(e) => { t.append(e) }
+        }
+        print(t)
+    }
+    let r303 = c.send(pool.call("PUT", url(a, "/redir/303?to=/who")).with_body("text/plain", lit("put")))
+    print(sys.to_string(r303.unwrap().body))
+    let rh = c.send(pool.call("HEAD", url(a, "/redir/303?to=/hello")))
+    print(rh.unwrap().status)
+    print("-- chains, relative Location, dot segments")
+    show_final(c.get(url(a, "/chain/5")), rigs)
+    show_final(c.get(url(a, "/dir/page")), rigs)
+    show_final(c.get(url(a, "/redir/302?to=//127.0.0.1:1/x")), rigs)
+    show_final(c.get(url(a, "/redir/302?to=ftp://example.org/x")), rigs)
+    show_final(c.get(url(a, "/redir/302?to=%2Fwith%20space")), rigs)
+    print("-- limits and loops")
+    show_err_only(c.get(url(a, "/loop")), rigs)
+    show_err_only(c.get(url(a, "/chain/11")), rigs)
+    show_final(c.get(url(a, "/chain/10")), rigs)
+    show_err_only(c.with_max_redirects(2).get(url(a, "/chain/3")), rigs)
+    show_final(c.with_max_redirects(3).get(url(a, "/chain/3")), rigs)
+    show_final(c.with_max_redirects(0).get(url(a, "/chain/3")), rigs)
+    show_final(c.send(pool.call("GET", url(a, "/chain/3")).with_max_redirects(1)), rigs)
+    print(c.stats().redirects > 20)
+    c.close()
+    print(stop(a).bad)
+}
+
+// ---- credentials across origins
+
+fn origins() uses io, net, clock, threads {
+    let a = start("A", quiet())
+    let b = start("B", quiet())
+    let rigs = List[a, b]
+    let c = pool.new().with_header("Authorization", lit("Bearer secret")).with_header("X-Default", lit("on"))
+    print("-- the same origin keeps them")
+    let same = c.send(pool.call("GET", url(a, "/redir/302?to=/who")).with_header("Cookie", lit("sid=1")))
+    print(sys.to_string(same.unwrap().body))
+    print("-- another port is another origin: no Authorization, no Cookie (X-Default stays)")
+    let mut to = String.from("/redir/302?to=")
+    to.append(sys.to_string(url(b, "/who")))
+    let cross = c.send(pool.call("GET", urls(a, to)).with_header("Cookie", lit("sid=1")))
+    print(sys.to_string(cross.unwrap().body))
+    print("-- and the call's own Authorization goes too, also across a chain that comes back")
+    let mut back = String.from("/redir/302?to=")
+    back.append(sys.to_string(url(b, "/redir/302?to=/who")))
+    let own = c.send(pool.call("GET", urls(a, back)).with_header("Authorization", lit("Basic abc")))
+    print(sys.to_string(own.unwrap().body))
+    print("-- 307 across origins keeps the method and the body, not the credentials")
+    let mut to307 = String.from("/redir/307?to=")
+    to307.append(sys.to_string(url(b, "/who")))
+    let post = c.send(pool.call("POST", urls(a, to307)).with_body("text/plain", lit("data")))
+    print(sys.to_string(post.unwrap().body))
+    print("-- the URL of the answer names the second server")
+    show_final(c.get(urls(a, to)), rigs)
+    c.close()
+    print(stop(a).requests > 0)
+    print(stop(b).requests > 0)
+}
+
+// ---- cookies
+
+fn cookies() uses io, net, clock, threads {
+    let a = start("A", quiet())
+    let rigs = List[a]
+    let jar = cookiejar.new()
+    let c = pool.new().with_cookies(jar)
+    print("-- a cookie set by one call goes back on the next")
+    show(c.get(url(a, "/who")))
+    show(c.get(url(a, "/set?a=sid%3Dabc%3B%20Path%3D%2F&b=theme%3Ddark%3B%20Path%3D%2Fwho")))
+    show(c.get(url(a, "/who")))
+    show(c.get(url(a, "/hello")))
+    print(jar.len())
+    print("-- the program's own Cookie header is kept and the jar's added")
+    let mine = c.send(pool.call("GET", url(a, "/who")).with_header("Cookie", lit("mine=1")))
+    print(sys.to_string(mine.unwrap().body))
+    print("-- a cookie set during a redirect is sent to the next hop")
+    show(c.get(url(a, "/set-then?to=/who")))
+    print("-- Max-Age=0 deletes, Secure is not stored from http, another Domain is refused")
+    show(c.get(url(a, "/set?a=sid%3D%3B%20Max-Age%3D0%3B%20Path%3D%2F&b=s%3D1%3B%20Secure&c=d%3D1%3B%20Domain%3Dexample.com")))
+    show(c.get(url(a, "/who")))
+    print("-- a cookie for the host that is an IP address: Domain equal to the host is fine, a Path limits it")
+    show(c.get(url(a, "/set?a=p%3D1%3B%20Path%3D%2Fnowhere&b=q%3D2%3B%20Domain%3D127.0.0.1")))
+    show(c.get(url(a, "/who")))
+    c.close()
+    let off = pool.new()
+    show(off.get(url(a, "/set?a=x%3D1")))
+    show(off.get(url(a, "/who")))
+    off.close()
+    print(stop(a).bad)
+}
+
+// ---- base URL, default headers, deadlines, gzip
+
+fn options() uses io, net, clock, threads {
+    let a = start("A", quiet())
+    let rigs = List[a]
+    print("-- base URL")
+    let base = url(a, "/dir/")
+    let c = pool.new().with_base(base)
+    show_final(c.get(lit("../who")), rigs)
+    show_final(c.get(lit("/who?z=1")), rigs)
+    show_final(c.get(lit("page")), rigs)
+    show_final(c.get(url(a, "/hello")), rigs)
+    show_final(pool.new().get(lit("/who")), rigs)
+    show_final(pool.new().with_base(lit("nonsense")).get(lit("/who")), rigs)
+    print("-- default headers; the call's own wins")
+    let c2 = pool.new().with_header("X-Default", lit("one")).with_header("Authorization", lit("Bearer t"))
+    show(c2.get(url(a, "/who")))
+    let o = c2.send(pool.call("GET", url(a, "/who")).with_header("X-Default", lit("two")))
+    print(sys.to_string(o.unwrap().body))
+    print("-- a bad header is refused before it is sent")
+    show_err_only(c2.send(pool.call("GET", url(a, "/who")).with_header("X-Bad", lit("a\r\nInjected: 1"))), rigs)
+    print("-- deadline: one for the whole call")
+    let slow = c2.send(pool.call("GET", url(a, "/slow")).with_timeout(time.millis(300)))
+    print(slow.is_err())
+    show(c2.with_timeout(time.millis(300)).get(url(a, "/slow")))
+    show(c2.get(url(a, "/hello")))
+    print("-- an address nobody listens on")
+    show(c2.get(lit("http://127.0.0.1:1/")).map_err(|e: String| -> String { String.from("refused") }))
+    show(c2.get(lit("http://127.0.0.1:99999/")))
+    show(c2.get(lit("gopher://x/")))
+    print("-- gzip: asked for, decoded, and the length is the plain one")
+    let g = c2.get(url(a, "/text")).unwrap()
+    print(g.body.len())
+    print(g.header("content-encoding").is_none())
+    let raw = pool.new().with_decoding(None)
+    let gr = raw.send(pool.call("GET", url(a, "/text")).with_header("Accept-Encoding", lit("gzip"))).unwrap()
+    print(sys.to_string(gr.header("content-encoding").unwrap_or(lit("-"))))
+    print(gr.body.len() < 1000)
+    c.close()
+    c2.close()
+    raw.close()
+    print(stop(a).bad)
+}
+
+fn main() uses io, net, clock, threads {
+    reuse()
+    dying()
+    concurrency()
+    redirects()
+    origins()
+    cookies()
+    options()
+}

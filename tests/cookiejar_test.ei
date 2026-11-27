@@ -1,0 +1,128 @@
+// http/cookiejar: the client's cookie store with explicit times: host-only and Domain cookies,
+// path matching and default paths (RFC 6265 5.1.3 and 5.1.4), lifetimes, Secure, replacement, order,
+// the limits, and the cookies a jar must refuse.
+
+import core.sys
+import std.bytes
+import std.io
+import http
+import http.cookie
+import http.cookiejar
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn sc(lines: List[str]) -> List[http.Header] {
+    let mut hs: List[http.Header] = List.new()
+    for l in lines { hs.push(http.Header(lit("Set-Cookie"), lit(l))) }
+    hs
+}
+
+fn header(j: cookiejar.Jar, host: str, path: str, secure: bool, now: i64) -> String {
+    match j.header_for(lit(host), lit(path), secure, now) {
+        Some(h) => sys.to_string(h)
+        None => String.from("(none)")
+    }
+}
+
+fn main() uses io {
+    let now: i64 = 1700000000
+    print("-- matching")
+    print(cookiejar.domain_match(lit("www.example.com"), lit("example.com")))
+    print(cookiejar.domain_match(lit("example.com"), lit("example.com")))
+    print(cookiejar.domain_match(lit("badexample.com"), lit("example.com")))
+    print(cookiejar.domain_match(lit("example.com"), lit("www.example.com")))
+    print(cookiejar.domain_match(lit("10.1.2.3"), lit("2.3")))
+    print(cookiejar.path_match(lit("/a/b"), lit("/a")))
+    print(cookiejar.path_match(lit("/a/b"), lit("/a/")))
+    print(cookiejar.path_match(lit("/ab"), lit("/a")))
+    print(cookiejar.path_match(lit("/a"), lit("/a")))
+    print(cookiejar.path_match(lit("/"), lit("/a")))
+    for p in ["/", "", "/a", "/a/b", "/a/b/", "x"] { print(sys.to_string(cookiejar.default_path(lit(p)))) }
+
+    print("-- host-only and Domain cookies")
+    let j = cookiejar.new()
+    print(j.store(lit("www.example.com"), lit("/"), false, sc(List["h=1", "d=2; Domain=example.com", "dd=3; Domain=.EXAMPLE.com"]), now))
+    print(header(j, "www.example.com", "/", false, now))
+    print(header(j, "example.com", "/", false, now))
+    print(header(j, "sub.www.example.com", "/", false, now))
+    print(header(j, "other.org", "/", false, now))
+    print("-- refused: a Domain the host is not in, a single label, a public-suffix-like parent is NOT refused, an IP address")
+    let j2 = cookiejar.new()
+    print(j2.store(lit("www.example.com"), lit("/"), false, sc(List["a=1; Domain=other.com", "b=1; Domain=com", "c=1; Domain=example.com", "d=1; Domain=www.example.com.evil.org"]), now))
+    print(header(j2, "example.com", "/", false, now))
+    let j3 = cookiejar.new()
+    print(j3.store(lit("10.1.2.3"), lit("/"), false, sc(List["a=1; Domain=2.3", "b=1; Domain=10.1.2.3", "c=1"]), now))
+    print(header(j3, "10.1.2.3", "/", false, now))
+    print(header(j3, "9.9.2.3", "/", false, now))
+
+    print("-- paths")
+    let j4 = cookiejar.new()
+    print(j4.store(lit("h"), lit("/dir/page"), false, sc(List["dflt=1", "root=2; Path=/", "deep=3; Path=/dir/page/x", "bad=4; Path=nope"]), now))
+    print(header(j4, "h", "/dir/other", false, now))
+    print(header(j4, "h", "/dir/page/x/y", false, now))
+    print(header(j4, "h", "/dir", false, now))
+    print(header(j4, "h", "/", false, now))
+    print("-- the longer path first, then the older cookie")
+    let j5 = cookiejar.new()
+    let k1 = j5.store(lit("h"), lit("/"), false, sc(List["a=1; Path=/"]), now)
+    let k2 = j5.store(lit("h"), lit("/"), false, sc(List["b=2; Path=/x/y"]), now + 5)
+    let k3 = j5.store(lit("h"), lit("/"), false, sc(List["c=3; Path=/x"]), now + 6)
+    let k4 = j5.store(lit("h"), lit("/"), false, sc(List["d=4; Path=/"]), now + 7)
+    print(header(j5, "h", "/x/y/z", false, now + 10))
+
+    print("-- lifetimes")
+    let j6 = cookiejar.new()
+    let k5 = j6.store(lit("h"), lit("/"), false, sc(List["s=1", "m=2; Max-Age=60", "e=3; Expires=Tue, 14 Nov 2023 22:15:30 GMT", "both=4; Max-Age=10; Expires=Wed, 01 Jan 2100 00:00:00 GMT", "past=5; Expires=Thu, 01 Jan 1970 00:00:00 GMT", "neg=6; Max-Age=-5"]), now)
+    print(header(j6, "h", "/", false, now))
+    print(header(j6, "h", "/", false, now + 20))
+    print(header(j6, "h", "/", false, now + 61))
+    print(header(j6, "h", "/", false, now + 1000000))
+    print(j6.len())
+    let far = cookiejar.new()
+    let k6 = far.store(lit("h"), lit("/"), false, sc(List["f=1; Max-Age=999999999999"]), now)
+    print(far.entries()[0].expires - now)
+    print("-- replace and delete")
+    let j7 = cookiejar.new()
+    let k7 = j7.store(lit("h"), lit("/"), false, sc(List["a=1", "b=1"]), now)
+    let k8 = j7.store(lit("h"), lit("/"), false, sc(List["a=2"]), now + 1)
+    print(header(j7, "h", "/", false, now + 2))
+    print(j7.entries()[0].created == now)
+    print(j7.store(lit("h"), lit("/"), false, sc(List["a=gone; Max-Age=0"]), now + 3))
+    print(header(j7, "h", "/", false, now + 4))
+    // another path is another cookie
+    let k9 = j7.store(lit("h"), lit("/"), false, sc(List["b=2; Path=/p"]), now + 5)
+    print(j7.len())
+    print("-- Secure")
+    let j8 = cookiejar.new()
+    print(j8.store(lit("h"), lit("/"), false, sc(List["plain=1", "sec=1; Secure"]), now))
+    print(j8.store(lit("h"), lit("/"), true, sc(List["sec=2; Secure"]), now))
+    print(header(j8, "h", "/", false, now))
+    print(header(j8, "h", "/", true, now))
+    print("-- an http response cannot replace or delete a Secure cookie")
+    print(j8.store(lit("h"), lit("/"), false, sc(List["sec=evil; Path=/"]), now))
+    print(j8.store(lit("h"), lit("/"), false, sc(List["sec=; Max-Age=0"]), now))
+    print(header(j8, "h", "/", true, now))
+    print(j8.store(lit("h"), lit("/"), true, sc(List["sec=ok; Secure"]), now))
+    print(header(j8, "h", "/", true, now))
+    print("-- prefixes and bad lines")
+    let j9 = cookiejar.new()
+    print(j9.store(lit("h"), lit("/"), true, sc(List["__Host-a=1; Secure; Path=/", "__Host-b=1; Secure; Path=/; Domain=h.com", "__Secure-c=1", "garbage", "=x", "ok=1"]), now))
+    print(header(j9, "h", "/", true, now))
+    print("-- limits: 50 per domain, the oldest go")
+    let j10 = cookiejar.new()
+    for i in 0..60 {
+        let mut l = String.from("c")
+        l.append(String.from_int(i as i64))
+        l.push_str("=1")
+        let kk = j10.store(lit("h"), lit("/"), false, List[http.Header(lit("Set-Cookie"), l.bytes())], now + (i as i64))
+    }
+    print(j10.len())
+    let h10 = header(j10, "h", "/", false, now + 100)
+    print(bytes.starts_with(h10.bytes(), lit("c10=1")))
+    print("-- set and clear")
+    let j11 = cookiejar.new()
+    j11.set(lit("h"), lit("t"), lit("v"), false, now)
+    print(header(j11, "h", "/anything", false, now))
+    j11.clear()
+    print(j11.len())
+}

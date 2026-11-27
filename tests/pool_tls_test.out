@@ -1,0 +1,60 @@
+-- h2: eight calls that wait for each other share one connection
+200 hello
+20
+8
+1
+1
+0
+-- bodies, headers, HEAD, a large response, gzip decoded
+POST path=/who cookie=[-] auth=[Bearer t] body=[over h2]
+200
+0
+300000
+4000
+true
+error: response body over the limit
+true
+-- redirects over h2 (same origin), cookies
+hello
+true
+POST path=/who cookie=[-] auth=[-] body=[kept]
+200 set
+200 GET path=/who cookie=[sid=abc; plain=1] auth=[-] body=[]
+2
+-- the h2 connection is replaced when it is gone
+1
+200 hello
+2
+1
+4
+-- a server without h2: HTTP/1.1 over TLS, pooled
+200 hello
+200 hello
+200 hello
+200 hello
+1
+3
+0
+11
+4
+4
+4
+-- with_h2(false) against a server that offers h2: HTTP/1.1 and one connection per call in flight
+11
+4
+4
+0
+4
+-- verification
+200 hello
+error: tls: certificate is not valid for the host name (sent alert bad_certificate)
+error: tls: unable to find a trusted issuer (sent alert unknown_ca)
+error: an https URL needs a trust configuration: Client.with_tls(..) or pool.system()
+true
+-- https to http is refused, unless allowed; http to https is followed
+error: redirect from https to http refused (with_allow_downgrade(true) follows it)
+200 hello
+200 hello
+-- a server that is gone
+200 hello
+error: failed

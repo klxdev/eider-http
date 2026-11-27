@@ -1,0 +1,162 @@
+-- keep-alive reuse
+200 hello
+200 hello
+200 hello
+200 hello
+200 hello
+1
+4
+1
+0
+1
+-- Connection: close is not reused
+200 closing
+200 closing
+200 closing
+3
+0
+1
+200 hello
+200 hello
+200 hello
+200 hello
+200 hello
+3
+3
+3
+-- the idle limits
+200 hello
+200 hello
+2
+0
+200 hello
+200 hello
+2
+0
+4
+-- a pooled connection the server closed
+200 hello
+200 hello
+2
+0
+2
+-- a pooled connection that dies under the call: GET goes again, POST does not
+200 ok
+200 ok
+2
+1
+connection closed before a response
+2
+-- eight calls in flight at once need eight connections
+8
+8
+8
+200 hello
+200 hello
+200 hello
+200 hello
+200 hello
+200 hello
+200 hello
+200 hello
+8
+-- the idle limit keeps two of them
+6
+6
+2
+-- many tasks, many calls: every answer is its own
+0
+100
+true
+true
+-- every status
+200 hello | url=http://127.0.0.1:PORT1/hello redirects=1
+200 hello | url=http://127.0.0.1:PORT1/hello redirects=1
+200 hello | url=http://127.0.0.1:PORT1/hello redirects=1
+200 hello | url=http://127.0.0.1:PORT1/hello redirects=1
+200 hello | url=http://127.0.0.1:PORT1/hello redirects=1
+-- 300, 304 and a 302 with no Location are returned as they are
+300 moved | url=http://127.0.0.1:PORT1/redir/300?to=/hello redirects=0
+304  | url=http://127.0.0.1:PORT1/redir/304?to=/hello redirects=0
+302  | url=http://127.0.0.1:PORT1/nolocation redirects=0
+-- the method and the body
+301: GET path=/who auth=[-] cookie=[-] x=[kept] ct=[-] body=[]
+302: GET path=/who auth=[-] cookie=[-] x=[kept] ct=[-] body=[]
+303: GET path=/who auth=[-] cookie=[-] x=[kept] ct=[-] body=[]
+307: POST path=/who auth=[-] cookie=[-] x=[kept] ct=[text/plain] body=[payload]
+308: POST path=/who auth=[-] cookie=[-] x=[kept] ct=[text/plain] body=[payload]
+GET path=/who auth=[-] cookie=[-] x=[-] ct=[-] body=[]
+200
+-- chains, relative Location, dot segments
+200 end of chain | url=http://127.0.0.1:PORT1/chain/0 redirects=5
+200 other thing ?a=1 | url=http://127.0.0.1:PORT1/other/thing?a=1 redirects=1
+error: connect: Connection refused
+error: unsupported URL scheme
+error: a URL with a space, a control byte or a non-ASCII byte (encode it)
+-- limits and loops
+too many redirects (the limit is 10)
+too many redirects (the limit is 10)
+200 end of chain | url=http://127.0.0.1:PORT1/chain/0 redirects=10
+too many redirects (the limit is 2)
+200 end of chain | url=http://127.0.0.1:PORT1/chain/0 redirects=3
+302  | url=http://127.0.0.1:PORT1/chain/3 redirects=0
+error: too many redirects (the limit is 1)
+true
+0
+-- the same origin keeps them
+GET path=/who auth=[Bearer secret] cookie=[sid=1] x=[on] ct=[-] body=[]
+-- another port is another origin: no Authorization, no Cookie (X-Default stays)
+GET path=/who auth=[-] cookie=[-] x=[on] ct=[-] body=[]
+-- and the call's own Authorization goes too, also across a chain that comes back
+GET path=/who auth=[-] cookie=[-] x=[on] ct=[-] body=[]
+-- 307 across origins keeps the method and the body, not the credentials
+POST path=/who auth=[-] cookie=[-] x=[on] ct=[text/plain] body=[data]
+-- the URL of the answer names the second server
+200 GET path=/who auth=[-] cookie=[-] x=[on] ct=[-] body=[] | url=http://127.0.0.1:PORT2/who redirects=1
+true
+true
+-- a cookie set by one call goes back on the next
+200 GET path=/who auth=[-] cookie=[-] x=[-] ct=[-] body=[]
+200 set
+200 GET path=/who auth=[-] cookie=[theme=dark; sid=abc] x=[-] ct=[-] body=[]
+200 hello
+2
+-- the program's own Cookie header is kept and the jar's added
+GET path=/who auth=[-] cookie=[mine=1; theme=dark; sid=abc] x=[-] ct=[-] body=[]
+-- a cookie set during a redirect is sent to the next hop
+200 GET path=/who auth=[-] cookie=[theme=dark; sid=abc; hop=1] x=[-] ct=[-] body=[]
+-- Max-Age=0 deletes, Secure is not stored from http, another Domain is refused
+200 set
+200 GET path=/who auth=[-] cookie=[theme=dark; hop=1] x=[-] ct=[-] body=[]
+-- a cookie for the host that is an IP address: Domain equal to the host is fine, a Path limits it
+200 set
+200 GET path=/who auth=[-] cookie=[theme=dark; hop=1; q=2] x=[-] ct=[-] body=[]
+200 set
+200 GET path=/who auth=[-] cookie=[-] x=[-] ct=[-] body=[]
+0
+-- base URL
+200 GET path=/who auth=[-] cookie=[-] x=[-] ct=[-] body=[] | url=http://127.0.0.1:PORT1/who redirects=0
+200 GET path=/who auth=[-] cookie=[-] x=[-] ct=[-] body=[] | url=http://127.0.0.1:PORT1/who?z=1 redirects=0
+200 other thing ?a=1 | url=http://127.0.0.1:PORT1/other/thing?a=1 redirects=1
+200 hello | url=http://127.0.0.1:PORT1/hello redirects=0
+error: a relative URL needs a base URL (Client.with_base)
+error: bad base URL: secure: the URL must start with http://, https://, ws:// or wss://
+-- default headers; the call's own wins
+200 GET path=/who auth=[Bearer t] cookie=[-] x=[one] ct=[-] body=[]
+GET path=/who auth=[Bearer t] cookie=[-] x=[two] ct=[-] body=[]
+-- a bad header is refused before it is sent
+invalid value for header X-Bad
+-- deadline: one for the whole call
+true
+error: response: deadline exceeded
+200 hello
+-- an address nobody listens on
+error: refused
+error: secure: bad port in the URL
+error: unsupported URL scheme
+-- gzip: asked for, decoded, and the length is the plain one
+4000
+true
+gzip
+true
+0

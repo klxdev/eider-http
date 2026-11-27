@@ -1,0 +1,938 @@
+//! http/pool: a high-level HTTP client over http/client, http/secure and http/h2, for programs that call
+//! services: a pool of connections per authority, redirects, a cookie jar, a base URL, default headers and
+//! a deadline per request (docs/pool.md).
+//!
+//!     let c = pool.new().with_base("http://127.0.0.1:8080/api/".bytes()).with_header("Accept", "application/json".bytes())
+//!     let r = c.get("users/7".bytes()).unwrap()                        // http://127.0.0.1:8080/api/users/7
+//!     let r2 = c.send(pool.call("POST", "/login".bytes()).with_body("application/json", body)).unwrap()
+//!
+//! A `Client` is cheap to copy and every copy shares one pool: give one to each task. Nothing in it is
+//! blocking for long: a call waits for a connection only as long as it takes to make one.
+//!
+//! Connections:
+//! - one pool per authority (scheme, host, port). An `http://` or an `https://` authority that speaks
+//!   HTTP/1.1 keeps up to `max_idle_per_host` idle keep-alive connections for `idle_timeout`; a call takes
+//!   an idle one (the newest) or opens a new one, so the number of connections follows the number of
+//!   calls in flight. A connection goes back only when its response was read to the end and neither side
+//!   said `Connection: close` (an HTTP/1.0 response without keep-alive counts); anything else closes it.
+//! - over https the client offers ALPN `h2` and `http/1.1` (`with_h2(false)` offers `http/1.1` only): when the
+//!   server picks `h2` the authority has ONE connection and every call is a stream on it, as many at once
+//!   as the server allows (`h2.Options.max_streams` of the server; the others wait for a slot). A dead or
+//!   GOAWAY-ed connection is replaced. Plain `http://` is HTTP/1.1 only (no h2c).
+//! - a connection that sat idle is checked before it is used (a closed or garbled one is dropped), and a
+//!   call that still fails on a connection taken from the pool, before any of the response, is sent once
+//!   more on a new one when its method is idempotent (GET, HEAD, PUT, DELETE, OPTIONS, TRACE).
+//!
+//! Redirects (`max_redirects`, default 10; 0 returns the 3xx as it is): 301 and 302 turn a POST into a GET, 303
+//! turns everything but HEAD into a GET (the body and `Content-*` headers go), 307 and 308 repeat the method and
+//! the body; other statuses, and a 3xx with no `Location`, are returned as they are. `Location` is resolved
+//! against the URL that was requested (absolute, `//host`, `/path`, `?query`, relative, dot segments). When the
+//! target is another origin (scheme, host or port differ) the `Authorization`, `Proxy-Authorization`, `Cookie` and
+//! `Host` headers are dropped for it and for what follows; the jar's cookies are chosen again for each URL. A
+//! redirect from `https` to `http` is refused with an Err unless `allow_downgrade`. Too many redirects (also a
+//! loop) is an Err. The final response has the context values `url` (where it came from) and `redirects`.
+//!
+//! One deadline covers the whole call, redirects included: `with_timeout` of the client (30 s) or of the call.
+//! Responses are read whole (up to `limits.max_body`, 16 MiB) and decoded when they come compressed (gzip,
+//! deflate, zstd; `with_decoding`), as http/client does.
+//!
+//! Not here: streaming bodies, proxies, HTTP/2 prior knowledge (h2c), a limit on connections per host (only on idle
+//! ones), retries beyond the one above, `Retry-After`, a resolver cache.
+
+import core.sys
+import std.bytes
+import std.sync
+import std.time
+import http
+import http.client
+import http.cookie
+import http.cookiejar
+import http.compress
+import http.h2
+import http.secure
+import http.transport
+import compression
+
+/// What a `Client` does. Change it with the `with_...` methods of `Client`.
+pub type Options = {
+    base: Option[List[u8]],
+    headers: List[http.Header],
+    timeout: time.Duration,
+    max_redirects: usize,
+    allow_downgrade: bool,
+    max_idle_per_host: usize,
+    idle_timeout: time.Duration,
+    limits: http.Limits,
+    decode: Option[compression.Limits],
+    h2: bool,
+    h2_options: h2.Options
+}
+
+/// 30 s per call, 10 redirects (no downgrade), 8 idle connections per host for 90 s, responses up to 16 MiB
+/// (decoded to 64 MiB), HTTP/2 offered over https, no cookie jar, no base URL, no default headers.
+pub fn options() -> Options {
+    let mut lim = http.limits()
+    lim.max_body = 16777216
+    let mut ho = h2.options()
+    ho.idle = time.seconds(90)
+    Options(None, List.new(), time.seconds(30), 10, false, 8, time.seconds(90), lim, Some(compression.limits()), true, ho)
+}
+
+type Idle = { conn: client.Conn, since: i64 }
+
+type Pool = {
+    idle: Map[List[u8], List[Idle]],
+    mux: Map[List[u8], h2.Client],
+    proto: Map[List[u8], i32],
+    gates: Map[List[u8], sync.Lock[bool]],
+    opened: i64,
+    reused: i64,
+    requests: i64,
+    redirects: i64
+}
+
+/// What a client has done so far: calls sent (one per hop of a redirect chain), connections opened, calls that used a
+/// connection from the pool, redirects followed, and the idle HTTP/1.1 connections and HTTP/2 connections held now.
+pub type Stats = { requests: i64, opened: i64, reused: i64, redirects: i64, idle: i64, h2_conns: i64 }
+
+/// The client: its options, the trust for https, and the pool, shared by every copy.
+pub type Client = { opt: Options, tls: Option[secure.ClientTls], jar: Option[cookiejar.Jar], pool: sync.Lock[Pool] }
+
+/// A client for `http://` URLs (and `https://` once `with_tls` says whom to trust).
+pub fn new() -> Client {
+    Client(options(), None, None, sync.lock(Pool(Map.new(), Map.new(), Map.new(), Map.new(), 0, 0, 0, 0)))
+}
+
+/// A client that verifies https servers against the operating system's CA bundle (read now).
+pub fn system() -> Result[Client, String] uses fs {
+    let tls = secure.client_system()?
+    Ok(new().with_tls(tls))
+}
+
+/// A request to send with `Client.send`: `url` is absolute or relative to the client's base URL.
+pub type Call = {
+    method: List[u8],
+    url: List[u8],
+    headers: List[http.Header],
+    body: List[u8],
+    timeout: Option[time.Duration],
+    max_redirects: Option[usize]
+}
+
+/// A call with no headers and no body. `url` is bytes (`"http://...".bytes()`, or `sys.lit("...")`).
+pub fn call(method: str, url: List[u8]) -> Call {
+    Call(sys.lit(method), url, List.new(), List.new(), None, None)
+}
+
+impl Call {
+    /// Adds a header (one of the same name that the client has as a default is replaced for this call).
+    fn with_header(self, name: str, value: List[u8]) -> Call {
+        let mut hs = self.headers.copy()
+        hs.push(http.Header(sys.lit(name), value))
+        Call(self.method, self.url, hs, self.body, self.timeout, self.max_redirects)
+    }
+
+    /// Sets the body and its `Content-Type`.
+    fn with_body(self, content_type: str, body: List[u8]) -> Call {
+        let mut hs = self.headers.copy()
+        hs.push(http.Header(sys.lit("Content-Type"), sys.lit(content_type)))
+        Call(self.method, self.url, hs, body, self.timeout, self.max_redirects)
+    }
+
+    /// The deadline of this call (redirects included), instead of the client's.
+    fn with_timeout(self, d: time.Duration) -> Call {
+        Call(self.method, self.url, self.headers, self.body, Some(d), self.max_redirects)
+    }
+
+    /// At most `n` redirects for this call (0: return the 3xx).
+    fn with_max_redirects(self, n: usize) -> Call {
+        Call(self.method, self.url, self.headers, self.body, self.timeout, Some(n))
+    }
+}
+
+impl Client {
+    /// The trust (`secure.client_roots_pem(..)`, `client_system()`) for `https://`. Without it an https URL is an Err.
+    fn with_tls(self, tls: secure.ClientTls) -> Client { Client(self.opt, Some(tls), self.jar, self.pool) }
+
+    /// A base URL (`http://host:port/prefix/`): a call with a relative URL is resolved against it as RFC 3986 says (so
+    /// `users/7` goes below the prefix, which should end in `/`, and `/users/7` replaces it). A base that is not an absolute http(s) URL makes every call an Err.
+    fn with_base(self, url: List[u8]) -> Client {
+        let mut o = self.opt.copy()
+        o.base = Some(url)
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// A header sent with every call (unless the call sets one of that name). Dropped on a cross-origin redirect when it is
+    /// `Authorization`, `Proxy-Authorization`, `Cookie` or `Host`.
+    fn with_header(self, name: str, value: List[u8]) -> Client {
+        let mut o = self.opt.copy()
+        o.headers.push(http.Header(sys.lit(name), value))
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// The deadline of a call, redirects included (default 30 s).
+    fn with_timeout(self, d: time.Duration) -> Client {
+        let mut o = self.opt.copy()
+        o.timeout = d
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// The most redirects one call follows (default 10; 0: none are followed).
+    fn with_max_redirects(self, n: usize) -> Client {
+        let mut o = self.opt.copy()
+        o.max_redirects = n
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// Follows a redirect from `https` to `http` (refused by default: it exposes what the first request protected).
+    fn with_allow_downgrade(self, yes: bool) -> Client {
+        let mut o = self.opt.copy()
+        o.allow_downgrade = yes
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// At most `n` idle HTTP/1.1 connections kept per authority (default 8; 0 keeps none: every call opens its own).
+    fn with_max_idle_per_host(self, n: usize) -> Client {
+        let mut o = self.opt.copy()
+        o.max_idle_per_host = n
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// How long an idle connection is kept (default 90 s). Also the idle limit of the HTTP/2 connections.
+    fn with_idle_timeout(self, d: time.Duration) -> Client {
+        let mut o = self.opt.copy()
+        o.idle_timeout = d
+        o.h2_options.idle = d
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// The parser limits of the responses (`max_body` 16 MiB by default).
+    fn with_limits(self, lim: http.Limits) -> Client {
+        let mut o = self.opt.copy()
+        o.limits = lim
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// The limits on decoding compressed responses (`None` turns decoding off, and no `Accept-Encoding` is added).
+    fn with_decoding(self, lim: Option[compression.Limits]) -> Client {
+        let mut o = self.opt.copy()
+        o.decode = lim
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// Offers ALPN `h2` over https (default) or only `http/1.1`.
+    fn with_h2(self, yes: bool) -> Client {
+        let mut o = self.opt.copy()
+        o.h2 = yes
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// The HTTP/2 options (stream and connection windows, header limits) of the connections it opens.
+    fn with_h2_options(self, ho: h2.Options) -> Client {
+        let mut o = self.opt.copy()
+        o.h2_options = ho
+        Client(o, self.tls, self.jar, self.pool)
+    }
+
+    /// Keeps cookies in `jar` (`cookiejar.new()`; share one jar between clients if you like) and sends them back.
+    fn with_cookies(self, jar: cookiejar.Jar) -> Client {
+        Client(self.opt, self.tls, Some(jar), self.pool)
+    }
+
+    /// The cookie jar, when there is one.
+    fn cookies(self) -> Option[cookiejar.Jar] { self.jar }
+
+    /// Counters, for tests and metrics.
+    fn stats(self) -> Stats {
+        self.pool.modify(|inout p: Pool| -> Stats {
+            let mut idle: i64 = 0
+            for (k, l) in p.idle.entries() { idle += l.len() as i64 }
+            Stats(p.requests, p.opened, p.reused, p.redirects, idle, p.mux.len() as i64)
+        })
+    }
+
+    /// Closes the idle connections and the HTTP/2 connections (streams in flight end). The client is still usable: the next
+    /// call opens new ones.
+    fn close(self) uses io, clock, threads {
+        let all = self.pool.modify(|inout p: Pool| -> (List[Idle], List[h2.Client]) {
+            let mut one: List[Idle] = List.new()
+            for (k, l) in p.idle.entries() { for i in l { one.push(i) } }
+            let mut two: List[h2.Client] = List.new()
+            for (k, c) in p.mux.entries() { two.push(c) }
+            p.idle = Map.new()
+            p.mux = Map.new()
+            p.proto = Map.new()
+            (one, two)
+        })
+        for i in all.0 {
+            let mut c = i.conn.copy()
+            c.close()
+        }
+        for c in all.1 { c.close() }
+    }
+
+    /// GET `url`.
+    fn get(self, url: List[u8]) -> Result[http.Response, String] uses net, io, clock, threads { self.send(call("GET", url)) }
+
+    /// HEAD `url`.
+    fn head(self, url: List[u8]) -> Result[http.Response, String] uses net, io, clock, threads { self.send(call("HEAD", url)) }
+
+    /// DELETE `url`.
+    fn delete(self, url: List[u8]) -> Result[http.Response, String] uses net, io, clock, threads { self.send(call("DELETE", url)) }
+
+    /// POST `body` to `url`.
+    fn post(self, url: List[u8], content_type: str, body: List[u8]) -> Result[http.Response, String] uses net, io, clock, threads {
+        self.send(call("POST", url).with_body(content_type, body))
+    }
+
+    /// PUT `body` to `url`.
+    fn put(self, url: List[u8], content_type: str, body: List[u8]) -> Result[http.Response, String] uses net, io, clock, threads {
+        self.send(call("PUT", url).with_body(content_type, body))
+    }
+
+    /// PATCH `body` to `url`.
+    fn patch(self, url: List[u8], content_type: str, body: List[u8]) -> Result[http.Response, String] uses net, io, clock, threads {
+        self.send(call("PATCH", url).with_body(content_type, body))
+    }
+
+    /// Sends `c`: the whole exchange (cookies, the pool, redirects) before one deadline. A response with any status is an Ok;
+    /// Err is for what could not be done (URL, connection, timeout, a refused or endless redirect, a response that does not parse).
+    fn send(self, c: Call) -> Result[http.Response, String] uses net, io, clock, threads {
+        let dl = time.after(match c.timeout {
+            Some(d) => d
+            None => self.opt.timeout
+        })
+        let limit = match c.max_redirects {
+            Some(n) => n
+            None => self.opt.max_redirects
+        }
+        let mut target = self.resolve_first(c.url)?
+        let mut method = c.method.copy()
+        let mut body = c.body.copy()
+        let mut headers: List[http.Header] = List.new()
+        for h in c.headers { headers.push(h) }
+        for d in self.opt.headers {
+            if http.count(c.headers, d.name) == 0 { headers.push(d) }
+        }
+        let mut hops: usize = 0
+        while true {
+            let mut req = http.request("GET", target.path.copy())
+            req.method = method.copy()
+            req.headers = headers.copy()
+            req.body = body.copy()
+            let now = time.unix_seconds()
+            match self.jar {
+                Some(jar) => {
+                    match jar.header_for(target.host.copy(), http.split_target(target.path.copy()).0, target.secure, now) {
+                        Some(cv) => { req.headers = with_cookie(req.headers, cv) }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            let mut resp = self.exchange(target, req, dl)?
+            match self.jar {
+                Some(jar) => {
+                    let k = jar.store(target.host.copy(), http.split_target(target.path.copy()).0, target.secure, resp.headers.copy(), time.unix_seconds())
+                }
+                None => {}
+            }
+            let loc = resp.header("location")
+            if !is_redirect(resp.status) || hops >= limit || loc.is_none() {
+                if is_redirect(resp.status) && loc.is_some() && limit > 0 {
+                    return Err(too_many(limit))
+                }
+                resp.set_ctx("url", target.text())
+                resp.set_ctx("redirects", bytes.from_u64(hops as u64))
+                return Ok(resp)
+            }
+            let next = resolve(target, loc.unwrap())?
+            if target.secure && !next.secure && !self.opt.allow_downgrade {
+                return Err(String.from("redirect from https to http refused (with_allow_downgrade(true) follows it)"))
+            }
+            if !same_origin(target, next) { headers = strip_credentials(headers) }
+            // the method and the body of the next hop
+            let m = method.copy()
+            let st = resp.status
+            let is_head = bytes.eq(m, sys.lit("HEAD"))
+            let to_get = (st == 303 && !is_head) || ((st == 301 || st == 302) && bytes.eq(m, sys.lit("POST")))
+            if to_get {
+                method = sys.lit("GET")
+                body = List.new()
+                headers = strip_content(headers)
+            }
+            self.pool.modify(|inout p: Pool| -> () { p.redirects += 1 })
+            target = next
+            hops += 1
+        }
+        Err(String.from("unreachable"))
+    }
+
+    fn resolve_first(self, url: List[u8]) -> Result[Target, String] {
+        match self.opt.base {
+            Some(b) => {
+                let bt = match absolute(b) {
+                    Ok(x) => x
+                    Err(e) => {
+                        let mut m = String.from("bad base URL: ")
+                        m.append(e)
+                        return Err(m)
+                    }
+                }
+                resolve(bt, url)
+            }
+            None => {
+                if scheme_of(url).is_none() { return Err(String.from("a relative URL needs a base URL (Client.with_base)")) }
+                resolve(Target(false, List.new(), 80, sys.lit("/")), url)
+            }
+        }
+    }
+
+    /// One request to one origin: a connection from the pool or a new one, with the retry for a pooled connection that turned out dead.
+    fn exchange(self, t: Target, req: http.Request, dl: time.Deadline) -> Result[http.Response, String] uses net, io, clock, threads {
+        let key = t.origin()
+        let me = self
+        me.pool.modify(|inout p: Pool| -> () { p.requests += 1 })
+        let mut tries: usize = 0
+        while true {
+            tries += 1
+            let l = self.lease(t, key.copy(), dl)?
+            match l {
+                One(c, reused) => {
+                    let mut cc = c.copy()
+                    match cc.request(req.copy(), dl) {
+                        Ok(r) => {
+                            self.give_back(key.copy(), cc)
+                            return Ok(r)
+                        }
+                        Err(e) => {
+                            cc.close()
+                            if reused && tries < 2 && idempotent(req.method) && !dl.expired() { continue }
+                            return Err(e)
+                        }
+                    }
+                }
+                Mux(c, reused) => {
+                    match fetch_h2(c, req.copy(), self.opt.limits.max_body, self.opt.decode, dl) {
+                        Ok(r) => { return Ok(r) }
+                        Err(e) => {
+                            if e.kind == h2.ERR_CLOSED {
+                                self.drop_mux(key.copy())
+                                if reused && tries < 2 && idempotent(req.method) && !dl.expired() { continue }
+                            }
+                            return Err(e.why)
+                        }
+                    }
+                }
+            }
+        }
+        Err(String.from("unreachable"))
+    }
+
+    // ---- the pool
+
+    /// A connection for `t`: from the pool, else a new one (at most one task at a time dials an https
+    /// authority whose protocol is not known to be HTTP/1.1, so that a burst of first calls ends up on one h2 connection).
+    fn lease(self, t: Target, key: List[u8], dl: time.Deadline) -> Result[Lease, String] uses net, io, clock, threads {
+        match self.take_live(key.copy()) {
+            Some(l) => { return Ok(l) }
+            None => {}
+        }
+        if t.secure && self.opt.h2 && self.proto_of(key.copy()) != 1 {
+            let gate = self.gate(key.copy())
+            let me = self
+            return gate.modify(|inout g: bool| -> Result[Lease, String] {
+                match me.take_live(key.copy()) {
+                    Some(l) => { return Ok(l) }
+                    None => {}
+                }
+                me.dial(t, key.copy(), dl)
+            })
+        }
+        self.dial(t, key, dl)
+    }
+
+    fn proto_of(self, key: List[u8]) -> i32 {
+        self.pool.modify(|inout p: Pool| -> i32 {
+            match p.proto.get(key) {
+                Some(v) => v
+                None => 0
+            }
+        })
+    }
+
+    fn gate(self, key: List[u8]) -> sync.Lock[bool] {
+        self.pool.modify(|inout p: Pool| -> sync.Lock[bool] {
+            match p.gates.get(key.copy()) {
+                Some(g) => g
+                None => {
+                    let g = sync.lock(false)
+                    p.gates.insert(key, g)
+                    g
+                }
+            }
+        })
+    }
+
+    /// The pool's side of a lease: a live HTTP/2 connection, or the newest idle HTTP/1.1 connection that has not expired (the ones
+    /// that have are returned in `dead` to be closed).
+    fn take(self, key: List[u8]) -> Taken uses clock {
+        let now = time.mono_ms()
+        let keep_ms = self.opt.idle_timeout.as_ns() / 1000000
+        self.pool.modify(|inout p: Pool| -> Taken {
+            let mut dead: List[client.Conn] = List.new()
+            let mut dead2: List[h2.Client] = List.new()
+            match p.mux.get(key.copy()) {
+                Some(c) => {
+                    if c.failure().is_none() {
+                        p.reused += 1
+                        return Taken(Some(Mux(c, true)), dead, dead2)
+                    }
+                    let gone = p.mux.remove(key.copy())
+                    dead2.push(c)
+                }
+                None => {}
+            }
+            let mut list: List[Idle] = match p.idle.get(key.copy()) {
+                Some(l) => l
+                None => List.new()
+            }
+            let mut found: Option[Lease] = None
+            while list.len() > 0 && found.is_none() {
+                let i = list.len() - 1
+                let it = list[i].copy()
+                list.remove(i)
+                if now - it.since > keep_ms {
+                    dead.push(it.conn)
+                } else {
+                    found = Some(One(it.conn, true))
+                    p.reused += 1
+                }
+            }
+            // what is left is older than what was taken: if the newest expired, so did they all
+            if found.is_none() {
+                for it in list { dead.push(it.conn) }
+                list = List.new()
+            }
+            p.idle.insert(key, list)
+            Taken(found, dead, dead2)
+        })
+    }
+
+    /// `take`, closing what it says is dead and skipping an idle connection that the server closed (or that has bytes we
+    /// did not ask for).
+    fn take_live(self, key: List[u8]) -> Option[Lease] uses net, io, clock, threads {
+        while true {
+            let t = self.take(key.copy())
+            for d in t.dead {
+                let mut x = d.copy()
+                x.close()
+            }
+            for d in t.dead_mux { d.close() }
+            match t.lease {
+                None => { return None }
+                Some(l) => {
+                    match l {
+                        Mux(c, r) => { return Some(l) }
+                        One(c, r) => {
+                            let mut cc = c.copy()
+                            if is_stale(cc) {
+                                cc.close()
+                                self.pool.modify(|inout p: Pool| -> () { p.reused -= 1 })
+                                continue
+                            }
+                            return Some(One(cc, true))
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Puts a connection whose response was read back among the idle ones (or closes it).
+    fn give_back(self, key: List[u8], c: client.Conn) uses io, clock {
+        let mut cc = c.copy()
+        if !cc.open { return }
+        let now = time.mono_ms()
+        let max = self.opt.max_idle_per_host
+        let keep_ms = self.opt.idle_timeout.as_ns() / 1000000
+        let over = self.pool.modify(|inout p: Pool| -> List[client.Conn] {
+            let mut gone: List[client.Conn] = List.new()
+            let mut list: List[Idle] = match p.idle.get(key.copy()) {
+                Some(l) => l
+                None => List.new()
+            }
+            let mut live: List[Idle] = List.new()
+            for it in list {
+                if now - it.since > keep_ms { gone.push(it.conn) } else { live.push(it) }
+            }
+            if max > 0 && live.len() < max { live.push(Idle(cc, now)) } else { gone.push(cc) }
+            p.idle.insert(key, live)
+            gone
+        })
+        for d in over {
+            let mut x = d.copy()
+            x.close()
+        }
+    }
+
+    /// Forgets the HTTP/2 connection of `key` when it has ended, and closes it.
+    fn drop_mux(self, key: List[u8]) uses io, clock, threads {
+        let gone = self.pool.modify(|inout p: Pool| -> Option[h2.Client] {
+            match p.mux.get(key.copy()) {
+                Some(c) => {
+                    if c.failure().is_some() {
+                        let z = p.mux.remove(key)
+                        return Some(c)
+                    }
+                    None
+                }
+                None => None
+            }
+        })
+        match gone {
+            Some(c) => { c.close() }
+            None => {}
+        }
+    }
+
+    /// Opens a connection to `t` and records what it speaks.
+    fn dial(self, t: Target, key: List[u8], dl: time.Deadline) -> Result[Lease, String] uses net, io, clock, threads {
+        let mut cn = if t.secure {
+            let tls = match self.tls {
+                Some(x) => x
+                None => { return Err(String.from("an https URL needs a trust configuration: Client.with_tls(..) or pool.system()")) }
+            }
+            let protos = if self.opt.h2 { List["h2".bytes(), "http/1.1".bytes()] } else { List["http/1.1".bytes()] }
+            client.connect_bytes(t.host.copy(), t.port, self.opt.limits, Some(tls.connector_alpn(t.host.copy(), protos)), dl)?
+        } else {
+            client.connect_bytes(t.host.copy(), t.port, self.opt.limits, None, dl)?
+        }
+        if t.secure && http.eq_s(cn.alpn(), "h2") {
+            match h2.connect(h2.wire_of_transport(cn.transport()), self.opt.h2_options) {
+                Ok(c0) => {
+                    let c = c0.with_target("https".bytes(), cn.host.copy())
+                    self.pool.modify(|inout p: Pool| -> () {
+                        p.opened += 1
+                        p.proto.insert(key.copy(), 2)
+                        p.mux.insert(key.copy(), c)
+                    })
+                    return Ok(Mux(c, false))
+                }
+                Err(e) => {
+                    cn.close()
+                    return Err(e.why)
+                }
+            }
+        }
+        self.pool.modify(|inout p: Pool| -> () {
+            p.opened += 1
+            p.proto.insert(key.copy(), 1)
+        })
+        match self.opt.decode {
+            Some(lim) => { cn = cn.with_decoding(lim) }
+            None => {}
+        }
+        Ok(One(cn, false))
+    }
+}
+
+// ---- leases
+
+type Lease = | One(c: client.Conn, reused: bool) | Mux(c: h2.Client, reused: bool)
+
+type Taken = { lease: Option[Lease], dead: List[client.Conn], dead_mux: List[h2.Client] }
+
+/// An idle connection that cannot be used: the server closed it, it has bytes nobody asked for, or it failed.
+fn is_stale(c: client.Conn) -> bool uses net, io, clock {
+    match c.transport().try_recv(1) {
+        Ok(r) => r.is_some()
+        Err(e) => true
+    }
+}
+
+fn idempotent(m: List[u8]) -> bool {
+    http.eq_s(m, "GET") || http.eq_s(m, "HEAD") || http.eq_s(m, "PUT") || http.eq_s(m, "DELETE") || http.eq_s(m, "OPTIONS") || http.eq_s(m, "TRACE")
+}
+
+// ---- HTTP/2
+
+fn conn_specific(n: List[u8]) -> bool {
+    http.eq_s(n, "connection") || http.eq_s(n, "keep-alive") || http.eq_s(n, "proxy-connection") || http.eq_s(n, "transfer-encoding") || http.eq_s(n, "upgrade") || http.eq_s(n, "host")
+}
+
+/// One request as a stream of `c`: like `h2.Client.fetch`, with a cap on the body, `Accept-Encoding` and decoding, and the
+/// headers checked as http/1.1 ones are.
+fn fetch_h2(c: h2.Client, req: http.Request, max_body: usize, decode: Option[compression.Limits], dl: time.Deadline) -> Result[http.Response, h2.Error] uses io, clock {
+    let mut q = req.copy()
+    match http.check_headers(q.headers) {
+        Ok(z) => {}
+        Err(e) => { return Err(h2.Error(h2.ERR_INVALID, 0, e)) }
+    }
+    if decode.is_some() && q.header("accept-encoding").is_none() {
+        q.set_header("Accept-Encoding", sys.lit("gzip, deflate, zstd"))
+    }
+    let mut hs: List[http.Header] = List.new()
+    hs.push(http.Header(":method".bytes(), q.method.copy()))
+    hs.push(http.Header(":scheme".bytes(), c.scheme.copy()))
+    hs.push(http.Header(":path".bytes(), q.target.copy()))
+    let mut auth = c.authority.copy()
+    match q.header("host") {
+        Some(v) => { auth = v }
+        None => {}
+    }
+    if auth.len() > 0 { hs.push(http.Header(":authority".bytes(), auth)) }
+    for f in q.headers {
+        let n = http.lower(f.name)
+        if conn_specific(n) { continue }
+        hs.push(http.Header(n, f.value))
+    }
+    let has_body = q.body.len() > 0 || http.eq_s(q.method, "POST") || http.eq_s(q.method, "PUT") || http.eq_s(q.method, "PATCH")
+    let st = c.open(hs, !has_body, dl)?
+    if has_body {
+        match st.send(q.body, true, dl) {
+            Ok(z) => {}
+            Err(e) => {
+                st.release()
+                return Err(e)
+            }
+        }
+    }
+    let head = match st.headers(dl) {
+        Ok(x) => x
+        Err(e) => {
+            st.release()
+            return Err(e)
+        }
+    }
+    let mut body: List[u8] = List.new()
+    while true {
+        match st.read(65536, dl) {
+            Ok(b) => {
+                if b.len() == 0 { break }
+                body.extend(b)
+                if body.len() > max_body {
+                    st.reset(8)
+                    st.release()
+                    return Err(h2.Error(h2.ERR_INVALID, 0, String.from("response body over the limit")))
+                }
+            }
+            Err(e) => {
+                st.release()
+                return Err(e)
+            }
+        }
+    }
+    let mut status: i32 = 0
+    match http.find_s(head, ":status") {
+        Some(v) => {
+            if v.len() == 3 { status = ((v[0] - 48) as i32) * 100 + ((v[1] - 48) as i32) * 10 + ((v[2] - 48) as i32) }
+        }
+        None => {}
+    }
+    let mut resp = http.response(status)
+    resp.version = 20
+    for f in head {
+        if f.name.len() > 0 && f.name[0] != 58 { resp.headers.push(f) }
+    }
+    match st.trailers() {
+        Some(t) => { for f in t { resp.headers.push(f) } }
+        None => {}
+    }
+    resp.body = body
+    st.release()
+    match decode {
+        Some(lim) => {
+            match compress.decode_response(resp, lim) {
+                Ok(plain) => { return Ok(plain) }
+                Err(why) => { return Err(h2.Error(h2.ERR_INVALID, 0, why)) }
+            }
+        }
+        None => {}
+    }
+    Ok(resp)
+}
+
+// ---- URLs
+
+/// Where a request goes: the scheme, the host (lowercase; a name, IPv4 or IPv6), the port and the origin-form target.
+type Target = { secure: bool, host: List[u8], port: i32, path: List[u8] }
+
+impl Target {
+    /// `scheme://host[:port]` (the port when it is not the scheme's own): the pool's key.
+    fn origin(self) -> List[u8] {
+        let mut o = if self.secure { sys.lit("https://") } else { sys.lit("http://") }
+        bytes.append(inout o, client.host_header_for(self.host.copy(), self.port, if self.secure { 443 } else { 80 }))
+        o
+    }
+
+    /// The URL.
+    fn text(self) -> List[u8] {
+        let mut o = self.origin()
+        bytes.append(inout o, self.path.copy())
+        o
+    }
+}
+
+fn same_origin(a: Target, b: Target) -> bool {
+    a.secure == b.secure && a.port == b.port && bytes.eq(a.host, b.host)
+}
+
+fn without_fragment(u: List[u8]) -> List[u8] {
+    match bytes.find_byte(u, 35, 0) {
+        Some(i) => bytes.slice(u, 0, i)
+        None => u
+    }
+}
+
+/// An absolute `http://` or `https://` URL.
+fn absolute(u: List[u8]) -> Result[Target, String] {
+    let p = match secure.parse_url(without_fragment(u)) {
+        Ok(x) => x
+        Err(e) => { return Err(e) }
+    }
+    if p.ws { return Err(String.from("not an http(s) URL")) }
+    Ok(Target(p.secure, http.lower(p.host), p.port, p.target))
+}
+
+/// The scheme of `r` when it starts with one (`ftp:`, `mailto:`): letters, digits, `+`, `-`, `.` up to a `:` before any `/`, `?`, `#`.
+fn scheme_of(r: List[u8]) -> Option[List[u8]] {
+    let mut i: usize = 0
+    while i < r.len() {
+        let c = r[i]
+        if c == 58 { if i > 0 { return Some(http.lower(bytes.slice(r, 0, i))) } else { return None } }
+        let ok = bytes.is_alpha(c) || (i > 0 && (bytes.is_digit(c) || c == 43 || c == 45 || c == 46))
+        if !ok { return None }
+        i += 1
+    }
+    None
+}
+
+/// RFC 3986 section 5.2.4 on a path.
+fn remove_dots(path: List[u8]) -> List[u8] {
+    let mut out: List[List[u8]] = List.new()
+    let segs = bytes.split(path, 47)
+    let mut i: usize = 0
+    for s in segs {
+        i += 1
+        if bytes.eq(s, sys.lit(".")) {
+            if i == segs.len() { out.push(List.new()) }
+        } else if bytes.eq(s, sys.lit("..")) {
+            if out.len() > 1 { out.remove(out.len() - 1) }
+            if i == segs.len() { out.push(List.new()) }
+        } else {
+            out.push(s)
+        }
+    }
+    let joined = bytes.join(out, sys.lit("/"))
+    if joined.len() == 0 || joined[0] != 47 { bytes.concat(sys.lit("/"), joined) } else { joined }
+}
+
+/// `r` (a URL reference: what `Location` or a call says) resolved against `base` (RFC 3986 section 5.2).
+fn resolve(base: Target, r0: List[u8]) -> Result[Target, String] {
+    let r = without_fragment(trim(r0))
+    for c in r {
+        if c <= 32 || c >= 127 { return Err(String.from("a URL with a space, a control byte or a non-ASCII byte (encode it)")) }
+    }
+    match scheme_of(r) {
+        Some(s) => {
+            if !(http.eq_s(s, "http") || http.eq_s(s, "https")) { return Err(String.from("unsupported URL scheme")) }
+            return absolute(r)
+        }
+        None => {}
+    }
+    if bytes.starts_with(r, sys.lit("//")) {
+        let mut u = if base.secure { sys.lit("https:") } else { sys.lit("http:") }
+        bytes.append(inout u, r)
+        return absolute(u)
+    }
+    let (bpath, bquery) = http.split_target(base.path.copy())
+    let mut path = bpath.copy()
+    let mut query: List[u8] = List.new()
+    let mut has_q = false
+    if r.len() == 0 {
+        query = bquery
+        has_q = bquery.len() > 0
+    } else if r[0] == 63 {
+        query = bytes.slice(r, 1, r.len())
+        has_q = true
+    } else {
+        // the reference's own path and query
+        let mut rp = r.copy()
+        match bytes.find_byte(r, 63, 0) {
+            Some(i) => {
+                rp = bytes.slice(r, 0, i)
+                query = bytes.slice(r, i + 1, r.len())
+                has_q = true
+            }
+            None => {}
+        }
+        if rp.len() > 0 && rp[0] == 47 {
+            path = remove_dots(rp)
+        } else {
+            let dir = match bytes.rfind_byte(bpath, 47) {
+                Some(i) => bytes.slice(bpath, 0, i + 1)
+                None => sys.lit("/")
+            }
+            path = remove_dots(bytes.concat(dir, rp))
+        }
+    }
+    let mut target = path
+    if has_q {
+        target.push(63)
+        bytes.append(inout target, query)
+    }
+    Ok(Target(base.secure, base.host.copy(), base.port, target))
+}
+
+fn trim(s: List[u8]) -> List[u8] { http.trim_ows(s) }
+
+// ---- redirect and header helpers
+
+fn is_redirect(st: i32) -> bool { st == 301 || st == 302 || st == 303 || st == 307 || st == 308 }
+
+fn too_many(n: usize) -> String {
+    let mut s = String.from("too many redirects (the limit is ")
+    s.append(String.from_int(n as i64))
+    s.push_str(")")
+    s
+}
+
+/// The headers of a request to another origin: no credentials, and no `Host` that named the first one.
+fn strip_credentials(hs: List[http.Header]) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    for h in hs {
+        let drop = http.eq_ci_s(h.name, "authorization") || http.eq_ci_s(h.name, "proxy-authorization") || http.eq_ci_s(h.name, "cookie") || http.eq_ci_s(h.name, "host")
+        if !drop { out.push(h) }
+    }
+    out
+}
+
+/// The headers of a request that lost its body.
+fn strip_content(hs: List[http.Header]) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    for h in hs {
+        let n = http.lower(h.name)
+        if !bytes.starts_with(n, sys.lit("content-")) && !http.eq_s(n, "transfer-encoding") { out.push(h) }
+    }
+    out
+}
+
+/// `hs` with the jar's cookies `cv` added to a `Cookie` header the program may have set itself.
+fn with_cookie(hs: List[http.Header], cv: List[u8]) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    let mut mine: List[u8] = List.new()
+    for h in hs {
+        if http.eq_ci_s(h.name, "cookie") {
+            if mine.len() > 0 { bytes.append(inout mine, sys.lit("; ")) }
+            bytes.append(inout mine, h.value)
+        } else {
+            out.push(h)
+        }
+    }
+    if mine.len() > 0 { bytes.append(inout mine, sys.lit("; ")) }
+    bytes.append(inout mine, cv)
+    out.push(http.Header(sys.lit("Cookie"), mine))
+    out
+}

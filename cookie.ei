@@ -1,0 +1,693 @@
+//! http/cookie: cookies, RFC 6265 with the 6265bis rules a server and a client should follow: the
+//! `Cookie` request header, `Set-Cookie` built and parsed, and jars that sign (HMAC-SHA-256) or
+//! encrypt (AES-256-GCM) the values they hand out, with a list of keys so a key can be rotated
+//! (docs/cookie.md).
+//!
+//! Server:
+//!
+//!     let jar = cookie.signed_jar(List[key_now, key_before]).unwrap()      // 32 bytes each; the first signs
+//!     match jar.get(q, "session") {                                         // None: absent, or forged
+//!         Some(s) => { ... s.value ... }
+//!         None => {}
+//!     }
+//!     let mut c = cookie.text("session", "u42").secure().http_only().same_site(cookie.SsLax).path("/")
+//!     let mut resp = http.text(200, "ok")
+//!     cookie.add(inout resp, jar.sign(c).unwrap()).unwrap()
+//!
+//! What is checked, on the way out and on the way in:
+//! - a name is an HTTP token, a value is `cookie-octet`s (printable ASCII without space, `"`, `,`, `;`
+//!   and `\`, optionally wrapped in one pair of `"`), a `Path` or `Domain` has no control byte and no
+//!   `;`: nothing can end the cookie early or start a new header line (no header injection);
+//! - `name=value` is at most 4096 bytes, an attribute value at most 1024 (6265bis section 5.6);
+//! - the prefixes `__Secure-` and `__Host-` (matched without regard to case) need `Secure`, and
+//!   `__Host-` also `Path=/` and no `Domain`; `SameSite=None` and `Partitioned` need `Secure`.
+//!   `build` refuses a cookie that breaks them, `parse_set_cookie` refuses the header.
+//! - parsing `Set-Cookie` follows 6265 section 5.2: unknown attributes are ignored, the last one of
+//!   a kind wins, `Max-Age` outranks `Expires` (the jar of a client decides, see http/cookiejar),
+//!   `Expires` is read with the lenient date algorithm of section 5.1.1.
+//! - the signed and the private jar compare in constant time and bind the cookie's name: a value
+//!   copied to another cookie does not verify.
+//!
+//! Not here: a public suffix list (the client's jar, http/cookiejar, has the consequences), and the
+//! `Cookie2`/`Set-Cookie2` headers of RFC 2965.
+
+import core.sys
+import std.bytes
+import std.encoding
+import crypto
+import http
+
+/// The `SameSite` attribute: `SsUnset` writes none (a browser treats it as Lax).
+pub type SameSite = | SsUnset | SsLax | SsStrict | SsNone
+
+/// A cookie as a server sets it, or as `Set-Cookie` carried it. `max_age` is in seconds (a
+/// number of 0 or less deletes the cookie), `expires` is a Unix time in seconds. A name-value
+/// pair is `name` and `value` (the value is the bytes between `=` and `;`, quotes included).
+pub type Cookie = {
+    name: List[u8],
+    value: List[u8],
+    path: Option[List[u8]],
+    domain: Option[List[u8]],
+    max_age: Option[i64],
+    expires: Option[i64],
+    secure: bool,
+    http_only: bool,
+    same_site: SameSite,
+    partitioned: bool
+}
+
+/// A cookie with no attributes.
+pub fn new(name: List[u8], value: List[u8]) -> Cookie {
+    Cookie(name, value, None, None, None, None, false, false, SsUnset, false)
+}
+
+/// `new` from text.
+pub fn text(name: str, value: str) -> Cookie { new(sys.lit(name), sys.lit(value)) }
+
+impl Cookie {
+    /// Sets `Path`.
+    fn path(self, p: str) -> Cookie {
+        Cookie(self.name, self.value, Some(sys.lit(p)), self.domain, self.max_age, self.expires, self.secure, self.http_only, self.same_site, self.partitioned)
+    }
+
+    /// Sets `Domain` (the cookie goes to subdomains too).
+    fn domain(self, d: str) -> Cookie {
+        Cookie(self.name, self.value, self.path, Some(sys.lit(d)), self.max_age, self.expires, self.secure, self.http_only, self.same_site, self.partitioned)
+    }
+
+    /// Sets `Max-Age` (seconds).
+    fn max_age(self, secs: i64) -> Cookie {
+        Cookie(self.name, self.value, self.path, self.domain, Some(secs), self.expires, self.secure, self.http_only, self.same_site, self.partitioned)
+    }
+
+    /// Sets `Expires` (Unix seconds).
+    fn expires(self, unix: i64) -> Cookie {
+        Cookie(self.name, self.value, self.path, self.domain, self.max_age, Some(unix), self.secure, self.http_only, self.same_site, self.partitioned)
+    }
+
+    /// Sets `Secure`.
+    fn secure(self) -> Cookie {
+        Cookie(self.name, self.value, self.path, self.domain, self.max_age, self.expires, true, self.http_only, self.same_site, self.partitioned)
+    }
+
+    /// Sets `HttpOnly`.
+    fn http_only(self) -> Cookie {
+        Cookie(self.name, self.value, self.path, self.domain, self.max_age, self.expires, self.secure, true, self.same_site, self.partitioned)
+    }
+
+    /// Sets `SameSite`.
+    fn same_site(self, s: SameSite) -> Cookie {
+        Cookie(self.name, self.value, self.path, self.domain, self.max_age, self.expires, self.secure, self.http_only, s, self.partitioned)
+    }
+
+    /// Sets `Partitioned` (CHIPS; needs `Secure`).
+    fn partitioned(self) -> Cookie {
+        Cookie(self.name, self.value, self.path, self.domain, self.max_age, self.expires, self.secure, self.http_only, self.same_site, true)
+    }
+
+    /// The cookie that deletes this one in a browser: the same name, `Path` and `Domain`, an empty value,
+    /// `Max-Age=0` and `Expires` in 1970.
+    fn removal(self) -> Cookie {
+        Cookie(self.name, List.new(), self.path, self.domain, Some(0), Some(0), self.secure, self.http_only, self.same_site, self.partitioned)
+    }
+}
+
+// ---- character classes
+
+/// Whether `c` is a `cookie-octet` (RFC 6265 section 4.1.1): `%x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E`.
+pub fn is_cookie_octet(c: u8) -> bool {
+    c == 33 || (c >= 35 && c <= 43) || (c >= 45 && c <= 58) || (c >= 60 && c <= 91) || (c >= 93 && c <= 126)
+}
+
+/// Whether `v` is a valid cookie value to send: `cookie-octet`s, optionally in one pair of double quotes.
+pub fn valid_value(v: List[u8]) -> bool {
+    let mut from: usize = 0
+    let mut to = v.len()
+    if v.len() >= 2 && v[0] == 34 && v[v.len() - 1] == 34 {
+        from = 1
+        to = v.len() - 1
+    }
+    let mut i = from
+    while i < to {
+        if !is_cookie_octet(v[i]) { return false }
+        i += 1
+    }
+    true
+}
+
+/// Whether `n` is a valid cookie name: a non-empty HTTP token.
+pub fn valid_name(n: List[u8]) -> bool { n.len() > 0 && http.is_token(n) }
+
+fn is_ctl(c: u8) -> bool { (c < 32 && c != 9) || c == 127 }
+
+fn attr_value_ok(v: List[u8]) -> bool {
+    for c in v {
+        if c < 32 || c == 127 || c == 59 || c > 126 { return false }
+    }
+    true
+}
+
+fn domain_ok(v: List[u8]) -> bool {
+    if v.len() == 0 || v.len() > 253 { return false }
+    for c in v {
+        let ok = bytes.is_alpha(c) || bytes.is_digit(c) || c == 45 || c == 46 || c == 95
+        if !ok { return false }
+    }
+    true
+}
+
+fn has_prefix_ci(name: List[u8], p: str) -> bool {
+    let q = sys.lit(p)
+    name.len() >= q.len() && http.eq_ci(bytes.slice(name, 0, q.len()), q)
+}
+
+fn is_slash(p: Option[List[u8]]) -> bool {
+    match p {
+        Some(v) => v.len() == 1 && v[0] == 47
+        None => false
+    }
+}
+
+/// Checks the rules that tie attributes together (the prefixes, `SameSite=None`, `Partitioned`).
+fn check_rules(c: Cookie) -> Result[(), String] {
+    if has_prefix_ci(c.name, "__Secure-") && !c.secure { return Err(String.from("a __Secure- cookie needs Secure")) }
+    if has_prefix_ci(c.name, "__Host-") {
+        if !c.secure { return Err(String.from("a __Host- cookie needs Secure")) }
+        if !is_slash(c.path) { return Err(String.from("a __Host- cookie needs Path=/")) }
+        if c.domain.is_some() { return Err(String.from("a __Host- cookie has no Domain")) }
+    }
+    Ok(())
+}
+
+// ---- building Set-Cookie
+
+fn put(out: List[u8], a: str, v: List[u8]) -> List[u8] {
+    let mut o = out.copy()
+    bytes.append(inout o, sys.lit(a))
+    bytes.append(inout o, v)
+    o
+}
+
+/// The value of a `Set-Cookie` header for `c`: `name=value` and its attributes, in the order Domain,
+/// Path, Expires, Max-Age, Secure, HttpOnly, SameSite, Partitioned. Err for anything that would make
+/// a broken or dangerous header (see the module comment).
+pub fn build(c: Cookie) -> Result[List[u8], String] {
+    if !valid_name(c.name) { return Err(String.from("cookie: the name is not a token")) }
+    if !valid_value(c.value) { return Err(String.from("cookie: the value has a byte that is not allowed (use a signed or private jar, or encode it)")) }
+    if c.name.len() + c.value.len() > 4096 { return Err(String.from("cookie: name and value are over 4096 bytes")) }
+    check_rules(c)?
+    if c.same_site == SsNone && !c.secure { return Err(String.from("cookie: SameSite=None needs Secure")) }
+    if c.partitioned && !c.secure { return Err(String.from("cookie: Partitioned needs Secure")) }
+    let mut out = c.name.copy()
+    out.push(61)
+    bytes.append(inout out, c.value)
+    match c.domain {
+        Some(d) => {
+            if !domain_ok(d) { return Err(String.from("cookie: bad Domain")) }
+            out = put(out, "; Domain=", d)
+        }
+        None => {}
+    }
+    match c.path {
+        Some(p) => {
+            if !attr_value_ok(p) || p.len() > 1024 || p.len() == 0 { return Err(String.from("cookie: bad Path")) }
+            out = put(out, "; Path=", p)
+        }
+        None => {}
+    }
+    match c.expires {
+        Some(t) => { out = put(out, "; Expires=", http.imf_date(t)) }
+        None => {}
+    }
+    match c.max_age {
+        Some(m) => { out = put(out, "; Max-Age=", bytes.from_i64(m)) }
+        None => {}
+    }
+    if c.secure { out = put(out, "; Secure", List.new()) }
+    if c.http_only { out = put(out, "; HttpOnly", List.new()) }
+    if c.same_site == SsLax { out = put(out, "; SameSite=Lax", List.new()) }
+    if c.same_site == SsStrict { out = put(out, "; SameSite=Strict", List.new()) }
+    if c.same_site == SsNone { out = put(out, "; SameSite=None", List.new()) }
+    if c.partitioned { out = put(out, "; Partitioned", List.new()) }
+    Ok(out)
+}
+
+/// Adds `Set-Cookie: <build(c)>` to `r` (a response may carry many). Err (and no header) when `build` refuses.
+pub fn add(inout r: http.Response, c: Cookie) -> Result[(), String] {
+    let v = build(c)?
+    r.headers.push(http.Header(sys.lit("Set-Cookie"), v))
+    Ok(())
+}
+
+// ---- dates (RFC 6265 section 5.1.1)
+
+fn is_date_delim(c: u8) -> bool {
+    c == 9 || (c >= 32 && c <= 47) || (c >= 59 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126)
+}
+
+fn month_of(t: List[u8]) -> i64 {
+    if t.len() < 3 { return 0 }
+    let m = http.lower(bytes.slice(t, 0, 3))
+    let names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    let mut i: i64 = 0
+    for n in names {
+        i += 1
+        if bytes.eq(m, sys.lit(n)) { return i }
+    }
+    0
+}
+
+/// `1..=max_digits` digits at the start of `t`: (value, digits used); (0, 0) when there are none.
+fn lead_digits(t: List[u8], max_digits: usize) -> (i64, usize) {
+    let mut n: i64 = 0
+    let mut k: usize = 0
+    while k < t.len() && k < max_digits && bytes.is_digit(t[k]) {
+        n = n * 10 + ((t[k] - 48) as i64)
+        k += 1
+    }
+    (n, k)
+}
+
+/// A token of the form `h:m:s` (1 or 2 digits each; anything may follow the seconds): hour, minute, second.
+fn clock_of(t: List[u8]) -> Option[(i64, i64, i64)] {
+    let (h, a) = lead_digits(t, 2)
+    if a == 0 || a >= t.len() || t[a] != 58 { return None }
+    let r1 = bytes.slice(t, a + 1, t.len())
+    let (m, b) = lead_digits(r1, 2)
+    if b == 0 || b >= r1.len() || r1[b] != 58 { return None }
+    let r2 = bytes.slice(r1, b + 1, r1.len())
+    let (s, c) = lead_digits(r2, 2)
+    if c == 0 { return None }
+    if c < r2.len() && bytes.is_digit(r2[c]) { return None }
+    Some((h, m, s))
+}
+
+fn days_from_civil(y0: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y0 - 1 } else { y0 }
+    let yy = if y >= 0 { y } else { y - 399 }
+    let era = yy / 400
+    let yoe = y - era * 400
+    let mp = (m + 9) % 12
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+/// Reads a cookie date the way RFC 6265 section 5.1.1 does (any of the old formats): Unix seconds, or
+/// None when it has no time, day, month and year, or a field is out of range, or the year is before 1601.
+pub fn parse_date(v: List[u8]) -> Option[i64] {
+    let mut have_time = false
+    let mut have_day = false
+    let mut have_month = false
+    let mut have_year = false
+    let mut hh: i64 = 0
+    let mut mi: i64 = 0
+    let mut ss: i64 = 0
+    let mut day: i64 = 0
+    let mut month: i64 = 0
+    let mut year: i64 = 0
+    let mut tok: List[u8] = List.new()
+    let mut i: usize = 0
+    while i <= v.len() {
+        if i == v.len() || is_date_delim(v[i]) {
+            if tok.len() > 0 {
+                if !have_time && clock_of(tok).is_some() {
+                    let (h, m, s) = clock_of(tok).unwrap()
+                    hh = h
+                    mi = m
+                    ss = s
+                    have_time = true
+                } else if !have_day && lead_digits(tok, 2).1 > 0 && (lead_digits(tok, 2).1 == tok.len() || !bytes.is_digit(tok[lead_digits(tok, 2).1])) {
+                    day = lead_digits(tok, 2).0
+                    have_day = true
+                } else if !have_month && month_of(tok) > 0 {
+                    month = month_of(tok)
+                    have_month = true
+                } else if !have_year && lead_digits(tok, 4).1 >= 2 && (lead_digits(tok, 4).1 == tok.len() || !bytes.is_digit(tok[lead_digits(tok, 4).1])) {
+                    year = lead_digits(tok, 4).0
+                    have_year = true
+                }
+                tok = List.new()
+            }
+        } else {
+            tok.push(v[i])
+        }
+        i += 1
+    }
+    if !(have_time && have_day && have_month && have_year) { return None }
+    if year >= 70 && year <= 99 { year += 1900 }
+    if year >= 0 && year <= 69 { year += 2000 }
+    if day < 1 || day > 31 || year < 1601 || hh > 23 || mi > 59 || ss > 59 { return None }
+    Some(days_from_civil(year, month, day) * 86400 + hh * 3600 + mi * 60 + ss)
+}
+
+// ---- parsing Set-Cookie
+
+fn trim_wsp(s: List[u8]) -> List[u8] {
+    let mut a: usize = 0
+    let mut b = s.len()
+    while a < b && (s[a] == 32 || s[a] == 9) { a += 1 }
+    while b > a && (s[b - 1] == 32 || s[b - 1] == 9) { b -= 1 }
+    bytes.slice(s, a, b)
+}
+
+fn parse_max_age(v: List[u8]) -> Option[i64] {
+    if v.len() == 0 { return None }
+    let neg = v[0] == 45
+    let digits = if neg { bytes.slice(v, 1, v.len()) } else { v }
+    if digits.len() == 0 { return None }
+    let mut n: i64 = 0
+    for c in digits {
+        if !bytes.is_digit(c) { return None }
+        // saturate: anything this large is "forever" or "long ago" alike
+        if n < 100000000000000000 { n = n * 10 + ((c - 48) as i64) }
+    }
+    Some(if neg { 0 - n } else { n })
+}
+
+/// Parses the value of a `Set-Cookie` header (6265 section 5.2, with the limits and prefix rules of 6265bis).
+/// Err: a control byte, no `=`, an empty or non-token name, `name=value` over 4096 bytes, or a broken
+/// `__Secure-`/`__Host-` prefix. An attribute that is unknown or malformed is skipped, as a user agent does.
+pub fn parse_set_cookie(line: List[u8]) -> Result[Cookie, String] {
+    for c in line {
+        if is_ctl(c) { return Err(String.from("set-cookie: control byte")) }
+    }
+    let semi = bytes.find_byte(line, 59, 0)
+    let pair = match semi {
+        Some(i) => bytes.slice(line, 0, i)
+        None => line
+    }
+    let eq = match bytes.find_byte(pair, 61, 0) {
+        Some(i) => i
+        None => { return Err(String.from("set-cookie: no =")) }
+    }
+    let name = trim_wsp(bytes.slice(pair, 0, eq))
+    let value = trim_wsp(bytes.slice(pair, eq + 1, pair.len()))
+    if !valid_name(name) { return Err(String.from("set-cookie: the name is empty or not a token")) }
+    if name.len() + value.len() > 4096 { return Err(String.from("set-cookie: name and value are over 4096 bytes")) }
+    let mut c = new(name, value)
+    match semi {
+        Some(i) => {
+            let rest = bytes.slice(line, i + 1, line.len())
+            for attr in bytes.split(rest, 59) {
+                let a = trim_wsp(attr)
+                if a.len() == 0 { continue }
+                let mut an = http.lower(a)
+                let mut av: List[u8] = List.new()
+                match bytes.find_byte(a, 61, 0) {
+                    Some(k) => {
+                        an = http.lower(trim_wsp(bytes.slice(a, 0, k)))
+                        av = trim_wsp(bytes.slice(a, k + 1, a.len()))
+                    }
+                    None => {}
+                }
+                if av.len() > 1024 { continue }
+                if bytes.eq(an, sys.lit("path")) {
+                    c.path = if av.len() > 0 && av[0] == 47 { Some(av) } else { None }
+                } else if bytes.eq(an, sys.lit("domain")) {
+                    let d = http.lower(if av.len() > 0 && av[0] == 46 { bytes.slice(av, 1, av.len()) } else { av })
+                    c.domain = if domain_ok(d) { Some(d) } else { None }
+                } else if bytes.eq(an, sys.lit("max-age")) {
+                    match parse_max_age(av) {
+                        Some(m) => { c.max_age = Some(m) }
+                        None => {}
+                    }
+                } else if bytes.eq(an, sys.lit("expires")) {
+                    match parse_date(av) {
+                        Some(t) => { c.expires = Some(t) }
+                        None => {}
+                    }
+                } else if bytes.eq(an, sys.lit("secure")) {
+                    c.secure = true
+                } else if bytes.eq(an, sys.lit("httponly")) {
+                    c.http_only = true
+                } else if bytes.eq(an, sys.lit("partitioned")) {
+                    c.partitioned = true
+                } else if bytes.eq(an, sys.lit("samesite")) {
+                    let s = http.lower(av)
+                    if bytes.eq(s, sys.lit("lax")) { c.same_site = SsLax }
+                    else if bytes.eq(s, sys.lit("strict")) { c.same_site = SsStrict }
+                    else if bytes.eq(s, sys.lit("none")) { c.same_site = SsNone }
+                    else { c.same_site = SsUnset }
+                }
+            }
+        }
+        None => {}
+    }
+    check_rules(c)?
+    Ok(c)
+}
+
+/// Every `Set-Cookie` header of `hs` that parses (the others are skipped).
+pub fn parse_set_cookies(hs: List[http.Header]) -> List[Cookie] {
+    let mut out: List[Cookie] = List.new()
+    for h in hs {
+        if http.eq_ci_s(h.name, "set-cookie") {
+            match parse_set_cookie(h.value) {
+                Ok(c) => { out.push(c) }
+                Err(e) => {}
+            }
+        }
+    }
+    out
+}
+
+// ---- the Cookie request header
+
+/// Parses the value of one `Cookie` header into (name, value) pairs in order: pairs are separated by
+/// `;`, a pair with no `=`, an empty or non-token name or a control byte is skipped, spaces around
+/// name and value are dropped, and a value keeps its quotes. At most 4096 bytes per pair.
+pub fn parse_cookie_header(v: List[u8]) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    for part in bytes.split(v, 59) {
+        let p = trim_wsp(part)
+        if p.len() == 0 || p.len() > 4096 { continue }
+        let mut bad = false
+        for c in p { if is_ctl(c) { bad = true } }
+        if bad { continue }
+        match bytes.find_byte(p, 61, 0) {
+            Some(i) => {
+                let n = trim_wsp(bytes.slice(p, 0, i))
+                if valid_name(n) { out.push(http.Header(n, trim_wsp(bytes.slice(p, i + 1, p.len())))) }
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// The cookies of every `Cookie` header of `hs` (HTTP/2 may send several), in order.
+pub fn cookies_of(hs: List[http.Header]) -> List[http.Header] {
+    let mut out: List[http.Header] = List.new()
+    for h in hs {
+        if http.eq_ci_s(h.name, "cookie") {
+            for p in parse_cookie_header(h.value) { out.push(p) }
+        }
+    }
+    out
+}
+
+/// The cookies a request carries.
+pub fn request_cookies(q: http.Request) -> List[http.Header] { cookies_of(q.headers) }
+
+/// The value of the first cookie called `name` in the request (the first wins: browsers send the
+/// most specific path first), quotes kept.
+pub fn request_cookie(q: http.Request, name: str) -> Option[List[u8]] {
+    http.find(request_cookies(q), sys.lit(name))
+}
+
+/// A `Cookie` header value from (name, value) pairs: `a=1; b=2`. Err for a pair that is not a valid
+/// name and value (a `;` or a control byte in it could add cookies).
+pub fn cookie_header(pairs: List[http.Header]) -> Result[List[u8], String] {
+    let mut out: List[u8] = List.new()
+    for p in pairs {
+        if !valid_name(p.name) { return Err(String.from("cookie: the name is not a token")) }
+        if !valid_value(p.value) { return Err(String.from("cookie: the value has a byte that is not allowed")) }
+        if out.len() > 0 { bytes.append(inout out, sys.lit("; ")) }
+        bytes.append(inout out, p.name)
+        out.push(61)
+        bytes.append(inout out, p.value)
+    }
+    Ok(out)
+}
+
+// ---- keys
+
+fn check_keys(keys: List[List[u8]], what: str) -> Result[(), String] {
+    if keys.len() == 0 { return Err(String.from("cookie: a jar needs at least one key")) }
+    for k in keys {
+        if k.len() < 32 { return Err(String.from("cookie: a key is at least 32 bytes")) }
+    }
+    Ok(())
+}
+
+/// What a jar found in a cookie: the plain `value` and which key (an index into the jar's list)
+/// made it. `current` is true for the first key: when it is false, set the cookie again so that the
+/// client holds one made with the newest key (rotation).
+pub type Opened = { value: List[u8], key_index: usize, current: bool }
+
+// ---- the signed jar
+
+/// Signs cookie values with HMAC-SHA-256 (the value stays readable by the client, but it cannot
+/// change it or move it to another cookie). Make one with `signed_jar`.
+pub type SignedJar = { keys: List[List[u8]] }
+
+/// A signed jar. `keys` (each at least 32 bytes, at least one): the first signs, all of them verify, so
+/// a new key is put first and the old one stays until the cookies it signed have expired.
+pub fn signed_jar(keys: List[List[u8]]) -> Result[SignedJar, String] {
+    check_keys(keys, "signed")?
+    Ok(SignedJar(keys))
+}
+
+fn mac_input(name: List[u8], value: List[u8]) -> List[u8] {
+    // a name is a token, which has no `=`: name and value cannot trade bytes
+    let mut m = name.copy()
+    m.push(61)
+    bytes.append(inout m, value)
+    m
+}
+
+fn tag_of(key: List[u8], name: List[u8], value: List[u8]) -> Result[List[u8], String] {
+    match crypto.hmac(crypto.hmac_key(crypto.Sha256, key), mac_input(name, value)) {
+        Ok(t) => Ok(t.bytes)
+        Err(e) => Err(crypto.error_text(e))
+    }
+}
+
+impl SignedJar {
+    /// The cookie value to send for `value`: `value.<tag>` (the tag is 43 base64url characters over `name=value`).
+    fn sign_value(self, name: List[u8], value: List[u8]) -> Result[List[u8], String] {
+        if !valid_name(name) { return Err(String.from("cookie: the name is not a token")) }
+        if !valid_value(value) { return Err(String.from("cookie: the value has a byte that is not allowed")) }
+        let t = tag_of(self.keys[0], name, value)?
+        let mut out = value.copy()
+        out.push(46)
+        bytes.append(inout out, encoding.base64_url(t).bytes())
+        Ok(out)
+    }
+
+    /// `c` with its value signed.
+    fn sign(self, c: Cookie) -> Result[Cookie, String] {
+        let v = self.sign_value(c.name, c.value)?
+        Ok(Cookie(c.name, v, c.path, c.domain, c.max_age, c.expires, c.secure, c.http_only, c.same_site, c.partitioned))
+    }
+
+    /// The value `sign_value` made for `name`, when its tag verifies under one of the keys (in constant time per key;
+    /// every key is tried); None for a forged, altered, truncated or unsigned value.
+    fn verify(self, name: List[u8], signed: List[u8]) -> Option[Opened] {
+        if signed.len() < 44 || signed[signed.len() - 44] != 46 { return None }
+        let value = bytes.slice(signed, 0, signed.len() - 44)
+        let tag = match encoding.unbase64_url(bytes.slice(signed, signed.len() - 43, signed.len())) {
+            Ok(t) => t
+            Err(e) => { return None }
+        }
+        // one encoding per tag: bits the decoder would ignore do not make a second valid cookie
+        if tag.len() != 32 || !bytes.eq(encoding.base64_url(tag.copy()).bytes(), bytes.slice(signed, signed.len() - 43, signed.len())) { return None }
+        let mut found: Option[usize] = None
+        let mut i: usize = 0
+        for k in self.keys {
+            match tag_of(k, name, value) {
+                Ok(t) => {
+                    if crypto.ct_equal(t, tag) && found.is_none() { found = Some(i) }
+                }
+                Err(e) => {}
+            }
+            i += 1
+        }
+        match found {
+            Some(j) => Some(Opened(value, j, j == 0))
+            None => None
+        }
+    }
+
+    /// The verified value of the request's cookie `name`; None when it is absent or does not verify.
+    fn get(self, q: http.Request, name: str) -> Option[Opened] {
+        match request_cookie(q, name) {
+            Some(v) => self.verify(sys.lit(name), v)
+            None => None
+        }
+    }
+}
+
+// ---- the private (encrypted) jar
+
+/// Encrypts cookie values with AES-256-GCM, so the client can neither read nor change them. The
+/// cookie's name is the associated data: a value moved to another cookie does not open. Make one
+/// with `private_jar`.
+pub type PrivateJar = { keys: List[List[u8]] }
+
+/// A private jar. `keys`: each exactly 32 bytes (at least one); the first encrypts, all of them decrypt (rotation as for `signed_jar`).
+/// Err when the crypto backend has no AES-GCM.
+pub fn private_jar(keys: List[List[u8]]) -> Result[PrivateJar, String] {
+    check_keys(keys, "private")?
+    for k in keys {
+        if k.len() != 32 { return Err(String.from("cookie: a private jar key is exactly 32 bytes")) }
+    }
+    if !crypto.supports(crypto.Sealing(crypto.Aes256Gcm)) { return Err(String.from("cookie: the crypto backend has no AES-256-GCM")) }
+    Ok(PrivateJar(keys))
+}
+
+impl PrivateJar {
+    /// The cookie value to send for `value`: base64url of a random 96-bit nonce and the sealed value (any bytes may be sealed).
+    fn encrypt_value(self, name: List[u8], value: List[u8]) -> Result[List[u8], String] uses io {
+        if !valid_name(name) { return Err(String.from("cookie: the name is not a token")) }
+        let key = match crypto.aead_key(crypto.Aes256Gcm, self.keys[0]) {
+            Ok(k) => k
+            Err(e) => { return Err(crypto.error_text(e)) }
+        }
+        let n = match crypto.random_nonce() {
+            Ok(x) => x
+            Err(e) => { return Err(crypto.error_text(e)) }
+        }
+        let sealed = match crypto.seal(key, n, name, value) {
+            Ok(s) => s
+            Err(e) => { return Err(crypto.error_text(e)) }
+        }
+        let mut blob = n.bytes.copy()
+        bytes.append(inout blob, sealed)
+        Ok(encoding.base64_url(blob).bytes())
+    }
+
+    /// `c` with its value encrypted.
+    fn encrypt(self, c: Cookie) -> Result[Cookie, String] uses io {
+        let v = self.encrypt_value(c.name, c.value)?
+        Ok(Cookie(c.name, v, c.path, c.domain, c.max_age, c.expires, c.secure, c.http_only, c.same_site, c.partitioned))
+    }
+
+    /// The plain value of `sealed` as `encrypt_value` made it for `name`, under one of the keys; None
+    /// for anything that does not authenticate (altered, truncated, another cookie's, not base64url).
+    fn decrypt(self, name: List[u8], sealed: List[u8]) -> Option[Opened] {
+        let blob = match encoding.unbase64_url(sealed) {
+            Ok(b) => b
+            Err(e) => { return None }
+        }
+        if blob.len() < 12 + crypto.TAG_LEN || !bytes.eq(encoding.base64_url(blob.copy()).bytes(), sealed) { return None }
+        let n = match crypto.nonce(bytes.slice(blob, 0, 12)) {
+            Ok(x) => x
+            Err(e) => { return None }
+        }
+        let body = bytes.slice(blob, 12, blob.len())
+        let mut i: usize = 0
+        for k in self.keys {
+            match crypto.aead_key(crypto.Aes256Gcm, k) {
+                Ok(key) => {
+                    match crypto.open(key, n, name, body) {
+                        Ok(plain) => { return Some(Opened(plain, i, i == 0)) }
+                        Err(e) => {}
+                    }
+                }
+                Err(e) => {}
+            }
+            i += 1
+        }
+        None
+    }
+
+    /// The decrypted value of the request's cookie `name`; None when it is absent or does not authenticate.
+    fn get(self, q: http.Request, name: str) -> Option[Opened] {
+        match request_cookie(q, name) {
+            Some(v) => self.decrypt(sys.lit(name), v)
+            None => None
+        }
+    }
+}

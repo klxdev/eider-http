@@ -1,0 +1,70 @@
+-- matching
+true
+true
+false
+false
+false
+true
+true
+false
+true
+false
+/
+/
+/
+/a
+/a/b
+/
+-- host-only and Domain cookies
+3
+h=1; d=2; dd=3
+d=2; dd=3
+d=2; dd=3
+(none)
+-- refused: a Domain the host is not in, a single label, a public-suffix-like parent is NOT refused, an IP address
+1
+c=1
+2
+b=1; c=1
+(none)
+-- paths
+4
+dflt=1; bad=4; root=2
+deep=3; dflt=1; bad=4; root=2
+dflt=1; bad=4; root=2
+root=2
+-- the longer path first, then the older cookie
+b=2; c=3; a=1; d=4
+-- lifetimes
+s=1; m=2; e=3; both=4
+s=1; m=2; e=3
+s=1; e=3
+s=1
+1
+34560000
+-- replace and delete
+b=1; a=2
+true
+1
+b=1
+2
+-- Secure
+1
+1
+plain=1
+plain=1; sec=2
+-- an http response cannot replace or delete a Secure cookie
+0
+0
+plain=1; sec=2
+1
+plain=1; sec=ok
+-- prefixes and bad lines
+2
+__Host-a=1; ok=1
+-- limits: 50 per domain, the oldest go
+50
+true
+-- set and clear
+t=v
+0

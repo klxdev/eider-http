@@ -1,0 +1,56 @@
+// Run by tests/pool_interop.sh: `pool_interop cookies` prints the Set-Cookie lines http/cookie builds
+// (python's http.cookies reads them back); `pool_interop client PORT` drives http/pool against
+// python's http.server (redirects, cookies, keep-alive).
+
+import core.sys
+import std.bytes
+import std.env
+import std.io
+import std.time
+import std.utf8
+import http
+import http.cookie
+import http.cookiejar
+import http.pool
+
+fn lit(s: str) -> List[u8] { sys.lit(s) }
+
+fn line(c: cookie.Cookie) uses io {
+    io.outln(cookie.build(c).unwrap())
+}
+
+fn show(r: Result[http.Response, String]) uses io {
+    match r {
+        Ok(x) => {
+            let mut t = String.from_int(x.status as i64)
+            t.push_str(" ")
+            t.append(sys.to_string(x.body))
+            io.outln(t.bytes())
+        }
+        Err(e) => io.outln(bytes.concat(lit("error: "), e.bytes()))
+    }
+}
+
+fn main() uses net, io, clock, threads {
+    let a = env.args()
+    if a.len() >= 2 && bytes.eq(a[1].copy(), lit("cookies")) {
+        line(cookie.text("SID", "31d4d96e407aad42").path("/").secure().http_only())
+        line(cookie.text("lang", "en-US").domain("example.com").path("/x").max_age(3600).same_site(cookie.SsStrict))
+        line(cookie.text("old", "x").expires(784111777))
+        line(cookie.text("quoted", "\"ab\"").same_site(cookie.SsLax))
+        return
+    }
+    let port = utf8.lossy(a[2].copy())
+    let mut base = String.from("http://127.0.0.1:")
+    base.append(port)
+    let c = pool.new().with_cookies(cookiejar.new()).with_base(bytes.concat(base.bytes(), lit("/")))
+    show(c.get(lit("hello")))
+    show(c.get(lit("redir")))
+    show(c.get(lit("login")))
+    show(c.get(lit("whoami")))
+    show(c.send(pool.call("POST", lit("redir307")).with_body("text/plain", lit("body"))))
+    show(c.send(pool.call("POST", lit("redir302")).with_body("text/plain", lit("body"))))
+    show(c.get(lit("gz")))
+    let st = c.stats()
+    io.outln(bytes.concat(lit("opened="), bytes.from_i64(st.opened)))
+}
